@@ -14,12 +14,14 @@ from nerfstudio.utils.rich_utils import CONSOLE
 
 from f3rm.features.clip_extract import CLIPArgs, extract_clip_features
 from f3rm.features.dino_extract import DINOArgs, extract_dino_features
+from f3rm.features.robopoint_extract import ROBOPOINTArgs, extract_robopoint_proj_features, extract_robopoint_noproj_features
+
 
 
 @dataclass
 class FeatureDataManagerConfig(VanillaDataManagerConfig):
     _target: Type = field(default_factory=lambda: FeatureDataManager)
-    feature_type: Literal["CLIP", "DINO"] = "CLIP"
+    feature_type: Literal["CLIP", "DINO", "ROBOPOINTproj", "ROBOPOINTnoproj"] = "CLIP"
     """Feature type to extract."""
     enable_cache: bool = True
     """Whether to cache extracted features."""
@@ -28,11 +30,15 @@ class FeatureDataManagerConfig(VanillaDataManagerConfig):
 feat_type_to_extract_fn = {
     "CLIP": extract_clip_features,
     "DINO": extract_dino_features,
+    "ROBOPOINTproj": extract_robopoint_proj_features,
+    "ROBOPOINTnoproj": extract_robopoint_noproj_features,
 }
 
 feat_type_to_args = {
     "CLIP": CLIPArgs,
     "DINO": DINOArgs,
+    "ROBOPOINTproj": ROBOPOINTArgs,
+    "ROBOPOINTnoproj": ROBOPOINTArgs,
 }
 
 
