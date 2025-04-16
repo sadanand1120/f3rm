@@ -84,8 +84,8 @@ class FeatureField(Field):
     ) -> Dict[FieldHeadNames, Tensor]:
         # Apply scene contraction
         positions = ray_samples.frustums.get_positions().detach()
-        positions = self.spatial_distortion(positions)
-        positions = (positions + 2.0) / 4.0
+        positions = self.spatial_distortion(positions)   # Apply spatial distortion, maps to a sphere of radius 2
+        positions = (positions + 2.0) / 4.0    # Remaps from [-2, 2] → [0, 1], Required for HashGrid encoding, which expects input coordinates in [0, 1]
         positions_flat = positions.view(-1, 3)
 
         # Get features

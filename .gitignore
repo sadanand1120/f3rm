@@ -20,3 +20,10 @@ datasets/
 # Nerfstudio outputs
 outputs/
 f3rm_outputs/
+
+**/*notrack*/
+**/*notrack*
+**/.clang-format
+**/.vscode
+colmap/
+Hierarchical-Localization/

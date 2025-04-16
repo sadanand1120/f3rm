@@ -6,8 +6,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from f3rm.features.clip.interpolate import interpolate_positional_embedding
-
 
 class Bottleneck(nn.Module):
     expansion = 4
@@ -66,7 +64,6 @@ class AttentionPool2d(nn.Module):
         self.v_proj = nn.Linear(embed_dim, embed_dim)
         self.c_proj = nn.Linear(embed_dim, output_dim or embed_dim)
         self.num_heads = num_heads
-        self.spacial_dim = spacial_dim
 
     def forward(self, x):
         x = x.flatten(start_dim=2).permute(2, 0, 1)  # NCHW -> (HW)NC
@@ -92,23 +89,6 @@ class AttentionPool2d(nn.Module):
             need_weights=False
         )
         return x.squeeze(0)
-
-    def forward_v(self, x: torch.Tensor):
-        """
-        Forward function for computing the value features for dense prediction (i.e., features for every image patch).
-        """
-        _, _, w, h = x.shape
-        x = x.flatten(start_dim=2).permute(2, 0, 1)  # NCHW -> (HW)NC
-        x = torch.cat([x.mean(dim=0, keepdim=True), x], dim=0)  # (HW+1)NC
-
-        # Interpolate positional embedding to match the size of the input
-        interpolated_pe = interpolate_positional_embedding(self.positional_embedding, x.permute(1, 0, 2), patch_size=1, w=w, h=h)
-        x = x + interpolated_pe[:, None, :]  # (HW+1)NC
-
-        v_in = F.linear(x, self.v_proj.weight, self.v_proj.bias)
-        v_out = F.linear(v_in, self.c_proj.weight, self.c_proj.bias)
-        v_out = v_out.permute(1, 0, 2)  # (HW+1)NC -> N(HW+1)C
-        return v_out
 
 
 class ModifiedResNet(nn.Module):
@@ -155,7 +135,7 @@ class ModifiedResNet(nn.Module):
 
         return nn.Sequential(*layers)
 
-    def forward(self, x, patch_output: bool = False):
+    def forward(self, x):
         def stem(x):
             x = self.relu1(self.bn1(self.conv1(x)))
             x = self.relu2(self.bn2(self.conv2(x)))
@@ -169,12 +149,7 @@ class ModifiedResNet(nn.Module):
         x = self.layer2(x)
         x = self.layer3(x)
         x = self.layer4(x)
-
-        if patch_output:
-            x = self.attnpool.forward_v(x)
-            x = x[:, 1:, :]  # remove the cls token
-        else:
-            x = self.attnpool(x)
+        x = self.attnpool(x)
 
         return x
 
@@ -211,25 +186,6 @@ class ResidualAttentionBlock(nn.Module):
         self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
         return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
 
-    def forward_v(self, x: torch.Tensor):
-        """
-        Forward function for computing the value features for dense prediction (i.e., features for every image patch).
-        The reason of not using the dense patch level embeddings after last transformer block instead of just the value embeddings is in MaskCLIP paper:
-        "One might argue that, since the global attention pooling is a self-attention layer, even without modification, 
-        it can also generate dense features. However, since query ¯q is the only query trained during the 
-        CLIP pre-training, this naive solution fails."
-        """
-        # Get the weights and biases for the value projection, multihead attention uses 3 * embed_dim for the input projection
-        v_in_proj_weight = self.attn.in_proj_weight[-self.attn.embed_dim:]
-        v_in_proj_bias = self.attn.in_proj_bias[-self.attn.embed_dim:]
-
-        v_in = F.linear(self.ln_1(x), v_in_proj_weight, v_in_proj_bias)
-        v_out = F.linear(v_in, self.attn.out_proj.weight, self.attn.out_proj.bias)
-
-        # Using the value features works the best. Adding this to 'x' or feeding 'v' to the LayerNorm then MLP degrades the performance
-        return v_out
-
-
     def forward(self, x: torch.Tensor):
         x = x + self.attention(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
@@ -262,48 +218,22 @@ class VisionTransformer(nn.Module):
         self.transformer = Transformer(width, layers, heads)
 
         self.ln_post = LayerNorm(width)
-        self.proj = nn.Parameter(scale * torch.randn(width, output_dim))  # project the visual features into multimodal space
+        self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
-        self.patch_size = patch_size
-
-    def forward(self, x: torch.Tensor, patch_output: bool = False):
-        _, _, w, h = x.shape
-
+    def forward(self, x: torch.Tensor):
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
         x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
-        x = x + interpolate_positional_embedding(self.positional_embedding, x, patch_size=self.patch_size, w=w, h=h)
+        x = x + self.positional_embedding.to(x.dtype)
         x = self.ln_pre(x)
 
         x = x.permute(1, 0, 2)  # NLD -> LND
-
-        if patch_output:
-            # replaces the self.transformer(x) call
-            *layers, last_resblock = self.transformer.resblocks
-            penultimate = nn.Sequential(*layers)
-            x = penultimate(x)
-            x = last_resblock.forward_v(x)
-
-            x = x.permute(1, 0, 2)  # LND -> NLD
-
-            # Extract the patch tokens, not the class token
-            x = x[:, 1:, :]
-
-            x = self.ln_post(x)
-            if self.proj is not None:
-                # This is equivalent to conv1d
-                x = x @ self.proj
-            return x
-
         x = self.transformer(x)
-
         x = x.permute(1, 0, 2)  # LND -> NLD
 
-        # get the class token
-        x = x[:, 0, :]
+        x = self.ln_post(x[:, 0, :])
 
-        x = self.ln_post(x)
         if self.proj is not None:
             x = x @ self.proj
 
@@ -409,15 +339,6 @@ class CLIP(nn.Module):
 
     def encode_image(self, image):
         return self.visual(image.type(self.dtype))
-
-    def get_patch_encodings(self, image) -> torch.Tensor:
-        """ Get the encodings for each patch in the image """
-        return self.visual(image.type(self.dtype), patch_output=True)
-
-    def get_image_encoder_projection(self) -> nn.Parameter:
-        """ Get vision transformer projection matrix."""
-        assert isinstance(self.visual, VisionTransformer)
-        return self.visual.proj
 
     def encode_text(self, text):
         x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
