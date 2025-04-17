@@ -21,8 +21,8 @@ f3rm_method = MethodSpecification(
             datamanager=FeatureDataManagerConfig(
                 feature_type="CLIP",
                 dataparser=NerfstudioDataParserConfig(train_split_fraction=0.95),
-                train_num_rays_per_batch=4096,
-                eval_num_rays_per_batch=4096,
+                train_num_rays_per_batch=8192,
+                eval_num_rays_per_batch=8192,
                 camera_optimizer=CameraOptimizerConfig(
                     mode="SO3xR3",
                     optimizer=AdamOptimizerConfig(lr=6e-4, eps=1e-8, weight_decay=1e-2),
@@ -31,7 +31,7 @@ f3rm_method = MethodSpecification(
             # To support more GPUs, we reduce the num rays per chunk. The default was 1 << 15 which uses ~16GB of GPU
             # memory when training and using viewer. 1 << 14 uses ~12GB of GPU memory in comparison. The decrease in
             # rendering speed is not too important.
-            model=FeatureFieldModelConfig(eval_num_rays_per_chunk=1 << 14),
+            model=FeatureFieldModelConfig(eval_num_rays_per_chunk=1 << 15),
         ),
         optimizers={
             "proposal_networks": {

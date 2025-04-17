@@ -94,11 +94,11 @@ class FeatureDataManager(VanillaDataManager):
             elif cache_dict.get("args") != extract_args.id_dict():
                 CONSOLE.print("Feature extraction args have changed, cache invalidated...")
             else:
-                return cache_dict["features"]
+                return cache_dict["features"].to(self.device)
 
         # Cache is invalid or doesn't exist, so extract features
         CONSOLE.print(f"Extracting {self.config.feature_type} features for {len(image_fnames)} images...")
-        features = extract_fn(image_fnames, self.device)
+        features = extract_fn(image_fnames, self.device).to("cpu")
         if self.config.enable_cache:
             cache_dict = {"args": extract_args.id_dict(), "image_fnames": image_fnames, "features": features}
             cache_dir.mkdir(exist_ok=True)

@@ -44,7 +44,7 @@ def _process(image_paths: List[str], device: torch.device, do_proj: bool = True)
     # Preprocess the images
     images = [Image.open(path).convert('RGB') for path in image_paths]
     preprocessed_images = process_images(images, image_processor, model.config)
-    preprocessed_images = preprocessed_images.half().to(device)  # (b, 3, h, w)
+    preprocessed_images = preprocessed_images.half()  # (b, 3, h, w)
     print(f"Preprocessed {len(images)} images into {preprocessed_images.shape}")
 
     # Get visual embeddings for the images
@@ -53,11 +53,13 @@ def _process(image_paths: List[str], device: torch.device, do_proj: bool = True)
         range(0, len(preprocessed_images), batch_size),
         desc="Extracting visual features",
     ):
-        batch = preprocessed_images[i: i + batch_size]
+        batch = preprocessed_images[i: i + batch_size].to(device)
         img_feat = vision_tower(batch)
         if do_proj:
             img_feat = mm_projector(img_feat)
-        embeddings.append(img_feat)
+        embeddings.append(img_feat.cpu())
+        del batch, img_feat
+        torch.cuda.empty_cache()
     embeddings = torch.cat(embeddings, dim=0)
 
     # Reshape embeddings from flattened patches to patch height and width
