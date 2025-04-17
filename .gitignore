@@ -20,6 +20,7 @@ datasets/
 # Nerfstudio outputs
 outputs/
 f3rm_outputs/
+robopoint_outputs/
 
 **/*notrack*/
 **/*notrack*
