@@ -12,16 +12,15 @@ from nerfstudio.data.datamanagers.base_datamanager import (
 )
 from nerfstudio.utils.rich_utils import CONSOLE
 
-from f3rm.features.clip_extract import CLIPArgs, extract_clip_features
+from f3rm.features.clip_extract import CLIPArgs, extract_clip_features, extract_clipnoproj_features
 from f3rm.features.dino_extract import DINOArgs, extract_dino_features
 from f3rm.features.robopoint_extract import ROBOPOINTArgs, extract_robopoint_proj_features, extract_robopoint_noproj_features
-
 
 
 @dataclass
 class FeatureDataManagerConfig(VanillaDataManagerConfig):
     _target: Type = field(default_factory=lambda: FeatureDataManager)
-    feature_type: Literal["CLIP", "DINO", "ROBOPOINTproj", "ROBOPOINTnoproj"] = "CLIP"
+    feature_type: Literal["CLIP", "CLIPnoproj", "DINO", "ROBOPOINTproj", "ROBOPOINTnoproj"] = "CLIP"
     """Feature type to extract."""
     enable_cache: bool = True
     """Whether to cache extracted features."""
@@ -29,6 +28,7 @@ class FeatureDataManagerConfig(VanillaDataManagerConfig):
 
 feat_type_to_extract_fn = {
     "CLIP": extract_clip_features,
+    "CLIPnoproj": extract_clipnoproj_features,
     "DINO": extract_dino_features,
     "ROBOPOINTproj": extract_robopoint_proj_features,
     "ROBOPOINTnoproj": extract_robopoint_noproj_features,
@@ -36,6 +36,7 @@ feat_type_to_extract_fn = {
 
 feat_type_to_args = {
     "CLIP": CLIPArgs,
+    "CLIPnoproj": CLIPArgs,
     "DINO": DINOArgs,
     "ROBOPOINTproj": ROBOPOINTArgs,
     "ROBOPOINTnoproj": ROBOPOINTArgs,
@@ -52,7 +53,7 @@ class FeatureDataManager(VanillaDataManager):
 
         # Split into train and eval features
         self.train_features = features[: len(self.train_dataset)]
-        self.eval_features = features[len(self.train_dataset) :]
+        self.eval_features = features[len(self.train_dataset):]
         assert len(self.eval_features) == len(self.eval_dataset)
 
         # Set metadata, so we can initialize model with feature dimensionality
@@ -68,9 +69,9 @@ class FeatureDataManager(VanillaDataManager):
         im_h, im_w = im_h.pop(), im_w.pop()
         self.scale_h = feat_h / im_h
         self.scale_w = feat_w / im_w
-        #assert np.isclose(
+        # assert np.isclose(
         #    self.scale_h, self.scale_w, atol=1.5e-3
-        #), f"Scales must be similar, got h={self.scale_h} and w={self.scale_w}"
+        # ), f"Scales must be similar, got h={self.scale_h} and w={self.scale_w}"
 
         # Garbage collect
         torch.cuda.empty_cache()

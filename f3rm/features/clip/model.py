@@ -266,7 +266,7 @@ class VisionTransformer(nn.Module):
 
         self.patch_size = patch_size
 
-    def forward(self, x: torch.Tensor, patch_output: bool = False):
+    def forward(self, x: torch.Tensor, patch_output: bool = False, do_patch_proj: bool = True):
         _, _, w, h = x.shape
 
         x = self.conv1(x)  # shape = [*, width, grid, grid]
@@ -291,7 +291,7 @@ class VisionTransformer(nn.Module):
             x = x[:, 1:, :]
 
             x = self.ln_post(x)
-            if self.proj is not None:
+            if self.proj is not None and do_patch_proj:
                 # This is equivalent to conv1d
                 x = x @ self.proj
             return x
@@ -410,9 +410,9 @@ class CLIP(nn.Module):
     def encode_image(self, image):
         return self.visual(image.type(self.dtype))
 
-    def get_patch_encodings(self, image) -> torch.Tensor:
+    def get_patch_encodings(self, image, do_patch_proj=True) -> torch.Tensor:
         """ Get the encodings for each patch in the image """
-        return self.visual(image.type(self.dtype), patch_output=True)
+        return self.visual(image.type(self.dtype), patch_output=True, do_patch_proj=do_patch_proj)
 
     def get_image_encoder_projection(self) -> nn.Parameter:
         """ Get vision transformer projection matrix."""

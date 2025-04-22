@@ -23,8 +23,19 @@ class CLIPArgs:
 
 
 @torch.no_grad()
+def extract_clipnoproj_features(image_paths: List[str], device: torch.device) -> torch.Tensor:
+    """Extract dense patch-level CLIP features for given images, without multimodal projection"""
+    return _extract_clip_features(image_paths, device, do_patch_proj=False)
+
+
+@torch.no_grad()
 def extract_clip_features(image_paths: List[str], device: torch.device) -> torch.Tensor:
     """Extract dense patch-level CLIP features for given images"""
+    return _extract_clip_features(image_paths, device, do_patch_proj=True)
+
+
+@torch.no_grad()
+def _extract_clip_features(image_paths: List[str], device: torch.device, do_patch_proj: bool = True) -> torch.Tensor:
     from f3rm.features.clip import clip
 
     model, preprocess = clip.load(CLIPArgs.model_name, device=device)
@@ -55,8 +66,8 @@ def extract_clip_features(image_paths: List[str], device: torch.device) -> torch
         range(0, len(preprocessed_images), CLIPArgs.batch_size),
         desc="Extracting CLIP features",
     ):
-        batch = preprocessed_images[i : i + CLIPArgs.batch_size]
-        embeddings.append(model.get_patch_encodings(batch))
+        batch = preprocessed_images[i: i + CLIPArgs.batch_size]
+        embeddings.append(model.get_patch_encodings(batch, do_patch_proj=do_patch_proj))
     embeddings = torch.cat(embeddings, dim=0)
 
     # Reshape embeddings from flattened patches to patch height and width
