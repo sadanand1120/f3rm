@@ -7,13 +7,13 @@ from tqdm import tqdm
 
 
 class DINOArgs:
-    model_type: str = "dino_vits8"
-    load_size: int = 224
-    stride: int = 4
-    facet: str = "key"
-    layer: int = 11
+    model_type: str = "dinov2_vitl14"
+    load_size: int = -1  # -1 to use smallest side size, -x to use scaled of smallest side
+    stride: int = None
+    facet: str = "token"
+    layer: int = -1
     bin: bool = False
-    batch_size: int = 4
+    batch_size: int = 2
 
     @classmethod
     def id_dict(cls):
@@ -28,43 +28,41 @@ class DINOArgs:
         }
 
 
-_supported_dino_models = {"dino_vits8", "dino_vits16", "dino_vitb8", "dino_vitb16"}
-
-
 @torch.no_grad()
-def extract_dino_features(image_paths: List[str], device: torch.device) -> torch.Tensor:
+def extract_dino_features(image_paths: List[str], device: torch.device, verbose=False) -> torch.Tensor:
     from f3rm.features.dino.dino_vit_extractor import ViTExtractor
 
-    assert (
-        DINOArgs.model_type in _supported_dino_models
-    ), f"Model type must be one of {_supported_dino_models}, not {DINOArgs.model_type}"
+    extractor = ViTExtractor(model_type=DINOArgs.model_type, stride=DINOArgs.stride)
+    if verbose:
+        print(f"Loaded DINO model {DINOArgs.model_type}")
 
-    extractor = ViTExtractor(DINOArgs.model_type, DINOArgs.stride, device=device)
-    print(f"Loaded DINO model {DINOArgs.model_type}")
-
-    # Preprocess images
-    preprocessed_images = [extractor.preprocess(image_path, DINOArgs.load_size)[0] for image_path in image_paths]
-    preprocessed_images = torch.cat(preprocessed_images, dim=0).to(device)
-    print(f"Preprocessed {len(image_paths)} images to shape {preprocessed_images.shape}")
-
-    # Extract DINO features in batches
     embeddings = []
-    for i in tqdm(
-        range(0, len(preprocessed_images), DINOArgs.batch_size),
-        desc="Extracting DINO features",
-    ):
-        batch = preprocessed_images[i : i + DINOArgs.batch_size]
-        embeddings.append(extractor.extract_descriptors(batch, DINOArgs.layer, DINOArgs.facet, DINOArgs.bin))
-    embeddings = torch.cat(embeddings, dim=0)
+    for i in tqdm(range(0, len(image_paths), DINOArgs.batch_size),
+                  desc="Preprocessing & extracting DINO features", leave=verbose):
+        batch_paths = image_paths[i: i + DINOArgs.batch_size]
+        # open & preprocess each image in the batch
+        batch_tensors = [
+            extractor.preprocess(p, DINOArgs.load_size, allow_crop=True)[0]
+            for p in batch_paths
+        ]
+        batch = torch.cat(batch_tensors, dim=0).to(device)
+        # extract descriptors, move to CPU, and store
+        emb = extractor.extract_descriptors(
+            batch, DINOArgs.layer, DINOArgs.facet, DINOArgs.bin
+        ).cpu()
+        embeddings.append(emb)
+        del batch, emb
+        torch.cuda.empty_cache()
 
-    # Reshape embeddings to have shape (batch, height, width, channels))
+    embeddings = torch.cat(embeddings, dim=0)
+    # reshape to (batch, height, width, channels)
     height, width = extractor.num_patches
     embeddings = rearrange(embeddings, "b 1 (h w) c -> b h w c", h=height, w=width)
-    print(f"Extracted DINO embeddings of shape {embeddings.shape}")
+    if verbose:
+        print(f"Extracted DINO embeddings of shape {embeddings.shape}")
 
-    # Delete and clear memory to be safe
+    # cleanup
     del extractor
-    del preprocessed_images
     torch.cuda.empty_cache()
     gc.collect()
 

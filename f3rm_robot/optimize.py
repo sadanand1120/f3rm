@@ -12,8 +12,7 @@ from pytorch3d.transforms import Transform3d, quaternion_to_matrix, random_quate
 from slugify import slugify
 from tqdm import tqdm
 
-from f3rm.features.clip import clip, tokenize
-from f3rm.features.clip.model import CLIP
+import open_clip
 from f3rm.features.clip_extract import CLIPArgs
 from f3rm_robot.args import OptimizationArgs, validate_args
 from f3rm_robot.collision import has_collision
@@ -69,13 +68,14 @@ def compute_task_embedding(task: Task) -> Float[torch.Tensor, "num_qps num_chann
 
 
 def retrieve_task(
-    query: str, clip_model: CLIP, device: torch.device
+    query: str, clip_model, device: torch.device
 ) -> Tuple[Task, Float[torch.Tensor, "num_qps num_channels"], Float[torch.Tensor, "1 num_channels"]]:
     """
     Retrieve the most relevant task for a given query. Returns the Task, task embedding, and query embedding.
     """
     # Retrieve relevant demonstrations by encoding query using CLIP and comparing it to the task embeddings.
     with torch.no_grad():
+        tokenize = open_clip.get_tokenizer(CLIPArgs.model_name)
         tokens = tokenize(query).to(device)
         query_emb = clip_model.encode_text(tokens)
         query_emb /= query_emb.norm(dim=-1, keepdim=True)
@@ -93,7 +93,7 @@ def retrieve_task(
 
 
 def get_initial_voxel_grid(
-    feature_field: FeatureFieldAdapter, query: str, clip_model: CLIP, device: torch.device
+    feature_field: FeatureFieldAdapter, query: str, clip_model, device: torch.device
 ) -> Tuple[Float[torch.Tensor, "num_voxels 3"], Float[torch.Tensor, "num_voxels"], Dict[str, int]]:
     """
     Get the initial masked voxel grid based on density (alpha) and language (CLIP features). These correspond to the
@@ -135,6 +135,7 @@ def get_initial_voxel_grid(
     # Feature masking by comparing each voxel's feature with the user query and negatives
     queries = [query, "object", "things", "stuff", "texture"]  # we use the negatives from LERF
     with torch.no_grad():
+        tokenize = open_clip.get_tokenizer(CLIPArgs.model_name)
         tokens = tokenize(queries).to(device)
         query_embs = clip_model.encode_text(tokens).float()
         query_embs /= query_embs.norm(dim=-1, keepdim=True)
@@ -202,7 +203,7 @@ def get_language_guidance_fn(voxel_sims: Float[torch.Tensor, "num_voxels"], quer
 
 
 def language_pose_optimization(
-    feature_field: FeatureFieldAdapter, clip_model: CLIP, query: str, device: torch.device
+    feature_field: FeatureFieldAdapter, clip_model, query: str, device: torch.device
 ) -> Dict[str, Any]:
     """
     Optimize 6-DOF poses for the given language query. We return the ranked grasps after optimization and the metrics.
@@ -381,7 +382,7 @@ def entrypoint():
 
     # Load CLIP so we can query via language
     print("Loading CLIP model...", end=" ")
-    clip_model, _ = clip.load(CLIPArgs.model_name, device=device)
+    clip_model, _, _ = open_clip.create_model_and_transforms(CLIPArgs.model_name, pretrained=CLIPArgs.model_pretrained, device=device)
     print("Done!")
 
     # Ask for query from user and optimize. If we're using the ViserVisualizer, we can use a textbox in the GUI

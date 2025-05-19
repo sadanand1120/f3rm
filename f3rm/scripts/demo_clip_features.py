@@ -4,8 +4,7 @@ import matplotlib.pyplot as plt
 import torch
 from PIL import Image
 
-from f3rm.features import clip
-from f3rm.features.clip import tokenize
+import open_clip
 from f3rm.features.clip_extract import CLIPArgs, extract_clip_features
 
 _MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -19,15 +18,16 @@ def demo_clip_features(text_query: str) -> None:
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
     # Extract the patch-level features for the images
-    clip_embs = extract_clip_features(image_paths, device)
+    clip_embs = extract_clip_features(image_paths, device, verbose=True).cpu()
     clip_embs /= clip_embs.norm(dim=-1, keepdim=True)
 
     # Load the CLIP model so we can get text embeddings
-    model, _ = clip.load(CLIPArgs.model_name, device=device)
+    model, _, _ = open_clip.create_model_and_transforms(CLIPArgs.model_name, pretrained=CLIPArgs.model_pretrained, device=device)
 
     # Encode text query
-    tokens = tokenize(text_query).to(device)
-    text_embs = model.encode_text(tokens)
+    tokenize = open_clip.get_tokenizer(CLIPArgs.model_name)
+    tokens = tokenize([text_query]).to(device)
+    text_embs = model.encode_text(tokens).squeeze().cpu()
     text_embs /= text_embs.norm(dim=-1, keepdim=True)
 
     # Compute similarities

@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from functools import cached_property
 from typing import Dict, List, Optional, Type
 
+import open_clip
 import torch
 import torch.nn.functional as F
 from nerfstudio.cameras.rays import RayBundle, RaySamples
@@ -20,9 +21,31 @@ from nerfstudio.viewer.server.viewer_elements import (
 )
 from torch.nn import Parameter
 
-from f3rm.feature_field import FeatureField, FeatureFieldHeadNames
+from f3rm.feature_field import FeatureField, FeatureFieldHeadNames, DualFeatureField
 from f3rm.pca_colormap import apply_pca_colormap_return_proj
 from f3rm.renderer import FeatureRenderer
+from f3rm.features.clip_extract import CLIPArgs
+
+
+from nerfstudio.cameras.rays import Frustums, RaySamples
+
+
+def _detach_ray_samples(rs: RaySamples) -> RaySamples:
+    f = rs.frustums
+    f_det = Frustums(
+        origins=f.origins.detach(),
+        directions=f.directions.detach(),
+        starts=f.starts.detach() if f.starts is not None else None,
+        ends=f.ends.detach() if f.ends is not None else None,
+        pixel_area=f.pixel_area.detach() if f.pixel_area is not None else None,
+    )
+    return RaySamples(
+        frustums=f_det,
+        camera_indices=rs.camera_indices.detach() if rs.camera_indices is not None else None,
+        deltas=rs.deltas.detach() if rs.deltas is not None else None,
+        spacing_ends=rs.spacing_ends.detach() if rs.spacing_ends is not None else None,
+        spacing_starts=rs.spacing_starts.detach() if rs.spacing_starts is not None else None,
+    )
 
 
 @dataclass
@@ -58,25 +81,21 @@ class ViewerUtils:
 
     @cached_property
     def clip(self):
-        from f3rm.features.clip import load
-        from f3rm.features.clip_extract import CLIPArgs
-
         CONSOLE.print(f"Loading CLIP {CLIPArgs.model_name} for viewer")
-        model, _ = load(CLIPArgs.model_name, device=self.device)
+        model, _, _ = open_clip.create_model_and_transforms(CLIPArgs.model_name, pretrained=CLIPArgs.model_pretrained, device=self.device)
         model.eval()
         return model
 
     @torch.no_grad()
     def handle_language_queries(self, raw_text: str, is_positive: bool):
         """Compute CLIP embeddings based on queries and update state"""
-        from f3rm.features.clip import tokenize
-
         texts = [x.strip() for x in raw_text.split(",") if x.strip()]
         # Clear the GUI state if there are no texts
         if not texts:
             self.clear_positives() if is_positive else self.clear_negatives()
             return
         # Embed text queries
+        tokenize = open_clip.get_tokenizer(CLIPArgs.model_name)
         tokens = tokenize(texts).to(self.device)
         embed = self.clip.encode_text(tokens).float()
         if is_positive:
@@ -115,7 +134,7 @@ class ViewerUtils:
         CONSOLE.print("Reset PCA projection")
 
 
-viewer_utils = ViewerUtils()
+viewer_utils = ViewerUtils(device=torch.device("cpu"))
 
 
 class FeatureFieldModel(NerfactoModel):
@@ -127,24 +146,43 @@ class FeatureFieldModel(NerfactoModel):
     def populate_modules(self):
         super().populate_modules()
 
-        # Create feature field
-        feature_dim = self.kwargs["metadata"]["feature_dim"]
-        if feature_dim <= 0:
-            raise ValueError(f"Feature dimensionality must be positive, not {feature_dim}")
+        feat_type = self.kwargs["metadata"]["feature_type"]
 
-        self.feature_field = FeatureField(
-            feature_dim=feature_dim,
-            spatial_distortion=self.field.spatial_distortion,
-            use_pe=self.config.feat_use_pe,
-            pe_n_freq=self.config.feat_pe_n_freq,
-            num_levels=self.config.feat_num_levels,
-            log2_hashmap_size=self.config.feat_log2_hashmap_size,
-            start_res=self.config.feat_start_res,
-            max_res=self.config.feat_max_res,
-            features_per_level=self.config.feat_features_per_level,
-            hidden_dim=self.config.feat_hidden_dim,
-            num_layers=self.config.feat_num_layers,
-        )
+        if feat_type == "DINOCLIP":
+            self.feature_field = DualFeatureField(
+                dino_dim=self.kwargs["metadata"]["feature_dim_dino"],
+                clip_dim=self.kwargs["metadata"]["feature_dim_clip"],
+                proj_hidden_dim=self.config.feat_hidden_dim,
+                proj_num_layers=self.config.feat_num_layers,
+                spatial_distortion=self.field.spatial_distortion,
+                use_pe=self.config.feat_use_pe,
+                pe_n_freq=self.config.feat_pe_n_freq,
+                num_levels=self.config.feat_num_levels,
+                log2_hashmap_size=self.config.feat_log2_hashmap_size,
+                start_res=self.config.feat_start_res,
+                max_res=self.config.feat_max_res,
+                features_per_level=self.config.feat_features_per_level,
+                hidden_dim=self.config.feat_hidden_dim,
+                num_layers=self.config.feat_num_layers,
+            )
+        else:
+            feature_dim = self.kwargs["metadata"]["feature_dim"]
+            if feature_dim <= 0:
+                raise ValueError("Feature dimensionality must be positive.")
+            self.feature_field = FeatureField(
+                feature_dim=feature_dim,
+                spatial_distortion=self.field.spatial_distortion,
+                use_pe=self.config.feat_use_pe,
+                pe_n_freq=self.config.feat_pe_n_freq,
+                num_levels=self.config.feat_num_levels,
+                log2_hashmap_size=self.config.feat_log2_hashmap_size,
+                start_res=self.config.feat_start_res,
+                max_res=self.config.feat_max_res,
+                features_per_level=self.config.feat_features_per_level,
+                hidden_dim=self.config.feat_hidden_dim,
+                num_layers=self.config.feat_num_layers,
+            )
+
         self.renderer_feature = FeatureRenderer()
         self.setup_gui()
 
@@ -154,7 +192,7 @@ class FeatureFieldModel(NerfactoModel):
         self.btn_refresh_pca = ViewerButton("Refresh PCA Projection", cb_hook=lambda _: viewer_utils.reset_pca_proj())
 
         # Only setup GUI for language features if we're using CLIP
-        if self.kwargs["metadata"]["feature_type"] != "CLIP":
+        if self.kwargs["metadata"]["feature_type"] not in ["CLIP", "DINOCLIP"]:
             return
         self.hint_text = ViewerText(name="Note:", disabled=True, default_value="Use , to separate labels")
         self.lang_1_pos_text = ViewerText(
@@ -198,15 +236,25 @@ class FeatureFieldModel(NerfactoModel):
 
         # Feature outputs
         ff_outputs = self.feature_field(ray_samples)
-        features = self.renderer_feature(features=ff_outputs[FeatureFieldHeadNames.FEATURE], weights=weights)
-
         outputs = {
             "rgb": rgb,
             "accumulation": accumulation,
             "depth": depth,
             "expected_depth": expected_depth,
-            "feature": features,
         }
+        if self.kwargs["metadata"]["feature_type"] == "DINOCLIP":
+            feat_dino = self.renderer_feature(ff_outputs["feat_dino"], weights)
+            feat_clip = self.renderer_feature(ff_outputs["feat_clip"], weights)
+            outputs.update(
+                {
+                    "feature_dino": feat_dino,
+                    "feature_clip": feat_clip,
+                    "feature": feat_clip,  # viewer uses this key
+                }
+            )
+        else:
+            features = self.renderer_feature(features=ff_outputs[FeatureFieldHeadNames.FEATURE], weights=weights)
+            outputs["feature"] = features
 
         if self.config.predict_normals:
             normals = self.renderer_normals(normals=field_outputs[FieldHeadNames.NORMALS], weights=weights)
@@ -215,8 +263,8 @@ class FeatureFieldModel(NerfactoModel):
             outputs["pred_normals"] = self.normals_shader(pred_normals)
         # These use a lot of GPU memory, so we avoid storing them for eval.
         if self.training:
-            outputs["weights_list"] = weights_list
-            outputs["ray_samples_list"] = ray_samples_list
+            outputs["weights_list"] = [w.detach() for w in weights_list]
+            outputs["ray_samples_list"] = [_detach_ray_samples(rs) for rs in ray_samples_list]
 
         if self.training and self.config.predict_normals:
             outputs["rendered_orientation_loss"] = orientation_loss(
@@ -236,16 +284,34 @@ class FeatureFieldModel(NerfactoModel):
 
     def get_metrics_dict(self, outputs, batch):
         metrics_dict = super().get_metrics_dict(outputs, batch)
-        # Compute feature error
-        target_feats = batch["feature"].to(self.device)
-        metrics_dict["feature_error"] = F.mse_loss(outputs["feature"], target_feats)
+        ft = self.kwargs["metadata"]["feature_type"]
+        if ft == "DINOCLIP":
+            metrics_dict["feature_dino_error"] = F.mse_loss(
+                outputs["feature_dino"], batch["feature_dino"].to(self.device)
+            )
+            metrics_dict["feature_clip_error"] = F.mse_loss(
+                outputs["feature_clip"], batch["feature_clip"].to(self.device)
+            )
+        else:
+            target_feats = batch["feature"].to(self.device)
+            metrics_dict["feature_error"] = F.mse_loss(outputs["feature"], target_feats)
         return metrics_dict
 
     def get_loss_dict(self, outputs, batch, metrics_dict=None):
         loss_dict = super().get_loss_dict(outputs, batch, metrics_dict)
-        # Compute feature loss
-        target_feats = batch["feature"].to(self.device)
-        loss_dict["feature_loss"] = self.config.feat_loss_weight * F.mse_loss(outputs["feature"], target_feats)
+        ft = self.kwargs["metadata"]["feature_type"]
+        if ft == "DINOCLIP":
+            loss_dict["feature_dino_loss"] = (
+                self.config.feat_loss_weight
+                * F.mse_loss(outputs["feature_dino"], batch["feature_dino"].to(self.device))
+            )
+            loss_dict["feature_clip_loss"] = (
+                self.config.feat_loss_weight
+                * F.mse_loss(outputs["feature_clip"], batch["feature_clip"].to(self.device))
+            )
+        else:
+            target_feats = batch["feature"].to(self.device)
+            loss_dict["feature_loss"] = self.config.feat_loss_weight * F.mse_loss(outputs["feature"], target_feats)
         return loss_dict
 
     @torch.no_grad()
@@ -258,7 +324,7 @@ class FeatureFieldModel(NerfactoModel):
         )
 
         # Nothing else to do if not CLIP features or no positives
-        if self.kwargs["metadata"]["feature_type"] != "CLIP" or not viewer_utils.has_positives:
+        if self.kwargs["metadata"]["feature_type"] not in ["CLIP", "DINOCLIP"] or not viewer_utils.has_positives:
             return outputs
 
         # Normalize CLIP features rendered by feature field

@@ -21,6 +21,7 @@ datasets/
 outputs/
 f3rm_outputs/
 robopoint_outputs/
+dense_outputs/
 renders/
 
 **/*notrack*/

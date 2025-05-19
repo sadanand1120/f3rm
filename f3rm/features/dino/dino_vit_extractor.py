@@ -1,6 +1,6 @@
 """
 High Resolution DINO ViT Feature Extractor
-Copied from https://github.com/ShirAmir/dino-vit-features/blob/main/extractor.py
+Adapted from https://github.com/ShirAmir/dino-vit-features/blob/main/extractor.py
 """
 import argparse
 import torch
@@ -12,6 +12,7 @@ import types
 from pathlib import Path
 from typing import Union, List, Tuple
 from PIL import Image
+from f3rm.features.utils import preprocess
 
 
 class ViTExtractor:
@@ -26,27 +27,37 @@ class ViTExtractor:
     d - the embedding dimension in the ViT.
     """
 
-    def __init__(self, model_type: str = 'dino_vits8', stride: int = 4, model: nn.Module = None,
-                 device: Union[str, torch.device] = 'cuda'):
+    def __init__(self, model_type: str = 'dino_vits8', stride: int = 4, model: nn.Module = None):
         """
         :param model_type: A string specifying the type of model to extract from.
                           [dino_vits8 | dino_vits16 | dino_vitb8 | dino_vitb16 | vit_small_patch8_224 |
-                          vit_small_patch16_224 | vit_base_patch8_224 | vit_base_patch16_224]
+                          vit_small_patch16_224 | vit_base_patch8_224 | vit_base_patch16_224 |
+                          dinov2_vits14 | dinov2_vitb14 | dinov2_vitl14 | dinov2_vitg14 | 
+                          dinov2_vits14_reg | dinov2_vitb14_reg | dinov2_vitl14_reg | dinov2_vitg14_reg]
         :param stride: stride of first convolution layer. small stride -> higher resolution.
         :param model: Optional parameter. The nn.Module to extract from instead of creating a new one in ViTExtractor.
                       should be compatible with model_type.
         """
         self.model_type = model_type
-        self.device = device
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         if model is not None:
             self.model = model
         else:
-            self.model = ViTExtractor.create_model(model_type)
+            if model_type.startswith('dinov2_'):
+                self.model = ViTExtractor.create_model_dinov2(model_type)
+            else:
+                self.model = ViTExtractor.create_model(model_type)
 
-        self.model = ViTExtractor.patch_vit_resolution(self.model, stride=stride)
+        if not model_type.startswith('dinov2_'):
+            self.model = ViTExtractor.patch_vit_resolution(self.model, stride=stride)
         self.model.eval()
         self.model.to(self.device)
-        self.p = self.model.patch_embed.patch_size
+
+        if model_type.startswith('dinov2_'):
+            self.p = self.model.patch_embed.patch_size[0]
+        else:
+            self.p = self.model.patch_embed.patch_size
+
         self.stride = self.model.patch_embed.proj.stride
 
         self.mean = (0.485, 0.456, 0.406) if "dino" in self.model_type else (0.5, 0.5, 0.5)
@@ -87,6 +98,17 @@ class ViTExtractor:
         return model
 
     @staticmethod
+    def create_model_dinov2(model_type: str) -> nn.Module:
+        """
+        :param model_type: a string specifying which model to load. 
+                            [dinov2_vits14 | dinov2_vitb14 | dinov2_vitl14 | dinov2_vitg14 | 
+                            dinov2_vits14_reg | dinov2_vitb14_reg | dinov2_vitl14_reg | dinov2_vitg14_reg]
+        :return: the model
+        """
+        model = torch.hub.load('facebookresearch/dinov2', model_type)
+        return model
+
+    @staticmethod
     def _fix_pos_enc(patch_size: int, stride_hw: Tuple[int, int]):
         """
         Creates a method for position encoding interpolation.
@@ -94,6 +116,7 @@ class ViTExtractor:
         :param stride_hw: A tuple containing the new height and width stride respectively.
         :return: the interpolation method
         """
+
         def interpolate_pos_encoding(self, x: torch.Tensor, w: int, h: int) -> torch.Tensor:
             npatch = x.shape[1] - 1
             N = self.pos_embed.shape[1] - 1
@@ -144,25 +167,26 @@ class ViTExtractor:
         model.interpolate_pos_encoding = types.MethodType(ViTExtractor._fix_pos_enc(patch_size, stride), model)
         return model
 
-    def preprocess(self, image_path: Union[str, Path],
-                   load_size: Union[int, Tuple[int, int]] = None) -> Tuple[torch.Tensor, Image.Image]:
+    def preprocess(self, image_path: Union[str, Path, Image.Image],
+                   load_size: Union[int, Tuple[int, int]] = None,
+                   allow_crop: bool = False) -> Tuple[torch.Tensor, Image.Image]:
         """
         Preprocesses an image before extraction.
-        :param image_path: path to image to be extracted.
-        :param load_size: optional. Size to resize image before the rest of preprocessing.
+        :param image_path: path to image to be extracted, or a PIL image.
+        :param load_size: optional. Size to resize image before the rest of preprocessing. -1 to use smallest side size.
+        :param allow_crop: optional. If True, crop the image to be divisible by the patch size.
         :return: a tuple containing:
                     (1) the preprocessed image as a tensor to insert the model of shape BxCxHxW.
                     (2) the pil image in relevant dimensions
         """
-        pil_image = Image.open(image_path).convert('RGB')
-        if load_size is not None:
-            pil_image = transforms.Resize(load_size, interpolation=transforms.InterpolationMode.LANCZOS)(pil_image)
-        prep = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=self.mean, std=self.std)
-        ])
-        prep_img = prep(pil_image)[None, ...]
-        return prep_img, pil_image
+        return preprocess(
+            image_path=image_path,
+            load_size=load_size,
+            patch_size=self.p,
+            mean=self.mean,
+            std=self.std,
+            allow_crop=allow_crop
+        )
 
     def _get_hook(self, facet: str):
         """
@@ -186,7 +210,7 @@ class ViTExtractor:
             input = input[0]
             B, N, C = input.shape
             qkv = module.qkv(input).reshape(B, N, 3, module.num_heads, C // module.num_heads).permute(2, 0, 3, 1, 4)
-            self._feats.append(qkv[facet_idx]) #Bxhxtxd
+            self._feats.append(qkv[facet_idx])  # Bxhxtxd
         return _inner_hook
 
     def _register_hooks(self, layers: List[int], facet: str) -> None:
@@ -270,13 +294,13 @@ class ViTExtractor:
                                 continue
                             if 0 <= i < self.num_patches[0] and 0 <= j < self.num_patches[1]:
                                 bin_x[:, part_idx * sub_desc_dim: (part_idx + 1) * sub_desc_dim, y, x] = avg_pools[k][
-                                                                                                           :, :, i, j]
+                                    :, :, i, j]
                             else:  # handle padding in a more delicate way than zero padding
                                 temp_i = max(0, min(i, self.num_patches[0] - 1))
                                 temp_j = max(0, min(j, self.num_patches[1] - 1))
                                 bin_x[:, part_idx * sub_desc_dim: (part_idx + 1) * sub_desc_dim, y, x] = avg_pools[k][
-                                                                                                           :, :, temp_i,
-                                                                                                           temp_j]
+                                    :, :, temp_i,
+                                    temp_j]
                             part_idx += 1
         bin_x = bin_x.flatten(start_dim=-2, end_dim=-1).permute(0, 2, 1).unsqueeze(dim=1)
         # Bx1x(t-1)x(dxh)
@@ -294,10 +318,13 @@ class ViTExtractor:
         """
         assert facet in ['key', 'query', 'value', 'token'], f"""{facet} is not a supported facet for descriptors. 
                                                              choose from ['key' | 'query' | 'value' | 'token'] """
+        if layer < 0:
+            layer = len(self.model.blocks) + layer
+        batch = batch.to(self.device)
         self._extract_features(batch, [layer], facet)
         x = self._feats[0]
         if facet == 'token':
-            x.unsqueeze_(dim=1) #Bx1xtxd
+            x.unsqueeze_(dim=1)  # Bx1xtxd
         if not include_cls:
             x = x[:, :, 1:, :]  # remove cls token
         else:
@@ -318,13 +345,16 @@ class ViTExtractor:
         assert self.model_type == "dino_vits8", f"saliency maps are supported only for dino_vits model_type."
         self._extract_features(batch, [11], 'attn')
         head_idxs = [0, 2, 4, 5]
-        curr_feats = self._feats[0] #Bxhxtxt
-        cls_attn_map = curr_feats[:, head_idxs, 0, 1:].mean(dim=1) #Bx(t-1)
+        curr_feats = self._feats[0]  # Bxhxtxt
+        cls_attn_map = curr_feats[:, head_idxs, 0, 1:].mean(dim=1)  # Bx(t-1)
         temp_mins, temp_maxs = cls_attn_map.min(dim=1)[0], cls_attn_map.max(dim=1)[0]
         cls_attn_maps = (cls_attn_map - temp_mins) / (temp_maxs - temp_mins)  # normalize to range [0,1]
         return cls_attn_maps
 
+
 """ taken from https://stackoverflow.com/questions/15008758/parsing-boolean-values-with-argparse"""
+
+
 def str2bool(v):
     if isinstance(v, bool):
         return v
@@ -334,6 +364,7 @@ def str2bool(v):
         return False
     else:
         raise argparse.ArgumentTypeError('Boolean value expected.')
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Facilitate ViT Descriptor extraction.')

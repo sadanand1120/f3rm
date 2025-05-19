@@ -12,10 +12,16 @@ export HLOC_WORKERS=24 && export CUDA_VISIBLE_DEVICES='0' && export HLOC_LOG_LEV
 
 
 
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && export CUDA_VISIBLE_DEVICES='0,1,2,3' && ns-train f3rm --max-num-iterations 120000 --pipeline.datamanager.train-num-images-to-sample-from 32 --pipeline.datamanager.train-num-times-to-repeat-images 128 --pipeline.datamanager.eval-num-images-to-sample-from 32 --pipeline.datamanager.eval-num-times-to-repeat-images 128 --machine.num-devices 4 --vis viewer+wandb --data datasets/f3rm/custom/ahgroom/ahgroom_colmap --pipeline.datamanager.feature-type CLIP
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && export CUDA_VISIBLE_DEVICES='0,1,2,3' && ns-train f3rm --max-num-iterations 120000 --pipeline.datamanager.train-num-images-to-sample-from 32 --pipeline.datamanager.train-num-times-to-repeat-images 128 --pipeline.datamanager.eval-num-images-to-sample-from 32 --pipeline.datamanager.eval-num-times-to-repeat-images 128 --machine.num-devices 4 --vis wandb --data datasets/f3rm/custom/ahgroom/ahgroom_colmap --pipeline.datamanager.feature-type CLIP --output-dir outputs --experiment-name homenew --pipeline.model.feat-hidden-dim 64 --pipeline.model.feat-num-layers 2 
 
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && export CUDA_VISIBLE_DEVICES='0,1,2,3' && ns-train f3rm --max-num-iterations 100000 --pipeline.datamanager.train-num-images-to-sample-from 32 --pipeline.datamanager.train-num-times-to-repeat-images 512 --pipeline.datamanager.eval-num-images-to-sample-from 32 --pipeline.datamanager.eval-num-times-to-repeat-images 512 --machine.num-devices 4 --vis viewer+wandb --data datasets/f3rm/custom/homenew nerfstudio-data --pipeline.datamanager.feature-type CLIP --orientation-method none --center-method none --auto-scale-poses False --scale-factor 1.0 --scene-scale 1.0 --output-dir outputs --experiment-name homenew
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && <...above...> --experiment-name homenew --load-dir dense_outputs/dinoclip/f3rm/2025-05-18_185942/nerfstudio_models
 
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && <...above...> --experiment-name homenew nerfstudio-data --orientation-method none --center-method none --auto-scale-poses False --scale-factor 1.0 --scene-scale 1.0
+
+
+
+
+ns-export pointcloud --load-config outputs/sittingroom/f3rm/2025-04-07_123618/config.yml --output-dir exports/sitting_pcd/ --num-points 50000000 --remove-outliers True --normal-method open3d --use-bounding-box True --bounding-box-min -1 -1 -1 --bounding-box-max 1 1 1
 
 
 

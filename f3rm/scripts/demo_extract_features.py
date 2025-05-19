@@ -18,12 +18,12 @@ image_paths = [os.path.join(_IMAGE_DIR, name) for name in ["frame_1.png", "frame
 def demo_extract_features():
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
-    clip_embeddings = extract_clip_features(image_paths, device)
+    clip_embeddings = extract_clip_features(image_paths, device, verbose=True).cpu()
     # Convert to float as torch PCA doesn't support half on GPU
     clip_embeddings = clip_embeddings.float()
     clip_pca = apply_pca_colormap(clip_embeddings).cpu().numpy()
 
-    dino_embeddings = extract_dino_features(image_paths, device)
+    dino_embeddings = extract_dino_features(image_paths, device, verbose=True).cpu()
     dino_pca = apply_pca_colormap(dino_embeddings).cpu().numpy()
 
     # Visualize the embeddings
