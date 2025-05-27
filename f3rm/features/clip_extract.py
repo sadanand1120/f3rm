@@ -13,7 +13,7 @@ import open_clip
 
 
 class CLIPArgs:
-    model_name: str = "ViT-L-14-336-quickgelu"
+    model_name: str = "ViT-L-14-336-quickgelu"   # open_clip.list_pretrained() lists all available models
     model_pretrained: str = "openai"
     load_size: int = 1024
     skip_center_crop: bool = True
@@ -59,6 +59,7 @@ def extract_clip_features(image_paths: List[str], device: torch.device, verbose=
     from f3rm.features.utils import get_preprocess
 
     model, _, _ = open_clip.create_model_and_transforms(CLIPArgs.model_name, pretrained=CLIPArgs.model_pretrained, device=device)
+    model.eval()
     preprocess = get_preprocess(resize=CLIPArgs.load_size, do_center_crop=not CLIPArgs.skip_center_crop)
     if verbose:
         print(f"Loaded CLIP model {CLIPArgs.model_name}")

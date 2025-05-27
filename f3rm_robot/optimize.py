@@ -383,6 +383,7 @@ def entrypoint():
     # Load CLIP so we can query via language
     print("Loading CLIP model...", end=" ")
     clip_model, _, _ = open_clip.create_model_and_transforms(CLIPArgs.model_name, pretrained=CLIPArgs.model_pretrained, device=device)
+    clip_model.eval()
     print("Done!")
 
     # Ask for query from user and optimize. If we're using the ViserVisualizer, we can use a textbox in the GUI

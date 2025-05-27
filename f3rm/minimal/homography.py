@@ -11,6 +11,29 @@ class Homography:
         pass
 
     @staticmethod
+    def projectCCStoPCS(ccs_coords, K, width, height, d=None, mode="skip"):
+        """
+        Projects set of points in CCS to PCS.
+        ccs_coords: (N x 3) array of points in CCS
+        Returns: (N x 2) array of points in PCS, in FOV of image, and a mask to indicate which ccs locs were preserved during pixel FOV bounding
+        """
+        ccs_coords = np.asarray(ccs_coords, dtype=np.float64)
+        ccs_mask = (ccs_coords[:, 2] > 0)  # mask to filter out points in front of camera (ie, possibly visible in image). This is important and is not taken care of by pixel bounding
+        ccs_coords = ccs_coords[ccs_mask]
+        if ccs_coords.shape[0] == 0 or ccs_coords is None:
+            return None, None
+        R = np.zeros((3, 1), dtype=np.float64)
+        T = np.zeros((3, 1), dtype=np.float64)
+        if d is None:
+            d = np.zeros((5,), dtype=np.float64)
+        image_points, _ = cv2.projectPoints(ccs_coords, R, T, K, d)
+        image_points = image_points.reshape(-1, 2).astype(int)
+        image_points, pcs_mask = Homography.to_image_fov_bounds(image_points, width, height, mode=mode)
+        unified_mask = deepcopy(ccs_mask)
+        unified_mask[ccs_mask] = pcs_mask
+        return image_points, unified_mask
+
+    @staticmethod
     def general_project_A_to_B(inp, AtoBmat):
         """
         Project inp from A frame to B

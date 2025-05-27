@@ -23,6 +23,7 @@ def demo_clip_features(text_query: str) -> None:
 
     # Load the CLIP model so we can get text embeddings
     model, _, _ = open_clip.create_model_and_transforms(CLIPArgs.model_name, pretrained=CLIPArgs.model_pretrained, device=device)
+    model.eval()
 
     # Encode text query
     tokenize = open_clip.get_tokenizer(CLIPArgs.model_name)

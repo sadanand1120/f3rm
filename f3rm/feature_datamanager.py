@@ -19,6 +19,19 @@ from f3rm.features.clip_extract import CLIPArgs, extract_clip_features
 from f3rm.features.dino_extract import DINOArgs, extract_dino_features
 from f3rm.features.robopoint_extract import ROBOPOINTArgs, extract_robopoint_proj_features, extract_robopoint_noproj_features
 
+_copy_stream = torch.cuda.Stream()
+
+
+def _async_to_cuda(t: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Pin + async-copy on a dedicated stream."""
+    if t.is_cuda:
+        return t
+    pin = t.pin_memory()
+    with torch.cuda.stream(_copy_stream):
+        gpu = pin.to(device, non_blocking=True)
+    torch.cuda.current_stream().wait_stream(_copy_stream)
+    return gpu
+
 
 class LazyFeatures:
     """Memory-mapped shards with O(1) random access.
@@ -238,14 +251,11 @@ class FeatureDataManager(VanillaDataManager):
     # Nearest-neighbor sampling helpers
     def _gather_feats(self, feats, camera_idx, y_idx, x_idx):
         if isinstance(feats, LazyFeatures):
-            out = [
-                feats[int(ci), int(yi), int(xi)]               # returns *CPU* tensor now
-                for ci, yi, xi in zip(camera_idx, y_idx, x_idx)
-            ]
-            return torch.stack(out, dim=0).to(self.device, non_blocking=True)
+            out = [feats[int(ci), int(yi), int(xi)] for ci, yi, xi in zip(camera_idx, y_idx, x_idx)]
+            cpu_batch = torch.stack(out, dim=0)
         else:
-            slice_cpu = feats[camera_idx, y_idx, x_idx]        # stays on CPU
-            return slice_cpu.to(self.device, non_blocking=True)
+            cpu_batch = feats[camera_idx, y_idx, x_idx]
+        return _async_to_cuda(cpu_batch, self.device)
 
     # helper
     def _index_triplet(self, batch, scale_h, scale_w):
@@ -257,7 +267,7 @@ class FeatureDataManager(VanillaDataManager):
 
     def next_train(self, step: int) -> Tuple[RayBundle, Dict]:
         ray_bundle, batch = super().next_train(step)
-        batch["image"] = batch["image"].to(self.device, non_blocking=True)
+        batch["image"] = _async_to_cuda(batch["image"], self.device)
         if self.config.feature_type == "DINOCLIP":
             camera_idx, y_idx, x_idx = self._index_triplet(batch, self.scale_h_dino, self.scale_w_dino)
             batch["feature_dino"] = self._gather_feats(self.features_dino, camera_idx, y_idx, x_idx)
@@ -272,7 +282,7 @@ class FeatureDataManager(VanillaDataManager):
 
     def next_eval(self, step: int) -> Tuple[RayBundle, Dict]:
         ray_bundle, batch = super().next_eval(step)
-        batch["image"] = batch["image"].to(self.device, non_blocking=True)
+        batch["image"] = _async_to_cuda(batch["image"], self.device)
         if self.config.feature_type == "DINOCLIP":
             camera_idx, y_idx, x_idx = self._index_triplet(batch, self.scale_h_dino, self.scale_w_dino)
             batch["feature_dino"] = self._gather_feats(self.features_dino, camera_idx + self.eval_offset, y_idx, x_idx)

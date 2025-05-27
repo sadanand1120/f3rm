@@ -28,5 +28,4 @@ renders/
 **/*notrack*
 **/.clang-format
 **/.vscode
-colmap/
 Hierarchical-Localization/
