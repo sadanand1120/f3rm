@@ -3,6 +3,7 @@ import numpy as np
 import os
 import yaml
 import math
+import torch
 from copy import deepcopy
 
 
@@ -11,40 +12,64 @@ class Homography:
         pass
 
     @staticmethod
-    def projectCCStoPCS(ccs_coords, K, width, height, d=None, mode="skip"):
+    def projectCCStoPCS(ccs_coords, K, width, height, d=None, mode="skip", device=None):
         """
         Projects set of points in CCS to PCS.
         ccs_coords: (N x 3) array of points in CCS
         Returns: (N x 2) array of points in PCS, in FOV of image, and a mask to indicate which ccs locs were preserved during pixel FOV bounding
         """
-        ccs_coords = np.asarray(ccs_coords, dtype=np.float64)
-        ccs_mask = (ccs_coords[:, 2] > 0)  # mask to filter out points in front of camera (ie, possibly visible in image). This is important and is not taken care of by pixel bounding
-        ccs_coords = ccs_coords[ccs_mask]
-        if ccs_coords.shape[0] == 0 or ccs_coords is None:
-            return None, None
-        R = np.zeros((3, 1), dtype=np.float64)
-        T = np.zeros((3, 1), dtype=np.float64)
-        if d is None:
-            d = np.zeros((5,), dtype=np.float64)
-        image_points, _ = cv2.projectPoints(ccs_coords, R, T, K, d)
-        image_points = image_points.reshape(-1, 2).astype(int)
-        image_points, pcs_mask = Homography.to_image_fov_bounds(image_points, width, height, mode=mode)
-        unified_mask = deepcopy(ccs_mask)
-        unified_mask[ccs_mask] = pcs_mask
-        return image_points, unified_mask
+        if device is not None and isinstance(ccs_coords, torch.Tensor):
+            # Torch tensor path - simplified projection without distortion
+            # Simple pinhole projection
+            projected = torch.matmul(ccs_coords, K.T)
+            pixel_coords = projected[:, :2] / projected[:, 2:3]
+
+            # Convert to integer pixel coordinates and clip to image bounds
+            pixel_coords = pixel_coords.round().long()
+            pixel_coords[:, 0] = torch.clamp(pixel_coords[:, 0], 0, width - 1)
+            pixel_coords[:, 1] = torch.clamp(pixel_coords[:, 1], 0, height - 1)
+
+            # For torch path, return simplified output (no mask for now)
+            return pixel_coords, None
+        else:
+            # Original NumPy implementation
+            ccs_coords = np.asarray(ccs_coords, dtype=np.float64)
+            ccs_mask = (ccs_coords[:, 2] > 0)  # mask to filter out points in front of camera (ie, possibly visible in image). This is important and is not taken care of by pixel bounding
+            ccs_coords = ccs_coords[ccs_mask]
+            if ccs_coords.shape[0] == 0 or ccs_coords is None:
+                return None, None
+            R = np.zeros((3, 1), dtype=np.float64)
+            T = np.zeros((3, 1), dtype=np.float64)
+            if d is None:
+                d = np.zeros((5,), dtype=np.float64)
+            image_points, _ = cv2.projectPoints(ccs_coords, R, T, K, d)
+            image_points = image_points.reshape(-1, 2).astype(int)
+            image_points, pcs_mask = Homography.to_image_fov_bounds(image_points, width, height, mode=mode)
+            unified_mask = deepcopy(ccs_mask)
+            unified_mask[ccs_mask] = pcs_mask
+            return image_points, unified_mask
 
     @staticmethod
-    def general_project_A_to_B(inp, AtoBmat):
+    def general_project_A_to_B(inp, AtoBmat, device=None):
         """
         Project inp from A frame to B
         inp: (N x 3) array of points in A frame
         AtoBmat: (4 x 4) transformation matrix from A to B
         Returns: (N x 3) array of points in B frame
         """
-        inp = np.asarray(inp).astype(np.float64)
-        inp_4d = Homography.get_homo_from_ordinary(inp)
-        out_4d = (AtoBmat @ inp_4d.T).T
-        return Homography.get_ordinary_from_homo(out_4d)
+        if device is not None and isinstance(inp, torch.Tensor):
+            # Torch tensor path
+            ones = torch.ones(inp.shape[0], 1, dtype=inp.dtype, device=inp.device)
+            inp_4d = torch.cat([inp, ones], dim=1)
+            out_4d = torch.matmul(inp_4d, AtoBmat.T)
+            out_3d = out_4d[:, :3] / out_4d[:, 3:4]
+            return out_3d
+        else:
+            # NumPy path (original implementation)
+            inp = np.asarray(inp).astype(np.float64)
+            inp_4d = Homography.get_homo_from_ordinary(inp)
+            out_4d = (AtoBmat @ inp_4d.T).T
+            return Homography.get_ordinary_from_homo(out_4d)
 
     @staticmethod
     def to_image_fov_bounds(pixels, width, height, mode="skip"):
@@ -76,7 +101,7 @@ class Homography:
         return np.hstack([points_lowerD, ones])  # append the ones column to points
 
     @staticmethod
-    def get_std_trans(cx=0, cy=0, cz=0):
+    def get_std_trans(cx=0, cy=0, cz=0, device=None):
         """
         cx, cy, cz are the coords of O_M wrt O_F when expressed in F
         Multiplication goes like M_coords = T * F_coords
@@ -87,37 +112,49 @@ class Homography:
             [0, 0, 1, -cz],
             [0, 0, 0, 1]
         ]
+        if device is not None:
+            return torch.tensor(mat, dtype=torch.float32, device=device)
         return np.array(mat)
 
     @staticmethod
-    def get_std_rot(axis, alpha):
+    def get_std_rot(axis, alpha, device=None):
         """
         axis is either "X", "Y", or "Z" axis of F and alpha is positive acc to right hand thumb rule dirn
         Multiplication goes like M_coords = T * F_coords
         """
+        if device is not None:
+            cos_alpha = torch.cos(torch.tensor(alpha, device=device))
+            sin_alpha = torch.sin(torch.tensor(alpha, device=device))
+        else:
+            cos_alpha = math.cos(alpha)
+            sin_alpha = math.sin(alpha)
+
         if axis == "X":
             mat = [
                 [1, 0, 0, 0],
-                [0, math.cos(alpha), math.sin(alpha), 0],
-                [0, -math.sin(alpha), math.cos(alpha), 0],
+                [0, cos_alpha, sin_alpha, 0],
+                [0, -sin_alpha, cos_alpha, 0],
                 [0, 0, 0, 1]
             ]
         elif axis == "Y":
             mat = [
-                [math.cos(alpha), 0, -math.sin(alpha), 0],
+                [cos_alpha, 0, -sin_alpha, 0],
                 [0, 1, 0, 0],
-                [math.sin(alpha), 0, math.cos(alpha), 0],
+                [sin_alpha, 0, cos_alpha, 0],
                 [0, 0, 0, 1]
             ]
         elif axis == "Z":
             mat = [
-                [math.cos(alpha), math.sin(alpha), 0, 0],
-                [-math.sin(alpha), math.cos(alpha), 0, 0],
+                [cos_alpha, sin_alpha, 0, 0],
+                [-sin_alpha, cos_alpha, 0, 0],
                 [0, 0, 1, 0],
                 [0, 0, 0, 1]
             ]
         else:
             raise ValueError("Invalid axis!")
+
+        if device is not None:
+            return torch.tensor(mat, dtype=torch.float32, device=device)
         return np.array(mat)
 
     @staticmethod

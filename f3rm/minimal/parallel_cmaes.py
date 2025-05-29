@@ -1,71 +1,68 @@
-# parallel_cma.py -------------------------------------------------------------
+# parallel_cma.py
 import os
 import sys
 import time
 import torch
+import torch.multiprocessing as mp
 import numpy as np
 from torch.multiprocessing import Process, Queue
-import cma                                   # pip install cma
-from typing import Callable, Sequence
+import cma
+from typing import Callable, Sequence, Optional
 from tqdm.auto import tqdm
 import inspect
 
+# Set the multiprocessing start method to 'spawn' for CUDA compatibility
+try:
+    mp.set_start_method('spawn', force=True)
+except RuntimeError:
+    pass  # Start method already set
 
-def _worker(param_q: Queue, result_q: Queue, stop_q: Queue, obj_source, w_id: int):
-    """GPU-aware worker that builds (if needed) its own objective fn."""
-    dev = torch.device(f"cuda:{w_id % torch.cuda.device_count()}" if torch.cuda.is_available() else "cpu")
 
-    # pick or build objective -------------------------------------------------
-    if callable(obj_source):
-        try:                                # zero-arg factory?
-            if len(inspect.signature(obj_source).parameters) == 1:
-                obj_fn = obj_source(dev)          # pass device
-            else:
-                obj_fn = obj_source() if callable(obj_source) else obj_source
-        except (ValueError, TypeError):
-            obj_fn = obj_source
-    else:
-        raise TypeError("obj_source must be callable")
+def _worker(param_q: Queue, result_q: Queue, stop_q: Queue, obj_source, worker_device: torch.device):
+    """Worker process that evaluates objectives on specified device."""
+    obj_fn = obj_source(worker_device)   # Build objective function from factory
 
-    # silence worker stdout / stderr -----------------------------------------
+    # Redirect worker output to avoid clutter
     pid = str(os.getpid())
     sys.stdout = open(f"/tmp/cma_{pid}.out", "a")
     sys.stderr = open(f"/tmp/cma_{pid}.err", "a")
 
-    # main loop ---------------------------------------------------------------
+    # Main evaluation loop
     while stop_q.empty():
         if param_q.empty():
             time.sleep(0.01)
             continue
         sid, x = param_q.get()
-        fitness = obj_fn(x, dev)
+        fitness = obj_fn(x)
         result_q.put((sid, fitness))
 
 
 class ParallelEvaluator:
-    """
-    Farm-outs objective evaluations to N workers.
-
-    obj_source:
-        * plain callable  -> used directly in every worker
-        * zero-arg factory -> called *inside each worker* to build
-                              the real objective (useful for heavy setup)
-    """
+    """Parallel objective function evaluator using multiple workers."""
 
     def __init__(self, obj_source, n_workers: int = 8, show_progress: bool = True):
         self.param_q, self.result_q, self.stop_q = Queue(), Queue(), Queue()
         self.show_progress = show_progress
-        self.workers = [Process(target=_worker, args=(self.param_q, self.result_q, self.stop_q, obj_source, wid)) for wid in range(n_workers)]
-        for w in self.workers:
-            w.start()
+
+        # Create workers with device assignment
+        self.workers = []
+        for wid in range(n_workers):
+            worker_device = torch.device(f"cuda:{wid % torch.cuda.device_count()}" if torch.cuda.is_available() else "cpu")
+            worker = Process(target=_worker, args=(self.param_q, self.result_q, self.stop_q, obj_source, worker_device))
+            self.workers.append(worker)
+            worker.start()
 
     def evaluate(self, params: Sequence[np.ndarray], repeats: int = 1) -> list[float]:
-        """Return mean fitness for every element in *params* (lower = better)."""
+        """Evaluate parameters and return mean fitness scores (lower = better)."""
         n_tasks = len(params) * repeats
         agg = [0.0] * len(params)
+
+        # Submit all tasks
         for sid, p in enumerate(params):
             for _ in range(repeats):
                 self.param_q.put((sid, p))
+
+        # Collect results
         bar = tqdm(total=n_tasks, disable=not self.show_progress, desc="Evaluations", leave=False)
         processed = 0
         while processed < n_tasks:
@@ -77,46 +74,36 @@ class ParallelEvaluator:
         return agg
 
     def close(self, grace: float = 5.0):
-        """
-        Try to shut workers down gracefully, then force-kill if they ignore us.
-
-        Parameters
-        ----------
-        grace : float
-            Seconds to wait for a clean exit before calling ``terminate()``.
-        """
-        # 1. signal stop (one token is enough—workers only test `.empty()`)
+        """Shutdown workers gracefully, then force-kill if needed."""
+        # Signal stop
         self.stop_q.put(True)
 
-        # 2. wait for graceful exit
+        # Wait for graceful exit
         for w in self.workers:
             w.join(timeout=grace)
 
-        # 3. hard kill any stragglers
+        # Force kill stragglers
         for w in self.workers:
             if w.is_alive():
                 print(f"[ParallelEvaluator] Worker {w.pid} still alive → terminate()")
                 w.terminate()
                 w.join()
 
-        # 4. tidy up log files (ignore if still held/open)
+        # Clean up log files
         for w in self.workers:
             for ext in (".out", ".err"):
                 try:
                     os.remove(f"/tmp/cma_{w.pid}{ext}")
-                except FileNotFoundError:
-                    pass
-                except PermissionError:
-                    # File might still be locked on some OSes—skip
+                except (FileNotFoundError, PermissionError):
                     pass
 
-        # 5. close queues and detach background threads
+        # Close queues
         for q in (self.param_q, self.result_q, self.stop_q):
             q.close()
-            q.join_thread()          # prevents hanging on interpreter exit
+            q.join_thread()
 
 
-def cma_es_optimize(obj_fn: Callable[[np.ndarray, torch.device], float],
+def cma_es_optimize(obj_source: Callable,
                     x0: np.ndarray,
                     sigma0: float = 0.5,
                     lower_bounds: np.ndarray = None,
@@ -126,12 +113,8 @@ def cma_es_optimize(obj_fn: Callable[[np.ndarray, torch.device], float],
                     repeats: int = 4,
                     target: float = None,
                     n_workers: int = 8):
-    """
-    Parallel CMA-ES optimisation with progress-bar and clean shutdown.
-    Returns (best_params, best_fitness).
-    Solves minimisation problem.
-    """
-    evaluator = ParallelEvaluator(obj_fn, n_workers=n_workers)
+    """Parallel CMA-ES optimization. Returns (best_params, best_fitness)."""
+    evaluator = ParallelEvaluator(obj_source, n_workers=n_workers)
     es = cma.CMAEvolutionStrategy(x0, sigma0, {'popsize': popsize, 'verb_disp': 0, 'bounds': [lower_bounds, upper_bounds]})
     best_params, best_fit = None, float("inf")
     try:
@@ -151,47 +134,70 @@ def cma_es_optimize(obj_fn: Callable[[np.ndarray, torch.device], float],
                 if target is not None and best_fit <= target:
                     break
     finally:
-        evaluator.close()          # ensures workers exit even on errors
+        print("Closing evaluator...")
+        evaluator.close()
     return best_params, best_fit
 
 
-def rastrigin(x: np.ndarray, *_):
-    """Shifted + negated so CMA-ES *minimises* (-reward == cost)."""
-    z = x - 10.0
-    return 10 * len(z) + np.sum(z**2 - 10 * np.cos(2 * np.pi * z))
+# Example objective functions
+class RastriginFactory:
+    """Factory for creating Rastrigin objective functions."""
+
+    def __init__(self, **kwargs):
+        pass  # No additional parameters needed for rastrigin
+
+    def __call__(self, device: torch.device):
+        def rastrigin(x: np.ndarray):
+            """Rastrigin function (shifted + negated for minimization)."""
+            z = x - 10.0
+            return 10 * len(z) + np.sum(z**2 - 10 * np.cos(2 * np.pi * z))
+        return rastrigin
 
 
-class Toy:
-    def __init__(self): self.offset = 3.0
-    def obj(self, x, *_): return np.sum((x - self.offset)**2)
+class ToyFactory:
+    """Factory for creating Toy objective functions."""
+
+    def __init__(self, **kwargs):
+        self.offset = kwargs.get('offset', 3.0)
+
+    def __call__(self, device: torch.device):
+        def obj(x: np.ndarray):
+            return np.sum((x - self.offset)**2)
+        return obj
 
 
-class Heavy:
-    def __init__(self, device: torch.device):
-        self.device = device
-        self.model = torch.randn(1000, 1000, device=device)
+class HeavyFactory:
+    """Factory for creating Heavy objective functions that use GPU."""
 
-    def obj(self, x: np.ndarray, _device_from_pool):
-        t = torch.as_tensor(x, dtype=torch.float32, device=self.device)
-        return float(((t @ t) + self.model[0, 0]).cpu())
+    def __init__(self, **kwargs):
+        self.model_size = kwargs.get('model_size', 1000)
 
+    def __call__(self, device: torch.device):
+        # Create model on the specified device
+        model = torch.randn(self.model_size, self.model_size, device=device)
 
-def heavy_factory(device: torch.device):
-    return Heavy(device).obj      # returns the bound method
+        def obj(x: np.ndarray):
+            t = torch.as_tensor(x, dtype=torch.float32, device=device)
+            return float(((t @ t) + model[0, 0]).cpu())
+        return obj
 
 
 if __name__ == "__main__":
+    # Example
+    heavy_factory = HeavyFactory(model_size=50000)
+    # toy_factory = ToyFactory(offset=3.0)
+    # rastrigin_factory = RastriginFactory()
+
     best_x, best_f = cma_es_optimize(
-        rastrigin,
-        # Toy().obj,
-        # heavy_factory,
+        obj_source=heavy_factory,
         x0=np.zeros(100),
         sigma0=0.5,
         popsize=101,
         max_epochs=1000,
         repeats=1,
-        n_workers=4,          # adjust to GPUs/CPU cores you have
-        target=1e-8           # optional early-stop
+        n_workers=4,
+        target=None
     )
-    print("Best fitness:", best_f)
-    print("Best params (first 6 dims):", best_x[:6])
+
+    print(f"Best fitness: {best_f}")
+    print(f"Best params (first 6 dims): {best_x[:6]}")
