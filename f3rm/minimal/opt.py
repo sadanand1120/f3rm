@@ -24,6 +24,85 @@ from f3rm.minimal.utils import exp_to_homo_T, homo_T_to_exp, se3_distance, clust
 from f3rm.minimal.parallel_cmaes import cma_es_optimize
 
 
+def smooth_peak(x: float, l: float, h: float, peak: float, *, eps: float = 1e-3) -> float:
+    """
+    Smooth (Gaussian-shaped) normalizer.
+    • Returns 1.0 at `peak`.
+    • Falls off like a Gaussian and is hard-clipped to 0 outside (l, h).
+    • `eps` sets how close to 0 the curve is at the bounds (default 1 × 10⁻³).
+
+    Parameters
+    ----------
+    x : scalar or numpy array
+    l : lower bound  (must be < peak)
+    h : upper bound  (must be > peak)
+    peak : x-value where output reaches 1.0
+    eps : desired value at the bounds (0 < eps < 1).  Smaller ⇒ wider σ.
+    """
+    if not (l < peak < h):
+        raise ValueError("Require l < peak < h")
+    if not (0.0 < eps < 1.0):
+        raise ValueError("eps must be in (0,1)")
+
+    # Choose σ so that Gaussian value == eps at the bounds.
+    sigma = (peak - l) / np.sqrt(2.0 * np.log(1.0 / eps))
+
+    x = np.asanyarray(x)
+    y = np.exp(-0.5 * ((x - peak) / sigma) ** 2)
+
+    # Hard-clip outside the support region
+    y = np.where((x < l) | (x > h), 0.0, y)
+    return float(y)
+
+
+def normalize_triangular_peak(x: float, l: float, h: float, peak: float) -> float:
+    """
+    Triangular-shaped normalizer.
+    • Returns 1.0 at `peak`, linearly tapers to 0.0 at `l` and `h`.
+    • Outside [l, h] → 0.0.
+
+    Parameters
+    ----------
+    x : scalar or numpy array
+    l : lower bound  (must be < peak)
+    h : upper bound  (must be > peak)
+    peak : x-value where output is 1.0 and derivative changes sign
+    """
+    if l >= peak or h <= peak:
+        raise ValueError("Require l < peak < h")
+
+    # vectorized computation
+    x = np.asanyarray(x)
+    left = (x - l) / (peak - l)
+    right = (h - x) / (h - peak)
+    y = np.where(x < l, 0.0,
+                 np.where(x <= peak, left,
+                          np.where(x <= h, right, 0.0)))
+    return float(np.clip(y, 0.0, 1.0))        # guarantees bounds
+
+
+def smooth_peak_torch(x: torch.Tensor, l: float, h: float, peak: float, eps: float = 1e-3) -> torch.Tensor:
+    """
+    Smooth (Gaussian-shaped) normalizer using torch operations.
+    • Returns 1.0 at `peak`.
+    • Falls off like a Gaussian and is hard-clipped to 0 outside (l, h).
+    • `eps` sets how close to 0 the curve is at the bounds (default 1 × 10⁻³).
+    """
+    if not (l < peak < h):
+        raise ValueError("Require l < peak < h")
+    if not (0.0 < eps < 1.0):
+        raise ValueError("eps must be in (0,1)")
+
+    # Choose σ so that Gaussian value == eps at the bounds.
+    sigma = (peak - l) / torch.sqrt(2.0 * torch.log(torch.tensor(1.0 / eps, device=x.device)))
+
+    y = torch.exp(-0.5 * ((x - peak) / sigma) ** 2)
+
+    # Hard-clip outside the support region
+    y = torch.where((x < l) | (x > h), torch.tensor(0.0, device=x.device), y)
+    return y
+
+
 class NERFOpt:
     def __init__(self, config_path: str = "outputs/ahgroom_colmap/f3rm/2025-04-14_190026/config.yml"):
         self.config_path = config_path
@@ -126,26 +205,38 @@ class NERFOpt:
 
         def obj(x: np.ndarray):
             x = torch.from_numpy(x).to(device, dtype=torch.float32)
-            newc2w_pose_44 = self.generate_new_pose(frame1_c2w_44, c2w_new_44, px=x[0].item(), py=x[1].item(), ry=x[2].item(), device=device)
+            x2_deg = torch.rad2deg(x[2] * 10.0)  # convert radians / 10 to degrees
+            newc2w_pose_44 = self.generate_new_pose(frame1_c2w_44, c2w_new_44, px=x[0].item(), py=x[1].item(), ry=x2_deg.item(), device=device)
             bevpcs_coords = self.c2w_pose_viz(newc2w_pose_44, c2w_new_44, K, WIDTH, HEIGHT, device)
             if not floor_mask[bevpcs_coords[0][1], bevpcs_coords[0][0]].item():
                 return torch.inf
-            score1 = torch.norm(newc2w_pose_44[:3, 3].squeeze() - nerfworld_coords[1].squeeze())
-            score2 = torch.abs(x[2] - 90)
-            return (score1 + score2).item()  # Return scalar for optimizer compatibility
+
+            if not x[0] > 0.49:   # to approximate "facing from the correct side"
+                return torch.inf
+
+            # Keep everything on GPU until the final return
+            _score1 = torch.norm(newc2w_pose_44[:3, 3].squeeze() - nerfworld_coords[1].squeeze())
+            _score2 = x2_deg
+            score1 = smooth_peak_torch(_score1, l=0.1, h=0.2, peak=0.15)
+            score2 = smooth_peak_torch(_score2, l=0.0, h=360.0, peak=90.0)
+            return -(score1 + score2).item()  # Return scalar for optimizer compatibility, negative for minimization
+
+            # score1 = torch.norm(newc2w_pose_44[:3, 3].squeeze() - nerfworld_coords[1].squeeze())
+            # score2 = torch.abs(x[2] - 90)
+            # return (score1 + score2).item()  # Return scalar for optimizer compatibility
         return obj
 
 
 if __name__ == "__main__":
     best_x, best_f = cma_es_optimize(
         obj_source=NERFOpt(),
-        x0=np.zeros(3),
+        x0=np.zeros(3),   # px, py, ry (in radians / 10)
         sigma0=0.5,
-        popsize=101,
+        popsize=1024,
         max_epochs=1000,
         repeats=1,
-        n_workers=4,
-        target=None
+        n_workers=8,
+        target=-1.99
     )
 
     print(f"Best fitness: {best_f}")
