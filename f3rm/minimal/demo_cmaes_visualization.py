@@ -10,11 +10,11 @@ import os
 
 def demo_rastrigin():
     """Demo CMA-ES on 2D Rastrigin function."""
-    from parallel_cmaes import cma_es_optimize, Rastrigin2DFactory
+    from parallel_cmaes import cma_es_optimize, RastriginFactory
 
     print("Running CMA-ES on 2D Rastrigin function...")
 
-    rastrigin_factory = Rastrigin2DFactory()
+    rastrigin_factory = RastriginFactory(shift=0.0, enforce_2d=True, use_fixed_constant=20)
 
     best_x, best_f = cma_es_optimize(
         obj_source=rastrigin_factory,

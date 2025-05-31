@@ -33,10 +33,10 @@ This will:
 ### 2. Run Individual Optimization
 
 ```python
-from parallel_cmaes import cma_es_optimize, Rastrigin2DFactory
+from parallel_cmaes import cma_es_optimize, RastriginFactory
 
-# Create objective function factory
-objective = Rastrigin2DFactory()
+# Create objective function factory (2D Rastrigin with no shift)
+objective = RastriginFactory(shift=0.0, enforce_2d=True, use_fixed_constant=20)
 
 # Run optimization with history recording
 best_x, best_f = cma_es_optimize(
@@ -82,9 +82,16 @@ The animated plots show:
 
 ## Supported Objective Functions
 
-### Rastrigin2DFactory
+### RastriginFactory
 - Classic multimodal test function with many local optima
-- Global minimum at (0, 0) with value 0
+- Configurable parameters:
+  - `shift`: Offset for the function (default: 10.0 for general case, 0.0 for 2D visualization)
+  - `enforce_2d`: Whether to enforce 2D constraint (default: False)
+  - `use_fixed_constant`: Use fixed constant instead of 10*len(z) (default: None, use 20 for 2D visualization)
+- Global minimum depends on shift parameter
+- Examples:
+  - General N-dimensional: `RastriginFactory(shift=10.0)` - minimum at (10, 10, ...)
+  - 2D visualization: `RastriginFactory(shift=0.0, enforce_2d=True, use_fixed_constant=20)` - minimum at (0, 0)
 
 ### SchafferFactory  
 - Another multimodal function with circular symmetry

@@ -188,32 +188,30 @@ def cma_es_optimize(obj_source: Callable,
 
 # Example objective functions
 class RastriginFactory:
-    """Factory for creating Rastrigin objective functions."""
+    """Factory for creating Rastrigin objective functions.
+
+    Can create both general N-dimensional and specific 2D versions based on parameters.
+    """
 
     def __init__(self, **kwargs):
-        pass  # No additional parameters needed for rastrigin
+        self.shift = kwargs.get('shift', 10.0)  # Default shift for general case
+        self.enforce_2d = kwargs.get('enforce_2d', False)  # Whether to enforce 2D constraint
+        self.use_fixed_constant = kwargs.get('use_fixed_constant', None)  # Use fixed constant instead of 10*len(z)
 
     def __call__(self, device: torch.device):
         def rastrigin(x: np.ndarray):
-            """Rastrigin function (shifted + negated for minimization)."""
-            z = x - 10.0
-            return 10 * len(z) + np.sum(z**2 - 10 * np.cos(2 * np.pi * z))
+            """Rastrigin function with configurable shift and dimensionality."""
+            if self.enforce_2d:
+                assert len(x) == 2, "This Rastrigin function is configured for 2D only"
+            z = x - self.shift
+            # Use fixed constant if specified, otherwise use 10*len(z)
+            if self.use_fixed_constant is not None:
+                constant = self.use_fixed_constant
+            else:
+                constant = 10 * len(z)
+
+            return constant + np.sum(z**2 - 10 * np.cos(2 * np.pi * z))
         return rastrigin
-
-
-class Rastrigin2DFactory:
-    """Factory for creating 2D Rastrigin objective functions."""
-
-    def __init__(self, **kwargs):
-        pass
-
-    def __call__(self, device: torch.device):
-        def rastrigin_2d(x: np.ndarray):
-            """2D Rastrigin function (shifted for visualization)."""
-            assert len(x) == 2, "This Rastrigin function is designed for 2D"
-            z = x  # No shift for better visualization
-            return 20 + np.sum(z**2 - 10 * np.cos(2 * np.pi * z))
-        return rastrigin_2d
 
 
 class SchafferFactory:
@@ -284,7 +282,8 @@ class HeavyFactory:
 
 if __name__ == "__main__":
     # Example for 2D optimization with visualization
-    rastrigin_2d_factory = Rastrigin2DFactory()
+    rastrigin_2d_factory = RastriginFactory(shift=0.0, enforce_2d=True, use_fixed_constant=20)
+    # rastrigin_factory = RastriginFactory(shift=10.0)
     # schaffer_factory = SchafferFactory()
     # heavy_factory = HeavyFactory(model_size=50000)
     # toy_factory = ToyFactory(offset=3.0)

@@ -17,7 +17,7 @@ import torch
 def create_objective_function(objective_name, **kwargs):
     """Create the objective function based on the factory name."""
     # Import the factory classes from parallel_cmaes
-    from parallel_cmaes import (Rastrigin2DFactory, SchafferFactory, ToyFactory,
+    from parallel_cmaes import (SchafferFactory, ToyFactory,
                                 RastriginFactory, HeavyFactory, DiscreteCircleFactory)
 
     # Import NERFOpt from opt module
@@ -28,7 +28,7 @@ def create_objective_function(objective_name, **kwargs):
 
     # Map factory names to factory classes
     factory_map = {
-        'Rastrigin2DFactory': Rastrigin2DFactory,
+        'Rastrigin2DFactory': lambda **kw: RastriginFactory(shift=0.0, enforce_2d=True, use_fixed_constant=20, **kw),
         'SchafferFactory': SchafferFactory,
         'ToyFactory': ToyFactory,
         'RastriginFactory': RastriginFactory,
