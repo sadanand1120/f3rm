@@ -1,15 +1,23 @@
-import torch
-from PIL import Image
-import open_clip
-from sklearn.decomposition import PCA
-from matplotlib import pyplot as plt
-from torchvision.transforms import CenterCrop, Compose, Resize, InterpolationMode, ToTensor, Normalize
-import numpy as np
-from scipy.spatial.transform import Rotation as R
-from spatialmath.base import trlog, trexp, trinv
-from sklearn.cluster import KMeans
-from sklearn.mixture import GaussianMixture
+# Standard library imports
 from typing import Optional
+
+# Third-party imports
+import numpy as np
+import open_clip
+import torch
+from einops import rearrange
+from matplotlib import pyplot as plt
+from PIL import Image
+from scipy.spatial.transform import Rotation as R
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+from sklearn.mixture import GaussianMixture
+from spatialmath.base import trexp, trinv, trlog
+from torchvision.transforms import (CenterCrop, Compose, InterpolationMode,
+                                    Normalize, Resize, ToTensor)
+
+# Repo-specific imports
+from f3rm.features.clip_extract import CLIPArgs, extract_clip_features
 
 
 def cluster_xyz(
@@ -151,9 +159,6 @@ def compute_similarity_text2vis(img_patch_descriptors, text_embeddings, has_nega
 
 
 if __name__ == "__main__":
-    from f3rm.features.clip_extract import CLIPArgs, extract_clip_features
-    from einops import rearrange
-
     image_path = "/robodata/smodak/repos/f3rm/f3rm/scripts/images/frame_1.png"
     descriptors = extract_clip_features([image_path], device=torch.device("cuda"), verbose=True).cpu().squeeze()  # (h, w, c)
     descriptors_flat = rearrange(descriptors, "h w c -> (h w) c")  # (h * w, c)

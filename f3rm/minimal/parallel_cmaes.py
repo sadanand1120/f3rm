@@ -1,16 +1,18 @@
-# parallel_cma.py
+# Standard library imports
+import inspect
+import json
 import os
 import sys
 import time
+from typing import Callable, Optional, Sequence
+
+# Third-party imports
+import cma
+import numpy as np
 import torch
 import torch.multiprocessing as mp
-import numpy as np
 from torch.multiprocessing import Process, Queue
-import cma
-from typing import Callable, Sequence, Optional
 from tqdm.auto import tqdm
-import inspect
-import json
 
 # Set the multiprocessing start method to 'spawn' for CUDA compatibility
 try:

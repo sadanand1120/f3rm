@@ -44,8 +44,8 @@ Each factory has built-in `viz_opt_params` for plug-and-play visualization:
 ### Custom Usage
 
 ```python
-from parallel_cmaes import cma_es_optimize, RastriginFactory
-from visualize_cmaes import visualize_optimization
+from f3rm.minimal.parallel_cmaes import cma_es_optimize, RastriginFactory
+from f3rm.minimal.visualize_cmaes import visualize_optimization
 
 # Create factory
 factory = RastriginFactory(shift=0.0, enforce_2d=True, use_fixed_constant=20)

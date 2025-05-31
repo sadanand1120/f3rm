@@ -1,10 +1,13 @@
+# Standard library imports
+import math
+import os
+from copy import deepcopy
+
+# Third-party imports
 import cv2
 import numpy as np
-import os
-import yaml
-import math
 import torch
-from copy import deepcopy
+import yaml
 
 
 class Homography:

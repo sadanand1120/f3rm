@@ -4,9 +4,13 @@ Demo script showing CMA-ES optimization with visualization.
 Simple example that runs optimization on one factory and creates animated plot.
 """
 
+# Third-party imports
 import numpy as np
-from parallel_cmaes import cma_es_optimize, RastriginFactory, SchafferFactory, ToyFactory, DiscreteCircleFactory
-from visualize_cmaes import visualize_optimization
+
+# Repo-specific imports
+from f3rm.minimal.parallel_cmaes import (cma_es_optimize, RastriginFactory, SchafferFactory,
+                                         ToyFactory, DiscreteCircleFactory)
+from f3rm.minimal.visualize_cmaes import visualize_optimization
 
 if __name__ == "__main__":
     # Choose factory class to run - just change this line to try different functions!

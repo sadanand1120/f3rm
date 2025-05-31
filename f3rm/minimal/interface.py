@@ -1,17 +1,24 @@
-from nerfstudio.utils.eval_utils import eval_load_checkpoint, TrainerConfig, Pipeline, VanillaDataManagerConfig, all_methods
-import yaml
-from pathlib import Path
+# Standard library imports
 import os
+from pathlib import Path
+from typing import Literal, Optional, Tuple
+
+# Third-party imports
 import matplotlib.pyplot as plt
-from PIL import Image
-import open3d as o3d
-from typing import Tuple, Optional, Literal
-import torch
 import numpy as np
+import open3d as o3d
+import torch
+import yaml
+from PIL import Image
+from nerfstudio.cameras.cameras import CameraType, Cameras
+from nerfstudio.utils.eval_utils import (Pipeline, TrainerConfig,
+                                         VanillaDataManagerConfig, all_methods, eval_load_checkpoint)
+
+# Repo-specific imports
 from f3rm.minimal.homography import Homography
-from nerfstudio.cameras.cameras import Cameras, CameraType
+
+# Configuration
 np.set_printoptions(precision=3, suppress=True)
-os.environ["TORCHDYNAMO_DISABLE"] = "1"
 
 
 class NERFinterface:

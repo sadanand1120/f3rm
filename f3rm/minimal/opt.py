@@ -1,12 +1,24 @@
+# Standard library imports
+import math
 import os
+
+# Third-party imports
 import cv2
+import numpy as np
+import open_clip
 import torch
 import torch.multiprocessing as mp
-import numpy as np
+from matplotlib import patches, pyplot as plt
 from PIL import Image
-from matplotlib import pyplot as plt
-from matplotlib import patches
-import math
+
+# Repo-specific imports
+from f3rm.features.clip_extract import CLIPArgs, extract_clip_features
+from f3rm.minimal.homography import Homography
+from f3rm.minimal.interface import NERFinterface
+from f3rm.minimal.parallel_cmaes import cma_es_optimize
+from f3rm.minimal.utils import (cluster_xyz, compute_similarity_text2vis,
+                                exp_to_homo_T, homo_T_to_exp, run_pca,
+                                se3_distance, viz_pca3)
 
 # Set the multiprocessing start method to 'spawn' for CUDA compatibility
 try:
@@ -14,14 +26,6 @@ try:
 except RuntimeError:
     # Start method can only be set once, so if it's already set, we continue
     pass
-
-import open_clip
-from f3rm.minimal.interface import NERFinterface
-from f3rm.features.clip_extract import extract_clip_features, CLIPArgs
-from f3rm.minimal.homography import Homography
-from f3rm.minimal.utils import run_pca, viz_pca3, compute_similarity_text2vis
-from f3rm.minimal.utils import exp_to_homo_T, homo_T_to_exp, se3_distance, cluster_xyz
-from f3rm.minimal.parallel_cmaes import cma_es_optimize
 
 
 def smooth_peak(x: float, l: float, h: float, peak: float, *, eps: float = 1e-3) -> float:
@@ -104,7 +108,7 @@ def smooth_peak_torch(x: torch.Tensor, l: float, h: float, peak: float, eps: flo
 
 
 class NERFOpt:
-    def __init__(self, config_path: str = "outputs/ahgroom_colmap/f3rm/2025-04-14_190026/config.yml"):
+    def __init__(self, config_path: str = "outputs/ahgroom_colmap/f3rm/2025-04-14_190026/config.yml", **kwargs):
         self.config_path = config_path
 
         # Visualization optimization parameters
@@ -223,19 +227,20 @@ class NERFOpt:
             if not floor_mask[bevpcs_coords[0][1], bevpcs_coords[0][0]].item():
                 return torch.inf
 
-            if not x[0] > 0.49:   # to approximate "facing from the correct side"
-                return torch.inf
+            # if not x[0] > 0.49:   # to approximate "facing from the correct side"
+            #     return torch.inf
 
             # Keep everything on GPU until the final return
             _score1 = torch.norm(newc2w_pose_44[:3, 3].squeeze() - nerfworld_coords[1].squeeze())
             _score2 = x2_deg
             score1 = smooth_peak_torch(_score1, l=0.1, h=0.2, peak=0.15)
             score2 = smooth_peak_torch(_score2, l=0.0, h=360.0, peak=90.0)
-            # TODO: approximate "facing from the correct side" by adding penalty for location on the wrong side
-            # _score3 = torch.norm(x[:2] - torch.as_tensor([0.224, 1.059], device=device))
-            # score3 = smooth_peak_torch(_score3, l=-10.0, h=10.0, peak=0.0)
-            # return (-(score1 + score2) + 0.1 * score3).item()
-            return -(score1 + score2).item()
+            # approximate "facing from the correct side" by adding penalty for location on the wrong side
+            wrongc2w_pose_44 = self.generate_new_pose(frame1_c2w_44, c2w_new_44, px=0.224, py=1.059, ry=0.0, device=device)
+            _score3 = torch.norm(newc2w_pose_44[:3, 3].squeeze() - wrongc2w_pose_44[:3, 3].squeeze())
+            score3 = smooth_peak_torch(_score3, l=-0.1, h=0.1, peak=0.0)
+            return (-(score1 + score2) + 0.2 * score3).item()
+            # return -(score1 + score2).item()
         return obj
 
 
@@ -245,7 +250,7 @@ if __name__ == "__main__":
         x0=np.zeros(3),   # px, py, ry (in radians / 10)
         sigma0=0.5,
         popsize=1024,
-        max_epochs=100,
+        max_epochs=50,
         repeats=1,
         n_workers=8,
         target=None,
