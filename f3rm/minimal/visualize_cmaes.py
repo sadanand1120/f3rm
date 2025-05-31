@@ -16,15 +16,8 @@ import torch
 
 def create_objective_function(objective_name, **kwargs):
     """Create the objective function based on the factory name."""
-    # Import the factory classes from parallel_cmaes
     from parallel_cmaes import (SchafferFactory, ToyFactory,
                                 RastriginFactory, HeavyFactory, DiscreteCircleFactory)
-
-    # Import NERFOpt from opt module
-    try:
-        from opt import NERFOpt
-    except ImportError:
-        NERFOpt = None
 
     # Map factory names to factory classes
     factory_map = {
@@ -37,21 +30,20 @@ def create_objective_function(objective_name, **kwargs):
     }
 
     # Add NERFOpt if available
-    if NERFOpt is not None:
+    try:
+        from opt import NERFOpt
         factory_map['NERFOpt'] = NERFOpt
-
-    if objective_name not in factory_map:
-        raise ValueError(f"Unknown objective function: {objective_name}. "
-                         f"Available: {list(factory_map.keys())}")
+    except ImportError:
+        pass
 
     # Special case for NERFOpt - we don't create background contours
     if objective_name == 'NERFOpt':
-        return None  # No background function needed
+        return None
 
     # Create the factory and get the actual objective function for other cases
     factory_class = factory_map[objective_name]
     factory = factory_class(**kwargs)
-    obj_fn = factory(torch.device('cpu'))  # Use CPU for visualization
+    obj_fn = factory(torch.device('cpu'))
 
     # Wrap the 1D function to work with 2D meshgrids
     def wrapped_fn(x, y):
@@ -102,11 +94,7 @@ def visualize_optimization(history_file, output_file=None, show_animation=True, 
         bounds = [[-1.25, -0.75], [1.75, 1.75]]
 
     # Create objective function using the actual factory (None for NERFOpt)
-    try:
-        objective_fn = create_objective_function(objective_name, **factory_params)
-    except Exception as e:
-        print(f"Warning: Could not create objective function from factory: {e}")
-        objective_fn = None
+    objective_fn = create_objective_function(objective_name, **factory_params)
 
     # Set up the figure and axis
     fig, ax = plt.subplots(figsize=(10, 8))
@@ -209,7 +197,7 @@ def visualize_optimization(history_file, output_file=None, show_animation=True, 
     return fig, anim
 
 
-def main():
+if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Visualize CMA-ES optimization history')
     parser.add_argument('history_file', help='JSON file containing optimization history')
     parser.add_argument('--output', '-o', help='Output file for animation (gif/mp4)')
@@ -224,19 +212,3 @@ def main():
         show_animation=not args.no_show,
         save_frames=args.save_frames
     )
-
-
-if __name__ == "__main__":
-    # Example usage
-    if len(sys.argv) == 1:
-        # Default behavior - look for optimization_history.json
-        import sys
-        import os
-        if os.path.exists("optimization_history.json"):
-            print("Using default history file: optimization_history.json")
-            visualize_optimization("optimization_history.json")
-        else:
-            print("No history file found. Run parallel_cmaes.py first to generate optimization_history.json")
-            print("Or specify a history file: python visualize_cmaes.py <history_file>")
-    else:
-        main()

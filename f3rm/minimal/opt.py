@@ -107,6 +107,18 @@ class NERFOpt:
     def __init__(self, config_path: str = "outputs/ahgroom_colmap/f3rm/2025-04-14_190026/config.yml"):
         self.config_path = config_path
 
+        # Visualization optimization parameters
+        self.viz_opt_params = {
+            'x0': np.array([0.0, 0.0, 0.0]),
+            'sigma0': 0.3,
+            'lower_bounds': np.array([-1.0, -1.0, -0.5]),
+            'upper_bounds': np.array([1.0, 1.0, 0.5]),
+            'popsize': 50,
+            'max_epochs': 20,
+            'repeats': 1,
+            'n_workers': 1
+        }
+
     @staticmethod
     def generate_new_pose(c2w_44: torch.Tensor, cbev2w_44: torch.Tensor, px: float, py: float, ry: float, device: torch.device) -> torch.Tensor:
         _T1 = Homography.get_std_trans(cx=px, cy=py, cz=0.0, device=device)

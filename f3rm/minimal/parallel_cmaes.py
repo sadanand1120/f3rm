@@ -19,6 +19,18 @@ except RuntimeError:
     pass  # Start method already set
 
 
+def convert_numpy_for_json(obj):
+    """Convert numpy arrays to lists for JSON serialization."""
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {k: convert_numpy_for_json(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [convert_numpy_for_json(item) for item in obj]
+    else:
+        return obj
+
+
 def _worker(param_q: Queue, result_q: Queue, stop_q: Queue, obj_source, worker_device: torch.device):
     """Worker process that evaluates objectives on specified device."""
     obj_fn = obj_source(worker_device)   # Build objective function from factory
@@ -140,7 +152,7 @@ def cma_es_optimize(obj_source: Callable,
         'popsize': popsize,
         'bounds': [lower_bounds.tolist() if lower_bounds is not None else None,
                    upper_bounds.tolist() if upper_bounds is not None else None],
-        'factory_params': getattr(obj_source, '__dict__', {})  # Store factory parameters
+        'factory_params': convert_numpy_for_json(getattr(obj_source, '__dict__', {}))  # Store factory parameters
     } if record_history else None
 
     try:
@@ -198,6 +210,18 @@ class RastriginFactory:
         self.enforce_2d = kwargs.get('enforce_2d', False)  # Whether to enforce 2D constraint
         self.use_fixed_constant = kwargs.get('use_fixed_constant', None)  # Use fixed constant instead of 10*len(z)
 
+        # Visualization optimization parameters
+        self.viz_opt_params = {
+            'x0': np.array([4.0, -4.0]),
+            'sigma0': 1.0,
+            'lower_bounds': np.array([-5.12, -5.12]),
+            'upper_bounds': np.array([5.12, 5.12]),
+            'popsize': 40,
+            'max_epochs': 30,
+            'repeats': 1,
+            'n_workers': 1
+        }
+
     def __call__(self, device: torch.device):
         def rastrigin(x: np.ndarray):
             """Rastrigin function with configurable shift and dimensionality."""
@@ -218,7 +242,17 @@ class SchafferFactory:
     """Factory for creating Schaffer-2D objective functions."""
 
     def __init__(self, **kwargs):
-        pass
+        # Visualization optimization parameters
+        self.viz_opt_params = {
+            'x0': np.array([50.0, 50.0]),
+            'sigma0': 3.0,
+            'lower_bounds': np.array([-100.0, -100.0]),
+            'upper_bounds': np.array([100.0, 100.0]),
+            'popsize': 40,
+            'max_epochs': 25,
+            'repeats': 1,
+            'n_workers': 1
+        }
 
     def __call__(self, device: torch.device):
         def schaffer(x: np.ndarray):
@@ -236,6 +270,18 @@ class ToyFactory:
 
     def __init__(self, **kwargs):
         self.offset = kwargs.get('offset', 3.0)
+
+        # Visualization optimization parameters
+        self.viz_opt_params = {
+            'x0': np.array([-2.0, -4.0]),
+            'sigma0': 0.2,
+            'lower_bounds': np.array([-5.0, -5.0]),
+            'upper_bounds': np.array([5.0, 5.0]),
+            'popsize': 30,
+            'max_epochs': 20,
+            'repeats': 1,
+            'n_workers': 1
+        }
 
     def __call__(self, device: torch.device):
         def obj(x: np.ndarray):
@@ -255,6 +301,18 @@ class DiscreteCircleFactory:
         self.center_y = kwargs.get('center_y', 2.0)
         self.radius = kwargs.get('radius', 0.2)
 
+        # Visualization optimization parameters
+        self.viz_opt_params = {
+            'x0': np.array([-2.0, -2.0]),
+            'sigma0': 0.5,
+            'lower_bounds': np.array([-3.0, -3.0]),
+            'upper_bounds': np.array([5.0, 5.0]),
+            'popsize': 40,
+            'max_epochs': 30,
+            'repeats': 1,
+            'n_workers': 1
+        }
+
     def __call__(self, device: torch.device):
         def obj(x: np.ndarray):
             """Discrete circle function - 1 inside circle, 0 outside."""
@@ -269,6 +327,18 @@ class HeavyFactory:
 
     def __init__(self, **kwargs):
         self.model_size = kwargs.get('model_size', 1000)
+
+        # Visualization optimization parameters
+        self.viz_opt_params = {
+            'x0': np.array([0.0, 0.0]),
+            'sigma0': 0.5,
+            'lower_bounds': np.array([-2.0, -2.0]),
+            'upper_bounds': np.array([2.0, 2.0]),
+            'popsize': 30,
+            'max_epochs': 20,
+            'repeats': 1,
+            'n_workers': 1
+        }
 
     def __call__(self, device: torch.device):
         # Create model on the specified device
