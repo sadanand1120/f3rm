@@ -20,6 +20,12 @@ def create_objective_function(objective_name, **kwargs):
     from parallel_cmaes import (Rastrigin2DFactory, SchafferFactory, ToyFactory,
                                 RastriginFactory, HeavyFactory, DiscreteCircleFactory)
 
+    # Import NERFOpt from opt module
+    try:
+        from opt import NERFOpt
+    except ImportError:
+        NERFOpt = None
+
     # Map factory names to factory classes
     factory_map = {
         'Rastrigin2DFactory': Rastrigin2DFactory,
@@ -30,11 +36,19 @@ def create_objective_function(objective_name, **kwargs):
         'DiscreteCircleFactory': DiscreteCircleFactory,
     }
 
+    # Add NERFOpt if available
+    if NERFOpt is not None:
+        factory_map['NERFOpt'] = NERFOpt
+
     if objective_name not in factory_map:
         raise ValueError(f"Unknown objective function: {objective_name}. "
                          f"Available: {list(factory_map.keys())}")
 
-    # Create the factory and get the actual objective function
+    # Special case for NERFOpt - we don't create background contours
+    if objective_name == 'NERFOpt':
+        return None  # No background function needed
+
+    # Create the factory and get the actual objective function for other cases
     factory_class = factory_map[objective_name]
     factory = factory_class(**kwargs)
     obj_fn = factory(torch.device('cpu'))  # Use CPU for visualization
@@ -85,42 +99,42 @@ def visualize_optimization(history_file, output_file=None, show_animation=True, 
 
     if bounds[0] is None or bounds[1] is None:
         print("Warning: No bounds specified in history. Using default bounds.")
-        bounds = [[-5.0, -5.0], [5.0, 5.0]]
+        bounds = [[-1.25, -0.75], [1.75, 1.75]]
 
-    # Create objective function using the actual factory
+    # Create objective function using the actual factory (None for NERFOpt)
     try:
         objective_fn = create_objective_function(objective_name, **factory_params)
     except Exception as e:
         print(f"Warning: Could not create objective function from factory: {e}")
-        print("This visualization may not work for functions that require specific parameters.")
-        # Fallback - still try to create with no parameters
-        objective_fn = create_objective_function(objective_name)
-
-    # Create contour plot
-    X, Y, Z = create_contour_plot(objective_fn, bounds)
+        objective_fn = None
 
     # Set up the figure and axis
     fig, ax = plt.subplots(figsize=(10, 8))
 
-    # Create contour plot
-    levels = np.logspace(np.log10(Z.min() + 1e-10), np.log10(Z.max()), 50)
-    contour = ax.contourf(X, Y, Z, levels=levels, norm=LogNorm(), cmap='viridis', alpha=0.8)
-    ax.contour(X, Y, Z, levels=levels, norm=LogNorm(), colors='black', alpha=0.3, linewidths=0.5)
-
-    # Add colorbar
-    plt.colorbar(contour, ax=ax, label='Objective Value')
+    # Create contour plot only if we have an objective function
+    if objective_fn is not None:
+        # Create contour plot
+        X, Y, Z = create_contour_plot(objective_fn, bounds)
+        levels = np.logspace(np.log10(Z.min() + 1e-10), np.log10(Z.max()), 50)
+        contour = ax.contourf(X, Y, Z, levels=levels, norm=LogNorm(), cmap='viridis', alpha=0.8)
+        ax.contour(X, Y, Z, levels=levels, norm=LogNorm(), colors='black', alpha=0.3, linewidths=0.5)
+        # Add colorbar
+        plt.colorbar(contour, ax=ax, label='Objective Value')
+    else:
+        # No background for NERFOpt - just set up the plot area
+        ax.set_facecolor('white')
+        ax.grid(True, alpha=0.3)
 
     # Initialize plot elements
-    samples_plot, = ax.plot([], [], 'bo', markersize=4, alpha=0.6, label='Samples')
-    mean_plot, = ax.plot([], [], 'go', markersize=8, label='Mean')
-    best_plot, = ax.plot([], [], 'ro', markersize=8, label='Best')
+    samples_plot, = ax.plot([], [], 'bo', markersize=2, alpha=0.6, label='Samples')
+    best_plot, = ax.plot([], [], 'go', markersize=8, label='Best')
+    mean_plot, = ax.plot([], [], 'ro', markersize=8, label='Mean')
 
     # Set labels and title
     ax.set_xlabel('x')
     ax.set_ylabel('y')
     ax.set_title(f'CMA-ES Optimization: {objective_name}')
     ax.legend()
-    ax.grid(True, alpha=0.3)
 
     # Set axis limits
     ax.set_xlim(bounds[0][0], bounds[1][0])
@@ -133,10 +147,18 @@ def visualize_optimization(history_file, output_file=None, show_animation=True, 
 
         gen = generations[frame]
 
-        # Extract samples (assuming 2D)
+        # Extract samples (assuming 2D, but handle 3D by taking first 2 dims)
         samples = np.array(gen['samples'])
         mean = np.array(gen['mean'])
         best_solution = np.array(gen['best_solution']) if gen['best_solution'] else mean
+
+        # Handle 3D data by taking only first 2 dimensions for visualization
+        if samples.shape[1] > 2:
+            samples = samples[:, :2]
+        if len(mean) > 2:
+            mean = mean[:2]
+        if len(best_solution) > 2:
+            best_solution = best_solution[:2]
 
         # Update plots
         samples_plot.set_data(samples[:, 0], samples[:, 1])

@@ -101,6 +101,13 @@ The animated plots show:
 - Configurable center position and radius
 - Useful for showing optimization limitations
 
+### NERFOpt
+- Real-world 3D pose optimization for NeRF-based robotics applications
+- Optimizes camera position (px, py) and rotation (ry) parameters
+- Visualization shows first 2 dimensions (px, py) with rotation fixed to 0
+- Demonstrates CMA-ES on complex, real-world objective functions
+- Requires NeRF model and related dependencies
+
 ## Dependencies
 
 ```bash

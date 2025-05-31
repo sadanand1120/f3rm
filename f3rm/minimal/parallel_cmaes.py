@@ -116,10 +116,19 @@ def cma_es_optimize(obj_source: Callable,
                     n_workers: int = 8,
                     record_history: bool = False,
                     history_file: str = None,
-                    enable_stop: bool = False):
+                    enable_stop: bool = False,
+                    seed: int = 42):
     """Parallel CMA-ES optimization. Returns (best_params, best_fitness)."""
+    # Set random seed for reproducibility
+    np.random.seed(seed)
+
     evaluator = ParallelEvaluator(obj_source, n_workers=n_workers)
-    es = cma.CMAEvolutionStrategy(x0, sigma0, {'popsize': popsize, 'verb_disp': 0, 'bounds': [lower_bounds, upper_bounds]})
+    es = cma.CMAEvolutionStrategy(x0, sigma0, {
+        'popsize': popsize,
+        'verb_disp': 0,
+        'bounds': [lower_bounds, upper_bounds],
+        'seed': seed
+    })
     best_params, best_fit = None, float("inf")
 
     # History recording
@@ -297,7 +306,8 @@ if __name__ == "__main__":
         n_workers=4,
         target=None,
         record_history=True,
-        history_file="optimization_history.json"
+        history_file="optimization_history.json",
+        seed=42
     )
 
     print(f"Best fitness: {best_f}")

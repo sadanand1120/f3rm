@@ -219,11 +219,11 @@ class NERFOpt:
             _score2 = x2_deg
             score1 = smooth_peak_torch(_score1, l=0.1, h=0.2, peak=0.15)
             score2 = smooth_peak_torch(_score2, l=0.0, h=360.0, peak=90.0)
-            return -(score1 + score2).item()  # Return scalar for optimizer compatibility, negative for minimization
-
-            # score1 = torch.norm(newc2w_pose_44[:3, 3].squeeze() - nerfworld_coords[1].squeeze())
-            # score2 = torch.abs(x[2] - 90)
-            # return (score1 + score2).item()  # Return scalar for optimizer compatibility
+            # TODO: approximate "facing from the correct side" by adding penalty for location on the wrong side
+            # _score3 = torch.norm(x[:2] - torch.as_tensor([0.224, 1.059], device=device))
+            # score3 = smooth_peak_torch(_score3, l=-10.0, h=10.0, peak=0.0)
+            # return (-(score1 + score2) + 0.1 * score3).item()
+            return -(score1 + score2).item()
         return obj
 
 
@@ -233,10 +233,12 @@ if __name__ == "__main__":
         x0=np.zeros(3),   # px, py, ry (in radians / 10)
         sigma0=0.5,
         popsize=1024,
-        max_epochs=1000,
+        max_epochs=100,
         repeats=1,
         n_workers=8,
-        target=-1.99
+        target=None,
+        record_history=True,
+        history_file="nerf_opt_history.json"
     )
 
     print(f"Best fitness: {best_f}")

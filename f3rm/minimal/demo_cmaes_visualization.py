@@ -18,7 +18,7 @@ def demo_rastrigin():
 
     best_x, best_f = cma_es_optimize(
         obj_source=rastrigin_factory,
-        x0=np.array([3.0, -2.0]),  # Start away from optimum
+        x0=np.array([4.0, -4.0]),  # Start away from optimum
         sigma0=1.0,
         lower_bounds=np.array([-5.12, -5.12]),
         upper_bounds=np.array([5.12, 5.12]),
@@ -50,7 +50,7 @@ def demo_schaffer():
     best_x, best_f = cma_es_optimize(
         obj_source=schaffer_factory,
         x0=np.array([50.0, 50.0]),  # Start away from optimum
-        sigma0=20.0,
+        sigma0=3.0,
         lower_bounds=np.array([-100.0, -100.0]),
         upper_bounds=np.array([100.0, 100.0]),
         popsize=40,
@@ -75,12 +75,12 @@ def demo_toy():
 
     print("\nRunning CMA-ES on toy quadratic function...")
 
-    toy_factory = ToyFactory(offset=2.0)
+    toy_factory = ToyFactory(offset=4.0)
 
     best_x, best_f = cma_es_optimize(
         obj_source=toy_factory,
-        x0=np.array([0.0, 0.0]),  # Start at origin
-        sigma0=1.0,
+        x0=np.array([-2.0, -4.0]),
+        sigma0=0.2,
         lower_bounds=np.array([-5.0, -5.0]),
         upper_bounds=np.array([5.0, 5.0]),
         popsize=30,
@@ -109,8 +109,8 @@ def demo_discrete_circle():
 
     best_x, best_f = cma_es_optimize(
         obj_source=discrete_factory,
-        x0=np.array([-1.0, -1.0]),  # Start far away from target
-        sigma0=1.0,
+        x0=np.array([-2.0, -2.0]),  # Start far away from target
+        sigma0=0.5,
         lower_bounds=np.array([-3.0, -3.0]),
         upper_bounds=np.array([5.0, 5.0]),
         popsize=40,
@@ -129,6 +129,39 @@ def demo_discrete_circle():
     print("History saved to discrete_circle_history.json")
 
     return "discrete_circle_history.json"
+
+
+def demo_nerf_opt():
+    """Demo CMA-ES on NERFOpt function (3D optimization, 2D visualization)."""
+    from parallel_cmaes import cma_es_optimize
+    from opt import NERFOpt
+
+    print("\nRunning CMA-ES on NERFOpt function (3D pose optimization)...")
+
+    nerf_factory = NERFOpt()
+
+    best_x, best_f = cma_es_optimize(
+        obj_source=nerf_factory,
+        x0=np.array([0.0, 0.0, 0.0]),  # px, py, ry (in radians / 10)
+        sigma0=0.3,
+        lower_bounds=np.array([-1.0, -1.0, -0.5]),
+        upper_bounds=np.array([1.0, 1.0, 0.5]),
+        popsize=50,
+        max_epochs=20,
+        repeats=1,
+        n_workers=1,  # Single worker to avoid multiprocessing issues
+        target=None,
+        record_history=True,
+        history_file="nerf_opt_history.json"
+    )
+
+    print(f"NERFOpt - Best fitness: {best_f:.4f}")
+    print(f"NERFOpt - Best params: {best_x}")
+    print("This demonstrates CMA-ES on a real 3D optimization problem!")
+    print("Visualization shows first 2 dimensions (px, py) with no background")
+    print("History saved to nerf_opt_history.json")
+
+    return "nerf_opt_history.json"
 
 
 def main():
@@ -159,6 +192,11 @@ def main():
         history_files.append(demo_discrete_circle())
     except Exception as e:
         print(f"Error running Discrete Circle demo: {e}")
+
+    try:
+        history_files.append(demo_nerf_opt())
+    except Exception as e:
+        print(f"Error running NERFOpt demo: {e}")
 
     print("\n" + "=" * 50)
     print("Optimization completed! Now creating visualizations...")
