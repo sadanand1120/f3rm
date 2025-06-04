@@ -175,14 +175,18 @@ class NERFOpt:
         frame1_c2w_44 = self.get_init_frame(device)
         c2w_new_44 = self.get_cbev2w_44(device)
         c2w_new = c2w_new_44[:3, :4]
-        FX, FY, WIDTH, HEIGHT = 1150.0, 1150.0, 1920, 1440
-        K_np = nerfint.get_cam_intrinsics_nodist(fx=FX, fy=FY, width=WIDTH, height=HEIGHT)
-        K = torch.from_numpy(K_np).to(device, dtype=torch.float32)
+        cam_params = {
+            "slow": {"FX": 1150.0, "FY": 1150.0, "WIDTH": 1920, "HEIGHT": 1440},
+            "fast": {"FX": 465.0, "FY": 465.0, "WIDTH": 960, "HEIGHT": 540}
+        }
+        FX_BEV, FY_BEV, WIDTH_BEV, HEIGHT_BEV = cam_params["slow"]["FX"], cam_params["slow"]["FY"], cam_params["slow"]["WIDTH"], cam_params["slow"]["HEIGHT"]
+        K_np_BEV = nerfint.get_cam_intrinsics_nodist(fx=FX_BEV, fy=FY_BEV, width=WIDTH_BEV, height=HEIGHT_BEV)
+        K_BEV = torch.from_numpy(K_np_BEV).to(device, dtype=torch.float32)
         outputs, ray_bundle = nerfint.get_custom_camera_outputs(
-            fx=FX,
-            fy=FY,
-            width=WIDTH,
-            height=HEIGHT,
+            fx=FX_BEV,
+            fy=FY_BEV,
+            width=WIDTH_BEV,
+            height=HEIGHT_BEV,
             c2w=c2w_new,
             fars=10.0,
             nears=1.1,
@@ -193,17 +197,17 @@ class NERFOpt:
         model.eval()
         tokenizer = open_clip.get_tokenizer(CLIPArgs.model_name)
 
-        text_queries = ["magazine", "object"]
-        text = tokenizer(text_queries).to(device)
-        text_features = model.encode_text(text)
-        sims = compute_similarity_text2vis(outputs["feature"], text_features, has_negatives=True, softmax_temp=1.0).squeeze()
-        magazine_mask = (sims > 0.502)
-
         text_queries = ["floor", "object"]
         text = tokenizer(text_queries).to(device)
         text_features = model.encode_text(text)
         sims = compute_similarity_text2vis(outputs["feature"], text_features, has_negatives=True, softmax_temp=1.0).squeeze()
         floor_mask = (sims > 0.502)
+
+        text_queries = ["magazine", "object"]
+        text = tokenizer(text_queries).to(device)
+        text_features = model.encode_text(text)
+        sims = compute_similarity_text2vis(outputs["feature"], text_features, has_negatives=True, softmax_temp=1.0).squeeze()
+        magazine_mask = (sims > 0.502)
 
         depth = outputs["depth"].squeeze(-1)  # (H,W)
         origins = ray_bundle.origins.squeeze(0)      # (H,W,3)
@@ -223,24 +227,45 @@ class NERFOpt:
             x = torch.from_numpy(x).to(device, dtype=torch.float32)
             x2_deg = torch.rad2deg(x[2] * 10.0)  # convert radians / 10 to degrees
             newc2w_pose_44 = self.generate_new_pose(frame1_c2w_44, c2w_new_44, px=x[0].item(), py=x[1].item(), ry=x2_deg.item(), device=device)
-            bevpcs_coords = self.c2w_pose_viz(newc2w_pose_44, c2w_new_44, K, WIDTH, HEIGHT, device)
+            bevpcs_coords = self.c2w_pose_viz(newc2w_pose_44, c2w_new_44, K_BEV, WIDTH_BEV, HEIGHT_BEV, device)
             if not floor_mask[bevpcs_coords[0][1], bevpcs_coords[0][0]].item():
                 return torch.inf
 
-            # if not x[0] > 0.49:   # to approximate "facing from the correct side"
-            #     return torch.inf
-
             # Keep everything on GPU until the final return
-            _score1 = torch.norm(newc2w_pose_44[:3, 3].squeeze() - nerfworld_coords[1].squeeze())
+            cluster1_to_pose = newc2w_pose_44[:3, 3].squeeze() - nerfworld_coords[1].squeeze()
+            _score1 = torch.norm(cluster1_to_pose)
             _score2 = x2_deg
             score1 = smooth_peak_torch(_score1, l=0.1, h=0.2, peak=0.15)
             score2 = smooth_peak_torch(_score2, l=0.0, h=360.0, peak=90.0)
-            # approximate "facing from the correct side" by adding penalty for location on the wrong side
-            wrongc2w_pose_44 = self.generate_new_pose(frame1_c2w_44, c2w_new_44, px=0.224, py=1.059, ry=0.0, device=device)
-            _score3 = torch.norm(newc2w_pose_44[:3, 3].squeeze() - wrongc2w_pose_44[:3, 3].squeeze())
-            score3 = smooth_peak_torch(_score3, l=-0.1, h=0.1, peak=0.0)
-            return (-(score1 + score2) + 0.2 * score3).item()
-            # return -(score1 + score2).item()
+
+            # # angle_between's second part: b/w vectors (1) obj_pose_vec = vec starting at cluster in dirn, (2) vector of the cur pose wrt to cluster as origin
+            # # get the unit vector of the gt_pose dirn
+            # c2w_gtdirn_44 = self.generate_new_pose(frame1_c2w_44, c2w_new_44, px=0.0, py=0.0, ry=90.0, device=device)
+            # fwdT = Homography.get_std_trans(cz=-0.02, device=device)
+            # c2w_gtdirn_44_2 = c2w_gtdirn_44 @ torch.linalg.inv(fwdT)
+            # gtdirn_vec = c2w_gtdirn_44_2[:3, 3].squeeze() - c2w_gtdirn_44[:3, 3].squeeze()
+            # gtdirn_vec = gtdirn_vec / torch.norm(gtdirn_vec)
+            # cluster1_to_pose_vec = cluster1_to_pose / torch.norm(cluster1_to_pose)
+            # cos_angle = torch.dot(gtdirn_vec, cluster1_to_pose_vec)   # should be -1 if facing
+
+            # coverage score
+            outputs_coverage = nerfint.get_custom_camera_outputs(
+                fx=cam_params["fast"]["FX"],
+                fy=cam_params["fast"]["FY"],
+                width=cam_params["fast"]["WIDTH"],
+                height=cam_params["fast"]["HEIGHT"],
+                c2w=newc2w_pose_44[:3, :4]
+            )
+            _sims = compute_similarity_text2vis(outputs_coverage["feature"], text_features, has_negatives=True, softmax_temp=1.0).squeeze()
+            coverage_score = _sims.mean()
+
+            # final_minimize_score = -(score1 + score2) + cos_angle
+            final_minimize_score = -(score1 + score2 + coverage_score)
+            # TODO: fix parallel cmaes's cpu-gpu lag leads to process crashing bug; come up with a very minimal test factory that simulates behavior and then try to fix
+            # TODO: make angle interpet rad/10 native to opt, and instead do conversion in nerf interface
+            # TODO: remove angle's duplicacy (ie, set bounds for angle 0 to 360)
+            # TODO: add a dumper of visualized camera output to images so you know how's opt progressing
+            return final_minimize_score.item()
         return obj
 
 
@@ -252,7 +277,7 @@ if __name__ == "__main__":
         popsize=1024,
         max_epochs=50,
         repeats=1,
-        n_workers=8,
+        n_workers=30,
         target=None,
         record_history=True,
         history_file="nerf_opt_history.json"

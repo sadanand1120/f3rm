@@ -90,32 +90,58 @@ class ParallelEvaluator:
 
     def close(self, grace: float = 2.0):
         """Shutdown workers gracefully, then force-kill if needed."""
+        print(f"[ParallelEvaluator] Shutting down {len(self.workers)} workers...")
+
         # Signal stop
+        print("[ParallelEvaluator] Signaling workers to stop...")
         self.stop_q.put(True)
 
-        # Wait for graceful exit
-        for w in self.workers:
-            w.join(timeout=grace)
+        # Wait for graceful exit with progress bar
+        print(f"[ParallelEvaluator] Waiting up to {grace}s for graceful shutdown...")
+        with tqdm(total=len(self.workers), desc="Graceful shutdown", leave=False) as pbar:
+            for i, w in enumerate(self.workers):
+                pbar.set_description(f"Waiting for worker {w.pid}")
+                w.join(timeout=grace)
+                if not w.is_alive():
+                    pbar.set_postfix(status="✓ Exited")
+                else:
+                    pbar.set_postfix(status="⚠ Still alive")
+                pbar.update(1)
 
         # Force kill stragglers
-        for w in self.workers:
-            if w.is_alive():
-                print(f"[ParallelEvaluator] Worker {w.pid} still alive → terminate()")
-                w.terminate()
-                w.join()
+        alive_workers = [w for w in self.workers if w.is_alive()]
+        if alive_workers:
+            print(f"[ParallelEvaluator] Force-terminating {len(alive_workers)} remaining workers...")
+            with tqdm(alive_workers, desc="Force termination", leave=False) as pbar:
+                for w in pbar:
+                    pbar.set_description(f"Terminating worker {w.pid}")
+                    w.terminate()
+                    w.join()
+                    pbar.set_postfix(status="✓ Terminated")
+        else:
+            print("[ParallelEvaluator] All workers exited gracefully!")
 
         # Clean up log files
-        for w in self.workers:
-            for ext in (".out", ".err"):
-                try:
-                    os.remove(f"/tmp/cma_{w.pid}{ext}")
-                except (FileNotFoundError, PermissionError):
-                    pass
+        print("[ParallelEvaluator] Cleaning up log files...")
+        cleaned_files = 0
+        with tqdm(self.workers, desc="Cleanup logs", leave=False) as pbar:
+            for w in pbar:
+                pbar.set_description(f"Cleaning logs for PID {w.pid}")
+                for ext in (".out", ".err"):
+                    try:
+                        os.remove(f"/tmp/cma_{w.pid}{ext}")
+                        cleaned_files += 1
+                    except (FileNotFoundError, PermissionError):
+                        pass
+                pbar.set_postfix(cleaned=cleaned_files)
 
         # Close queues
+        print("[ParallelEvaluator] Closing queues...")
         for q in (self.param_q, self.result_q, self.stop_q):
             q.close()
             q.join_thread()
+
+        print("[ParallelEvaluator] Shutdown complete!")
 
 
 def cma_es_optimize(obj_source: Callable,
@@ -183,8 +209,24 @@ def cma_es_optimize(obj_source: Callable,
                     }
                     history['generations'].append(generation_data)
 
+                # Create postfix with best fitness and first 3 dimensions
+                postfix_dict = {'best_f': f"{best_fit:.4g}"}
+                if best_params is not None:
+                    # Get first 3 dimensions, pad with None if fewer dimensions
+                    x_vals = []
+                    for i in range(3):
+                        if i < len(best_params):
+                            x_vals.append(f"{best_params[i]:.3f}")
+                        else:
+                            x_vals.append("None")
+                    postfix_dict.update({
+                        'x0': x_vals[0],
+                        'x1': x_vals[1],
+                        'x2': x_vals[2]
+                    })
+
                 bar.update(0)   # refresh only, iteration already counted
-                bar.set_postfix(best=f"{best_fit:.4g}")
+                bar.set_postfix(**postfix_dict)
                 if target is not None and best_fit <= target:
                     break
     finally:

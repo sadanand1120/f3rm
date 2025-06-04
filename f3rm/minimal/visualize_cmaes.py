@@ -16,6 +16,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from matplotlib.colors import LogNorm
+from tqdm.auto import tqdm
 
 # Repo-specific imports
 from f3rm.minimal.opt import NERFOpt
@@ -78,7 +79,7 @@ def create_contour_plot(objective_fn, bounds, resolution=100):
     return X, Y, Z
 
 
-def visualize_optimization(history_file, output_file=None, show_animation=True, save_frames=False, linear_scale=False):
+def visualize_optimization(history_file, output_file=None, show_animation=True, save_frames=False, linear_scale=False, show_background=True):
     """Create animated visualization of CMA-ES optimization."""
 
     # Load history
@@ -103,8 +104,8 @@ def visualize_optimization(history_file, output_file=None, show_animation=True, 
     # Set up the figure and axis
     fig, ax = plt.subplots(figsize=(10, 8))
 
-    # Create contour plot if we have an objective function
-    if objective_fn is not None:
+    # Create contour plot if we have an objective function and background is enabled
+    if objective_fn is not None and show_background:
         # Create contour plot
         X, Y, Z = create_contour_plot(objective_fn, bounds)
 
@@ -189,21 +190,27 @@ def visualize_optimization(history_file, output_file=None, show_animation=True, 
         frame_dir = "cmaes_frames"
         os.makedirs(frame_dir, exist_ok=True)
 
-        for i, gen in enumerate(generations):
+        # Use tqdm progress bar for frame saving
+        for i, gen in tqdm(enumerate(generations), total=len(generations), desc="Saving frames"):
             animate(i)
             plt.savefig(f"{frame_dir}/frame_{i:03d}.png", dpi=150, bbox_inches='tight')
-            print(f"Saved frame {i+1}/{len(generations)}")
 
-    # Save as GIF if output file specified
+    # Save as GIF/MP4 if output file specified
     if output_file:
-        print(f"Saving animation to {output_file}...")
+        # Custom progress callback for animation saving
+        pbar = tqdm(total=len(generations), desc="Saving animation")
+
+        def progress_callback(i, n):
+            pbar.update(1)
+            if i == n - 1:
+                pbar.close()
+
         if output_file.endswith('.gif'):
-            anim.save(output_file, writer='pillow', fps=5)
+            anim.save(output_file, writer='pillow', fps=5, progress_callback=progress_callback)
         elif output_file.endswith('.mp4'):
-            anim.save(output_file, writer='ffmpeg', fps=5)
+            anim.save(output_file, writer='ffmpeg', fps=5, progress_callback=progress_callback)
         else:
-            anim.save(output_file + '.gif', writer='pillow', fps=5)
-        print("Animation saved!")
+            anim.save(output_file + '.gif', writer='pillow', fps=5, progress_callback=progress_callback)
 
     # Show animation
     if show_animation:
@@ -220,6 +227,7 @@ if __name__ == "__main__":
     parser.add_argument('--no-show', action='store_true', help='Don\'t show interactive animation')
     parser.add_argument('--save-frames', action='store_true', help='Save individual frames')
     parser.add_argument('--linear-scale', action='store_true', help='Use linear scale for contour plot')
+    parser.add_argument('--no-background', action='store_true', help='Disable contour visualization')
 
     args = parser.parse_args()
 
@@ -228,5 +236,6 @@ if __name__ == "__main__":
         output_file=args.output,
         show_animation=not args.no_show,
         save_frames=args.save_frames,
-        linear_scale=args.linear_scale
+        linear_scale=args.linear_scale,
+        show_background=not args.no_background
     )
