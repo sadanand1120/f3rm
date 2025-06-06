@@ -265,6 +265,7 @@ class NERFOpt:
             # TODO: make angle interpet rad/10 native to opt, and instead do conversion in nerf interface
             # TODO: remove angle's duplicacy (ie, set bounds for angle 0 to 360)
             # TODO: add a dumper of visualized camera output to images so you know how's opt progressing
+            # TODO: pluck out task specific stuff into some sort of dev specified config file or sth, implement scene DSL functions
             return final_minimize_score.item()
         return obj
 
