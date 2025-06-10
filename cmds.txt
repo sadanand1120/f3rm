@@ -12,11 +12,11 @@ export HLOC_WORKERS=24 && export CUDA_VISIBLE_DEVICES='0' && export HLOC_LOG_LEV
 
 
 
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && export CUDA_VISIBLE_DEVICES='0,1,2,3' && ns-train f3rm --max-num-iterations 120000 --pipeline.datamanager.train-num-images-to-sample-from 32 --pipeline.datamanager.train-num-times-to-repeat-images 256 --pipeline.datamanager.eval-num-images-to-sample-from 32 --pipeline.datamanager.eval-num-times-to-repeat-images 256 --machine.num-devices 4 --vis wandb --data datasets/f3rm/custom/ahgroom/ahgroom_colmap --pipeline.datamanager.feature-type CLIP --output-dir outputs --experiment-name homenew --pipeline.model.feat-hidden-dim 64 --pipeline.model.feat-num-layers 2
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && export CUDA_VISIBLE_DEVICES='0,1,2,3' && ns-train f3rm --max-num-iterations 120000 --pipeline.datamanager.train-num-images-to-sample-from 32 --pipeline.datamanager.train-num-times-to-repeat-images 512 --pipeline.datamanager.eval-num-images-to-sample-from 32 --pipeline.datamanager.eval-num-times-to-repeat-images 512 --machine.num-devices 4 --vis wandb --data datasets/f3rm/custom/ahgroom/ahgroom_colmap --pipeline.datamanager.feature-type CLIP --output-dir outputs --experiment-name homenew --pipeline.model.feat-hidden-dim 64 --pipeline.model.feat-num-layers 2
 
-export <...above...> --experiment-name homenew --load-dir dense_outputs/dinoclip/f3rm/2025-05-18_185942/nerfstudio_models
+export <...above...> --pipeline.model.feat-num-layers 2 --load-dir dense_outputs/dinoclip/f3rm/2025-05-18_185942/nerfstudio_models
 
-export <...above...> --experiment-name homenew nerfstudio-data --orientation-method none --center-method none --auto-scale-poses False --scale-factor 1.0 --scene-scale 1.0
+export <...above...> --pipeline.model.feat-num-layers 2 nerfstudio-data --orientation-method none --center-method none --auto-scale-poses False --scale-factor 1.0 --scene-scale 1.0
 
 
 
@@ -26,3 +26,7 @@ ns-export pointcloud --load-config outputs/sittingroom/f3rm/2025-04-07_123618/co
 
 
 unset CUDA_VISIBLE_DEVICES && ns-viewer --load-config outputs/home/f3rm/2025-04-06_131604/config.yml
+
+
+
+conda activate gpuprofile && python3 gpu_tracker.py --user smodak --gpu 0 1 2 3 --interval 1 --file rec_ahgroom_colmap_1362216_dinoclip_nodetachconfig.csv --mode record

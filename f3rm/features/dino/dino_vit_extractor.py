@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Union, List, Tuple
 from PIL import Image
 from f3rm.features.utils import preprocess
+import warnings
 
 
 class ViTExtractor:
@@ -69,6 +70,45 @@ class ViTExtractor:
         self.num_patches = None
 
     @staticmethod
+    def _safe_torch_hub_load(repo, model_name, max_retries=5, retry_delay=1.0):
+        """Safely load from torch hub with file locking to prevent race conditions when multiple processes try to load the same model."""
+        import tempfile
+        import fcntl
+        import time
+
+        # Create a lock file in a temp directory
+        lock_dir = Path(tempfile.gettempdir()) / "torch_hub_locks"
+        lock_dir.mkdir(exist_ok=True)
+        lock_file = lock_dir / f"{repo.replace('/', '_')}_{model_name}.lock"
+
+        for attempt in range(max_retries):
+            try:
+                # Try to acquire lock
+                with open(lock_file, 'w') as f:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    # Load the model while holding the lock
+                    model = torch.hub.load(repo, model_name)
+                    return model
+            except (BlockingIOError, OSError) as e:
+                if attempt < max_retries - 1:
+                    # Wait with exponential backoff
+                    wait_time = retry_delay * (2 ** attempt) + (torch.rand(1).item() * 0.5)
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    # Fallback: try loading without lock on final attempt
+                    warnings.warn(f"Failed to acquire lock after {max_retries} attempts, trying without lock")
+                    return torch.hub.load(repo, model_name)
+            except Exception as e:
+                if "Directory not empty" in str(e) and attempt < max_retries - 1:
+                    # Specific handling for the directory not empty error
+                    wait_time = retry_delay * (2 ** attempt) + (torch.rand(1).item() * 0.5)
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    raise
+
+    @staticmethod
     def create_model(model_type: str) -> nn.Module:
         """
         :param model_type: a string specifying which model to load. [dino_vits8 | dino_vits16 | dino_vitb8 |
@@ -77,7 +117,7 @@ class ViTExtractor:
         :return: the model
         """
         if 'dino' in model_type:
-            model = torch.hub.load('facebookresearch/dino:main', model_type)
+            model = ViTExtractor._safe_torch_hub_load('facebookresearch/dino:main', model_type)
         else:  # model from timm -- load weights from timm to dino model (enables working on arbitrary size images).
             try:
                 import timm
@@ -90,7 +130,7 @@ class ViTExtractor:
                 'vit_base_patch16_224': 'dino_vitb16',
                 'vit_base_patch8_224': 'dino_vitb8'
             }
-            model = torch.hub.load('facebookresearch/dino:main', model_type_dict[model_type])
+            model = ViTExtractor._safe_torch_hub_load('facebookresearch/dino:main', model_type_dict[model_type])
             temp_state_dict = temp_model.state_dict()
             del temp_state_dict['head.weight']
             del temp_state_dict['head.bias']
@@ -105,7 +145,7 @@ class ViTExtractor:
                             dinov2_vits14_reg | dinov2_vitb14_reg | dinov2_vitl14_reg | dinov2_vitg14_reg]
         :return: the model
         """
-        model = torch.hub.load('facebookresearch/dinov2', model_type)
+        model = ViTExtractor._safe_torch_hub_load('facebookresearch/dinov2', model_type)
         return model
 
     @staticmethod

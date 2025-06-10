@@ -18,11 +18,8 @@ dist/
 datasets/
 
 # Nerfstudio outputs
-outputs/
-f3rm_outputs/
-robopoint_outputs/
-dense_outputs/
-temp_outputs/
+*outputs*/
+
 renders/
 
 **/*notrack*/
