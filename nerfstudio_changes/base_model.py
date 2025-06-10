@@ -183,9 +183,9 @@ class Model(nn.Module):
                     continue
                 # outputs_lists[output_name].append(output)
                 if output_name.startswith("feature"):   # mymodif
-                    outputs_lists[output_name].append(output.detach().cpu())  # mymodif
+                    outputs_lists[output_name].append(output.cpu())  # mymodif
                 else:   # mymodif
-                    outputs_lists[output_name].append(output.detach())  # mymodif
+                    outputs_lists[output_name].append(output)  # mymodif
                 del output   # mymodif
             if (i // num_rays_per_chunk) % 20 == 0:   # mymodif
                 torch.cuda.empty_cache()   # mymodif

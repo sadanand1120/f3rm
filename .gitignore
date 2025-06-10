@@ -22,6 +22,7 @@ outputs/
 f3rm_outputs/
 robopoint_outputs/
 dense_outputs/
+temp_outputs/
 renders/
 
 **/*notrack*/

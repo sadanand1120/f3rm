@@ -27,27 +27,6 @@ from f3rm.renderer import FeatureRenderer
 from f3rm.features.clip_extract import CLIPArgs
 
 
-from nerfstudio.cameras.rays import Frustums, RaySamples
-
-
-def _detach_ray_samples(rs: RaySamples) -> RaySamples:
-    f = rs.frustums
-    f_det = Frustums(
-        origins=f.origins.detach(),
-        directions=f.directions.detach(),
-        starts=f.starts.detach() if f.starts is not None else None,
-        ends=f.ends.detach() if f.ends is not None else None,
-        pixel_area=f.pixel_area.detach() if f.pixel_area is not None else None,
-    )
-    return RaySamples(
-        frustums=f_det,
-        camera_indices=rs.camera_indices.detach() if rs.camera_indices is not None else None,
-        deltas=rs.deltas.detach() if rs.deltas is not None else None,
-        spacing_ends=rs.spacing_ends.detach() if rs.spacing_ends is not None else None,
-        spacing_starts=rs.spacing_starts.detach() if rs.spacing_starts is not None else None,
-    )
-
-
 @dataclass
 class FeatureFieldModelConfig(NerfactoModelConfig):
     """Note: make sure to use naming that doesn't conflict with NerfactoModelConfig"""
@@ -263,8 +242,8 @@ class FeatureFieldModel(NerfactoModel):
             outputs["pred_normals"] = self.normals_shader(pred_normals)
         # These use a lot of GPU memory, so we avoid storing them for eval.
         if self.training:
-            outputs["weights_list"] = [w.detach() for w in weights_list]
-            outputs["ray_samples_list"] = [_detach_ray_samples(rs) for rs in ray_samples_list]
+            outputs["weights_list"] = weights_list
+            outputs["ray_samples_list"] = ray_samples_list
 
         if self.training and self.config.predict_normals:
             outputs["rendered_orientation_loss"] = orientation_loss(
@@ -328,7 +307,8 @@ class FeatureFieldModel(NerfactoModel):
             return outputs
 
         # Normalize CLIP features rendered by feature field
-        clip_features = outputs["feature"]
+        clip_features = outputs["feature"]   # is on cpu() because of your base_model.py modification to nerfstudio code
+        clip_features = clip_features.to(viewer_utils.device)
         clip_features /= clip_features.norm(dim=-1, keepdim=True)
 
         # If there are no negatives, just show the cosine similarity with the positives
