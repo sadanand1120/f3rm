@@ -18,6 +18,7 @@ pip install -e ".[robot]" && pip install "git+https://github.com/facebookresearc
 pip3 install torchtyping==0.1.5 && pip3 install typeguard==4.4.2
 f3rm-optimize --help
 wandb login
+pip3 install GPUtil psutil nvidia-ml-py
 cp /robodata/smodak/repos/f3rm/nerfstudio_changes/record3d_utils.py /opt/miniconda3/envs/f3rm/lib/python3.9/site-packages/nerfstudio/process_data/
 cp /robodata/smodak/repos/f3rm/nerfstudio_changes/hloc_utils.py /opt/miniconda3/envs/f3rm/lib/python3.9/site-packages/nerfstudio/process_data/
 cp /robodata/smodak/repos/f3rm/nerfstudio_changes/colmap_utils.py /opt/miniconda3/envs/f3rm/lib/python3.9/site-packages/nerfstudio/process_data/
