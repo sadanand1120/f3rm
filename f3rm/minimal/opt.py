@@ -267,6 +267,7 @@ class NERFOpt:
             # TODO: add a dumper of visualized camera output to images so you know how's opt progressing
             # TODO: pluck out task specific stuff into some sort of dev specified config file or sth, implement scene DSL functions
             # TODO: to get higher batch_size in training with dino etc, introduce shard_size in DINOArgs etc, and make shard_size low for dino
+            # TODO: investigate exactly what TRAINING ARG or shard size is causing the process to crash due to OOM
             return final_minimize_score.item()
         return obj
 

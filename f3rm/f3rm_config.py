@@ -3,20 +3,26 @@ from nerfstudio.configs.base_config import ViewerConfig
 from nerfstudio.data.dataparsers.nerfstudio_dataparser import NerfstudioDataParserConfig
 from nerfstudio.engine.optimizers import AdamOptimizerConfig
 from nerfstudio.engine.schedulers import ExponentialDecaySchedulerConfig
-from nerfstudio.engine.trainer import TrainerConfig
 from nerfstudio.pipelines.base_pipeline import VanillaPipelineConfig
 from nerfstudio.plugins.types import MethodSpecification
 
 from f3rm.feature_datamanager import FeatureDataManagerConfig
 from f3rm.model import FeatureFieldModelConfig
+from f3rm.trainer import F3RMTrainerConfig
 
 f3rm_method = MethodSpecification(
-    config=TrainerConfig(
+    config=F3RMTrainerConfig(
         method_name="f3rm",
         steps_per_eval_batch=500,
         steps_per_save=2000,
         max_num_iterations=30000,
         mixed_precision=True,
+        # Seeding configuration - now with comprehensive support
+        enable_comprehensive_seeding=True,
+        seed_deterministic_algorithms=True,
+        seed_warn_only=False,  # Set to True if you encounter issues with deterministic algorithms
+        seed_cublas_workspace=True,
+        print_seed_info=True,
         pipeline=VanillaPipelineConfig(
             datamanager=FeatureDataManagerConfig(
                 feature_type="CLIP",
@@ -50,5 +56,5 @@ f3rm_method = MethodSpecification(
         viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
         vis="viewer",
     ),
-    description="F3RM with parallel NeRF training and feature field distillation.",
+    description="F3RM with parallel NeRF training, feature field distillation, and comprehensive seeding for reproducibility.",
 )
