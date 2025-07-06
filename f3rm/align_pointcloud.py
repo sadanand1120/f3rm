@@ -654,8 +654,8 @@ class InteractiveFilterTool:
         return True
 
     def save_filter_bounds(self):
-        """Save the current filter bounds to metadata."""
-        console.print(f"\n[bold green]Saving filter bounds...")
+        """Apply the current filter bounds to all data and save."""
+        console.print(f"\n[bold green]Applying filter bounds to all data...")
 
         # Print filter bounds
         console.print("[cyan]Filter bounds:")
@@ -663,27 +663,91 @@ class InteractiveFilterTool:
             color = self.axis_colors[i]
             console.print(f"  [{color}]{axis_name}: {self.filter_min[i]:.3f} to {self.filter_max[i]:.3f}")
 
-        # Update metadata
-        metadata_path = self.data.data_dir / "metadata.json"
+        # Apply filter to all pointcloud data
+        self.apply_filter_to_data()
+
+        console.print("[bold green]✓ Filter bounds applied and data updated")
+
+    def apply_filter_to_data(self):
+        """Apply the filter bounds to all pointcloud data and save."""
+        data_dir = self.data.data_dir
+
+        # Load original points array to create the filter mask
+        points = np.load(data_dir / "points.npy")
+
+        # Create mask for points within filter bounds
+        within_bounds = np.all(
+            (points >= self.filter_min) & (points <= self.filter_max),
+            axis=1
+        )
+
+        original_count = len(points)
+        filtered_count = within_bounds.sum()
+
+        console.print(f"[cyan]Filtering {original_count:,} points...")
+        console.print(f"[cyan]Keeping {filtered_count:,} points ({100*filtered_count/original_count:.1f}%)")
+        console.print(f"[cyan]Removing {original_count - filtered_count:,} points ({100*(original_count - filtered_count)/original_count:.1f}%)")
+
+        # 1. Filter and save RGB pointcloud
+        rgb_pcd = o3d.io.read_point_cloud(str(data_dir / "pointcloud_rgb.ply"))
+        rgb_points = np.asarray(rgb_pcd.points)
+        rgb_colors = np.asarray(rgb_pcd.colors)
+
+        filtered_rgb_pcd = o3d.geometry.PointCloud()
+        filtered_rgb_pcd.points = o3d.utility.Vector3dVector(rgb_points[within_bounds])
+        filtered_rgb_pcd.colors = o3d.utility.Vector3dVector(rgb_colors[within_bounds])
+
+        o3d.io.write_point_cloud(str(data_dir / "pointcloud_rgb.ply"), filtered_rgb_pcd)
+        console.print("[green]✓ Updated RGB pointcloud")
+
+        # 2. Filter and save PCA pointcloud
+        pca_pcd = o3d.io.read_point_cloud(str(data_dir / "pointcloud_feature_pca.ply"))
+        pca_points = np.asarray(pca_pcd.points)
+        pca_colors = np.asarray(pca_pcd.colors)
+
+        filtered_pca_pcd = o3d.geometry.PointCloud()
+        filtered_pca_pcd.points = o3d.utility.Vector3dVector(pca_points[within_bounds])
+        filtered_pca_pcd.colors = o3d.utility.Vector3dVector(pca_colors[within_bounds])
+
+        o3d.io.write_point_cloud(str(data_dir / "pointcloud_feature_pca.ply"), filtered_pca_pcd)
+        console.print("[green]✓ Updated PCA pointcloud")
+
+        # 3. Filter and save points array
+        filtered_points = points[within_bounds]
+        np.save(data_dir / "points.npy", filtered_points.astype(np.float32))
+        console.print("[green]✓ Updated points array")
+
+        # 4. Filter and save features array
+        features_file = self.data.metadata['files']['features']
+        features = np.load(data_dir / features_file)
+        filtered_features = features[within_bounds]
+        np.save(data_dir / features_file, filtered_features)
+        console.print("[green]✓ Updated features array")
+
+        # 5. Update metadata with new counts and bounding box
+        metadata_path = data_dir / "metadata.json"
         with open(metadata_path, 'r') as f:
             metadata = json.load(f)
 
-        # Add filter bounds to metadata
-        metadata['filter_bounds'] = {
-            'min': self.filter_min.tolist(),
-            'max': self.filter_max.tolist(),
+        # Update metadata
+        metadata['num_points'] = int(filtered_count)
+        metadata['bbox_min'] = filtered_points.min(axis=0).tolist()
+        metadata['bbox_max'] = filtered_points.max(axis=0).tolist()
+        metadata['filter_applied'] = {
+            'bounds': {
+                'min': self.filter_min.tolist(),
+                'max': self.filter_max.tolist()
+            },
+            'original_count': int(original_count),
+            'filtered_count': int(filtered_count),
             'applied': True
         }
 
         with open(metadata_path, 'w') as f:
             json.dump(metadata, f, indent=2)
+        console.print("[green]✓ Updated metadata with new counts and bounding box")
 
-        console.print("[bold green]✓ Filter bounds saved to metadata")
-
-        # Show final statistics
-        filtered_count, total_count = self.apply_filter()
-        console.print(f"[cyan]Final result: {filtered_count:,}/{total_count:,} points within filter bounds")
-        console.print(f"[cyan]Filtered out: {total_count - filtered_count:,} points ({100*(total_count - filtered_count)/total_count:.1f}%)")
+        console.print(f"[bold green]✓ Filtering complete: {filtered_count:,} points saved")
 
 
 def align_pointcloud(data_dir: Path, rotation_step: float = 10.0, translation_step: float = 0.1) -> None:
