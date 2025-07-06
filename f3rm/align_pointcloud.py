@@ -10,12 +10,17 @@ Usage:
     python align_pointcloud.py --data-dir exports/pointcloud_data/
 
 Controls:
-    - Normal Open3D controls (mouse drag, scroll, etc.) for viewing
-    - Hold CTRL + mouse drag to rotate the pointcloud around axes
-    - Hold SHIFT + mouse drag to translate the pointcloud
+    - Mouse: Normal Open3D viewing controls (camera only)
+    - Arrow Keys: Rotate around X/Y axes (pitch/yaw)
+    - Z/X: Rotate around Z-axis (roll)
+    - I/K: Move forward/back (±Y)
+    - J/L: Move left/right (±X)  
+    - U/O: Move up/down (±Z)
     - Press 'R' to reset transform
     - Press 'S' to save transform and exit
     - Press 'Q' to quit without saving
+    
+Note: Camera view is preserved during transforms for real-time visual feedback.
 """
 
 import argparse
@@ -53,11 +58,6 @@ class InteractiveAlignmentTool:
         self.transformed_pcd = None
         self.reference_geoms = []
 
-        # Control state
-        self.ctrl_pressed = False
-        self.shift_pressed = False
-        self.last_mouse_pos = None
-
     def create_reference_geometries(self) -> list:
         """Create coordinate frame, bounding box, and grid."""
         geometries = []
@@ -78,24 +78,34 @@ class InteractiveAlignmentTool:
         return geometries
 
     def update_transformed_pointcloud(self):
-        """Update the transformed pointcloud based on current transform."""
-        if self.original_pcd is None:
+        """Update the transformed pointcloud based on current transform while preserving camera view."""
+        if self.original_pcd is None or self.vis is None:
             return
+
+        # Save current camera parameters
+        view_control = self.vis.get_view_control()
+        camera_params = view_control.convert_to_pinhole_camera_parameters()
 
         # Apply transform to pointcloud
         self.transformed_pcd = o3d.geometry.PointCloud(self.original_pcd)
         self.transformed_pcd.transform(self.transform)
 
-        # Update visualization
-        if self.vis is not None:
-            self.vis.clear_geometries()
+        # Clear and re-add geometries
+        self.vis.clear_geometries()
 
-            # Add transformed pointcloud
-            self.vis.add_geometry(self.transformed_pcd)
+        # Add transformed pointcloud
+        self.vis.add_geometry(self.transformed_pcd)
 
-            # Add reference geometries
-            for geom in self.reference_geoms:
-                self.vis.add_geometry(geom)
+        # Add reference geometries
+        for geom in self.reference_geoms:
+            self.vis.add_geometry(geom)
+
+        # Restore camera parameters to maintain view
+        view_control.convert_from_pinhole_camera_parameters(camera_params)
+
+        # Update the visualization
+        self.vis.poll_events()
+        self.vis.update_renderer()
 
     def key_callback(self, vis, key, action):
         """Handle key press events."""
@@ -111,22 +121,9 @@ class InteractiveAlignmentTool:
                 console.print("[yellow]Exiting without saving transform")
                 vis.close()
                 return True
-            elif key == 341:  # Left CTRL
-                self.ctrl_pressed = True
-            elif key == 340:  # Left SHIFT
-                self.shift_pressed = True
         elif action == 0:  # Key release
-            if key == 341:  # Left CTRL
-                self.ctrl_pressed = False
-            elif key == 340:  # Left SHIFT
-                self.shift_pressed = False
+            return False
 
-        return False
-
-    def mouse_callback(self, vis, button, action):
-        """Handle mouse events for transformation."""
-        # For now, we'll use keyboard-based transformations
-        # Mouse-based transformations in Open3D are more complex to implement
         return False
 
     def reset_transform(self):
@@ -182,17 +179,17 @@ class InteractiveAlignmentTool:
         console.print(self.data.get_info())
 
         console.print("\n[bold blue]Controls:")
-        console.print("  Mouse: Normal Open3D viewing controls")
+        console.print("  Mouse: Normal Open3D viewing controls (camera only)")
         console.print("  'R': Reset transform to identity")
         console.print("  'S': Save transform and exit")
         console.print("  'Q': Quit without saving")
-        console.print("  'X'/'1': Rotate +/-10° around X-axis (Red)")
-        console.print("  'Y'/'2': Rotate +/-10° around Y-axis (Green)")
-        console.print("  'Z'/'3': Rotate +/-10° around Z-axis (Blue)")
-        console.print("  'W'/'T': Move forward/back (±Y)")
-        console.print("  'A'/'D': Move left/right (±X)")
-        console.print("  'F'/'V': Move up/down (±Z)")
+        console.print("  Arrow Keys: Rotate around X/Y axes (pitch/yaw)")
+        console.print("  'Z'/'X': Rotate around Z-axis (roll)")
+        console.print("  'I'/'K': Move forward/back (±Y)")
+        console.print("  'J'/'L': Move left/right (±X)")
+        console.print("  'U'/'O': Move up/down (±Z)")
         console.print("\n[bold yellow]Goal: Align pointcloud so floor is on XY plane and objects are properly oriented")
+        console.print("[bold yellow]Note: Camera view is preserved during transforms for real-time feedback")
 
         # Load RGB pointcloud
         self.original_pcd = self.data.rgb_pointcloud
@@ -208,45 +205,46 @@ class InteractiveAlignmentTool:
             width=1400, height=900
         )
 
-        # Register callbacks
+        # Register callbacks for save/reset/quit
         self.vis.register_key_callback(ord('R'), lambda vis: self.reset_transform())
         self.vis.register_key_callback(ord('S'), lambda vis: self.save_and_exit(vis))
         self.vis.register_key_callback(ord('Q'), lambda vis: self.quit_without_save(vis))
 
-        # Rotation controls
-        self.vis.register_key_callback(ord('X'), lambda vis: self.apply_rotation('x', 10))
-        self.vis.register_key_callback(ord('Y'), lambda vis: self.apply_rotation('y', 10))
-        self.vis.register_key_callback(ord('Z'), lambda vis: self.apply_rotation('z', 10))
+        # Arrow key rotation controls (Open3D key codes)
+        # Up Arrow = 265, Down Arrow = 264, Left Arrow = 263, Right Arrow = 262
+        self.vis.register_key_callback(265, lambda vis: self.apply_rotation('x', 10))    # Up Arrow: +X rotation
+        self.vis.register_key_callback(264, lambda vis: self.apply_rotation('x', -10))   # Down Arrow: -X rotation
+        self.vis.register_key_callback(263, lambda vis: self.apply_rotation('y', 10))    # Left Arrow: +Y rotation
+        self.vis.register_key_callback(262, lambda vis: self.apply_rotation('y', -10))   # Right Arrow: -Y rotation
 
-        # Shift + rotation for opposite direction (Open3D limitation: can't detect shift easily)
-        # We'll use different keys for negative rotations
-        self.vis.register_key_callback(ord('1'), lambda vis: self.apply_rotation('x', -10))
-        self.vis.register_key_callback(ord('2'), lambda vis: self.apply_rotation('y', -10))
-        self.vis.register_key_callback(ord('3'), lambda vis: self.apply_rotation('z', -10))
+        # Z/X keys for Z rotation (much more convenient than Page Up/Down)
+        self.vis.register_key_callback(ord('Z'), lambda vis: self.apply_rotation('z', 10))    # Z: +Z rotation
+        self.vis.register_key_callback(ord('X'), lambda vis: self.apply_rotation('z', -10))   # X: -Z rotation
 
-        # Translation controls (using WASD + QE, but avoiding S and Q conflicts)
-        self.vis.register_key_callback(ord('W'), lambda vis: self.apply_translation(0, 0.1, 0))  # +Y
-        self.vis.register_key_callback(ord('A'), lambda vis: self.apply_translation(-0.1, 0, 0))  # -X
-        self.vis.register_key_callback(ord('D'), lambda vis: self.apply_translation(0.1, 0, 0))  # +X
+        # IJKL controls for translation (like vim navigation)
+        self.vis.register_key_callback(ord('I'), lambda vis: self.apply_translation(0, 0.1, 0))   # I: +Y (forward)
+        self.vis.register_key_callback(ord('K'), lambda vis: self.apply_translation(0, -0.1, 0))  # K: -Y (back)
+        self.vis.register_key_callback(ord('J'), lambda vis: self.apply_translation(-0.1, 0, 0))  # J: -X (left)
+        self.vis.register_key_callback(ord('L'), lambda vis: self.apply_translation(0.1, 0, 0))   # L: +X (right)
 
-        # Use different keys for translation to avoid S/Q conflicts
-        self.vis.register_key_callback(ord('T'), lambda vis: self.apply_translation(0, -0.1, 0))  # -Y (T for "back")
-        self.vis.register_key_callback(ord('F'), lambda vis: self.apply_translation(0, 0, 0.1))  # +Z (F for "up")
-        self.vis.register_key_callback(ord('V'), lambda vis: self.apply_translation(0, 0, -0.1))  # -Z (V for "down")
+        # U/O for up/down translation
+        self.vis.register_key_callback(ord('U'), lambda vis: self.apply_translation(0, 0, 0.1))   # U: +Z (up)
+        self.vis.register_key_callback(ord('O'), lambda vis: self.apply_translation(0, 0, -0.1))  # O: -Z (down)
 
         # Add initial geometries
         self.update_transformed_pointcloud()
 
         console.print("\n[dim]Detailed Controls:")
-        console.print("  X/1: Rotate +/-10° around X-axis (Red)")
-        console.print("  Y/2: Rotate +/-10° around Y-axis (Green)")
-        console.print("  Z/3: Rotate +/-10° around Z-axis (Blue)")
-        console.print("  W/T: Move forward/back (±Y)")
-        console.print("  A/D: Move left/right (±X)")
-        console.print("  F/V: Move up/down (±Z)")
+        console.print("  ↑/↓ Arrow: Rotate around X-axis (pitch)")
+        console.print("  ←/→ Arrow: Rotate around Y-axis (yaw)")
+        console.print("  Z/X: Rotate around Z-axis (roll)")
+        console.print("  I/K: Move forward/back (±Y)")
+        console.print("  J/L: Move left/right (±X)")
+        console.print("  U/O: Move up/down (±Z)")
         console.print("  R: Reset transform")
         console.print("  S: Save and exit")
         console.print("  Q: Quit without saving")
+        console.print("\n[dim]Note: Use small incremental adjustments for precise alignment")
 
         # Run visualization
         self.vis.run()

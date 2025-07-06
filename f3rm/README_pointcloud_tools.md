@@ -37,16 +37,20 @@ python align_pointcloud.py --data-dir exports/sitting_pcd_features/
 ```
 
 **Interactive Controls:**
-- **Mouse**: Normal Open3D viewing (rotate, zoom, pan)
-- **X/1**: Rotate ±10° around X-axis (Red)
-- **Y/2**: Rotate ±10° around Y-axis (Green)  
-- **Z/3**: Rotate ±10° around Z-axis (Blue)
-- **W/T**: Move forward/back (±Y)
-- **A/D**: Move left/right (±X)
-- **F/V**: Move up/down (±Z)
+- **Mouse**: Normal Open3D viewing (rotate, zoom, pan camera only)
+- **Arrow Keys**: Rotate around X/Y axes (pitch/yaw)
+- **Z/X**: Rotate around Z-axis (roll)
+- **I/K**: Move forward/back (±Y)
+- **J/L**: Move left/right (±X)
+- **U/O**: Move up/down (±Z)
 - **R**: Reset transform
 - **S**: Save transform and exit
 - **Q**: Quit without saving
+
+**Features:**
+- Camera view is preserved during transforms for real-time visual feedback
+- Keyboard-only controls avoid conflicts with Open3D's built-in mouse controls
+- See coordinate axes move in real-time as you apply transformations
 
 **Goal**: Align so the floor is on the XY plane and objects are properly oriented with the coordinate axes.
 
@@ -72,6 +76,60 @@ python visualize_feature_pointcloud.py \
 ```
 
 **Coordinate Guides**: Shows origin (0,0,0), axes (Red=X, Green=Y, Blue=Z), bounding box wireframe, and grid lines for spatial reference.
+
+#### Advanced Filtering (All Modes)
+
+The visualizer supports two types of filtering that work in any mode:
+
+**1. Bounding Box Filtering:**
+```bash
+# Only show points within a specific region
+python visualize_feature_pointcloud.py \
+    --data-dir exports/data \
+    --mode rgb \
+    --bbox-filter-min -0.5 -0.5 0.0 \
+    --bbox-filter-max 0.5 0.5 1.0
+```
+
+**2. Semantic Filtering:**
+```bash
+# Filter OUT floor points (remove floor, show everything else)
+python visualize_feature_pointcloud.py \
+    --data-dir exports/data \
+    --mode rgb \
+    --semantic-filter-query "floor" \
+    --semantic-filter-mode "filter-out" \
+    --semantic-threshold 0.6
+
+# Filter IN only chair points (show only chairs)
+python visualize_feature_pointcloud.py \
+    --data-dir exports/data \
+    --mode pca \
+    --semantic-filter-query "chair" \
+    --semantic-filter-mode "filter-in" \
+    --semantic-threshold 0.5
+```
+
+**3. Combined Filtering:**
+```bash
+# Show only chairs in a specific region, without floor
+python visualize_feature_pointcloud.py \
+    --data-dir exports/data \
+    --mode semantic \
+    --query "cushion" \
+    --bbox-filter-min -1 -1 0.2 \
+    --bbox-filter-max 1 1 2.0 \
+    --semantic-filter-query "floor" \
+    --semantic-filter-mode "filter-out" \
+    --semantic-threshold 0.7
+```
+
+**Filter Visualization:**
+- **Gray wireframe**: Original pointcloud bounds from export
+- **Orange wireframe**: Active bbox filter bounds (when using `--bbox-filter-*`)
+- **Grid lines**: Spatial reference on XY plane
+
+**Filter Order**: Filters are applied in sequence: bbox filter first, then semantic filter.
 
 ## Complete Workflow
 
