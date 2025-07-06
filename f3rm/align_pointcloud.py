@@ -2,14 +2,17 @@
 """
 F3RM Pointcloud Alignment Tool
 
-This script provides interactive alignment of F3RM pointclouds with coordinate axes.
+This script provides interactive alignment of F3RM pointclouds with coordinate axes,
+and interactive bounding box filtering with visual feedback.
+
 Use this after export_feature_pointcloud.py and before visualize_feature_pointcloud.py
-to properly align your pointcloud with the coordinate system.
+to properly align your pointcloud with the coordinate system and/or filter out unwanted regions.
 
 Usage:
-    python align_pointcloud.py --data-dir exports/pointcloud_data/
+    python align_pointcloud.py --data-dir exports/pointcloud_data/ --mode align
+    python align_pointcloud.py --data-dir exports/pointcloud_data/ --mode filter
 
-Controls:
+Align Mode Controls:
     - Mouse: Normal Open3D viewing controls (camera only)
     - Arrow Keys: Rotate around X/Y axes (pitch/yaw)
     - Z/X: Rotate around Z-axis (roll)
@@ -19,8 +22,18 @@ Controls:
     - Press 'R' to reset transform
     - Press 'S' to save transform and exit
     - Press 'Q' to quit without saving
+
+Filter Mode Controls:
+    - Mouse: Normal Open3D viewing controls
+    - 'N': Cycle between X, Y, Z axis filtering
+    - ↑/↓ Arrow: Adjust max bound for current axis
+    - ←/→ Arrow: Adjust min bound for current axis
+    - 'R': Reset all filters to original bounds
+    - 'S': Save filter bounds and exit
+    - 'Q': Quit without saving
     
 Note: Camera view is preserved during transforms for real-time visual feedback.
+Colored planes show the current filtering bounds (red=X, green=Y, blue=Z).
 """
 
 import argparse
@@ -43,6 +56,71 @@ from f3rm.visualize_feature_pointcloud import (
 )
 
 console = Console()
+
+
+def create_filter_plane(axis: int, value: float, bbox_min: np.ndarray, bbox_max: np.ndarray,
+                        is_min: bool = True, alpha: float = 0.3) -> o3d.geometry.TriangleMesh:
+    """
+    Create a colored plane to visualize filtering bounds.
+
+    Args:
+        axis: 0=X, 1=Y, 2=Z
+        value: Position of the plane along the axis
+        bbox_min, bbox_max: Overall bounding box for plane size
+        is_min: True for min bound plane, False for max bound plane
+        alpha: Transparency (not used in Open3D mesh, but for reference)
+
+    Returns:
+        Colored triangle mesh plane
+    """
+    # Colors for each axis (red=X, green=Y, blue=Z)
+    axis_colors = [
+        [1.0, 0.3, 0.3],  # Red for X
+        [0.3, 1.0, 0.3],  # Green for Y
+        [0.3, 0.3, 1.0],  # Blue for Z
+    ]
+
+    # Make min planes slightly darker
+    color = axis_colors[axis]
+    if is_min:
+        color = [c * 0.7 for c in color]
+
+    # Create plane vertices based on axis
+    if axis == 0:  # X axis plane (YZ plane)
+        vertices = [
+            [value, bbox_min[1], bbox_min[2]],
+            [value, bbox_max[1], bbox_min[2]],
+            [value, bbox_max[1], bbox_max[2]],
+            [value, bbox_min[1], bbox_max[2]]
+        ]
+    elif axis == 1:  # Y axis plane (XZ plane)
+        vertices = [
+            [bbox_min[0], value, bbox_min[2]],
+            [bbox_max[0], value, bbox_min[2]],
+            [bbox_max[0], value, bbox_max[2]],
+            [bbox_min[0], value, bbox_max[2]]
+        ]
+    else:  # Z axis plane (XY plane)
+        vertices = [
+            [bbox_min[0], bbox_min[1], value],
+            [bbox_max[0], bbox_min[1], value],
+            [bbox_max[0], bbox_max[1], value],
+            [bbox_min[0], bbox_max[1], value]
+        ]
+
+    # Create triangles (two triangles per quad)
+    triangles = [
+        [0, 1, 2],
+        [0, 2, 3]
+    ]
+
+    # Create mesh
+    mesh = o3d.geometry.TriangleMesh()
+    mesh.vertices = o3d.utility.Vector3dVector(vertices)
+    mesh.triangles = o3d.utility.Vector3iVector(triangles)
+    mesh.paint_uniform_color(color)
+
+    return mesh
 
 
 class InteractiveAlignmentTool:
@@ -342,6 +420,272 @@ class InteractiveAlignmentTool:
         console.print("[dim]Note: Feature vectors unchanged (view-invariant)")
 
 
+class InteractiveFilterTool:
+    """Interactive tool for setting bounding box filters with visual feedback."""
+
+    def __init__(self, data: FeaturePointcloudData, filter_step: float = 0.05):
+        self.data = data
+        self.vis = None
+        self.filter_step = filter_step
+
+        # Initialize filter bounds to original bounding box
+        self.original_bbox_min = np.array(self.data.metadata['bbox_min'])
+        self.original_bbox_max = np.array(self.data.metadata['bbox_max'])
+        self.filter_min = self.original_bbox_min.copy()
+        self.filter_max = self.original_bbox_max.copy()
+
+        # Current axis being filtered (0=X, 1=Y, 2=Z)
+        self.current_axis = 0
+        self.axis_names = ['X', 'Y', 'Z']
+        self.axis_colors = ['red', 'green', 'blue']
+
+        # Store geometries
+        self.original_pcd = None
+        self.filtered_pcd = None
+        self.reference_geoms = []
+        self.filter_planes = []
+
+    def create_reference_geometries(self) -> list:
+        """Create coordinate frame, bounding box, and grid."""
+        geometries = []
+
+        # Coordinate frame at origin (larger for visibility)
+        geometries.extend(create_coordinate_frame(size=0.3))
+
+        # Original bounding box wireframe (gray)
+        geometries.extend(create_bounding_box_lines(self.original_bbox_min, self.original_bbox_max))
+
+        # Grid lines for spatial reference
+        geometries.extend(create_grid_lines(self.original_bbox_min, self.original_bbox_max, grid_size=0.2))
+
+        return geometries
+
+    def create_filter_planes(self) -> list:
+        """Create colored planes showing current filter bounds."""
+        planes = []
+
+        for axis in range(3):
+            # Min plane
+            min_plane = create_filter_plane(
+                axis, self.filter_min[axis],
+                self.original_bbox_min, self.original_bbox_max,
+                is_min=True
+            )
+            planes.append(min_plane)
+
+            # Max plane
+            max_plane = create_filter_plane(
+                axis, self.filter_max[axis],
+                self.original_bbox_min, self.original_bbox_max,
+                is_min=False
+            )
+            planes.append(max_plane)
+
+        return planes
+
+    def apply_filter(self):
+        """Apply current filter bounds to the pointcloud."""
+        points = np.asarray(self.original_pcd.points)
+        colors = np.asarray(self.original_pcd.colors)
+
+        # Create mask for points within filter bounds
+        within_bounds = np.all(
+            (points >= self.filter_min) & (points <= self.filter_max),
+            axis=1
+        )
+
+        # Apply filter
+        filtered_points = points[within_bounds]
+        filtered_colors = colors[within_bounds]
+
+        # Update filtered pointcloud
+        self.filtered_pcd = o3d.geometry.PointCloud()
+        self.filtered_pcd.points = o3d.utility.Vector3dVector(filtered_points)
+        self.filtered_pcd.colors = o3d.utility.Vector3dVector(filtered_colors)
+
+        return len(filtered_points), len(points)
+
+    def update_visualization(self):
+        """Update the visualization with current filter state."""
+        if self.vis is None:
+            return
+
+        # Save current camera parameters
+        view_control = self.vis.get_view_control()
+        camera_params = view_control.convert_to_pinhole_camera_parameters()
+
+        # Apply current filter
+        filtered_count, total_count = self.apply_filter()
+
+        # Create new filter planes
+        self.filter_planes = self.create_filter_planes()
+
+        # Clear and re-add geometries
+        self.vis.clear_geometries()
+
+        # Add filtered pointcloud
+        self.vis.add_geometry(self.filtered_pcd)
+
+        # Add reference geometries
+        for geom in self.reference_geoms:
+            self.vis.add_geometry(geom)
+
+        # Add filter planes
+        for plane in self.filter_planes:
+            self.vis.add_geometry(plane)
+
+        # Restore camera parameters to maintain view
+        view_control.convert_from_pinhole_camera_parameters(camera_params)
+
+        # Update status
+        axis_name = self.axis_names[self.current_axis]
+        axis_color = self.axis_colors[self.current_axis]
+        console.print(f"[{axis_color}]Current axis: {axis_name} | "
+                      f"Min: {self.filter_min[self.current_axis]:.3f} | "
+                      f"Max: {self.filter_max[self.current_axis]:.3f} | "
+                      f"Points: {filtered_count:,}/{total_count:,}")
+
+    def cycle_axis(self):
+        """Cycle to the next axis (X -> Y -> Z -> X)."""
+        self.current_axis = (self.current_axis + 1) % 3
+        console.print(f"[bold {self.axis_colors[self.current_axis]}]Switched to {self.axis_names[self.current_axis]} axis filtering")
+        self.update_visualization()
+
+    def adjust_bound(self, is_max: bool, direction: int):
+        """Adjust min or max bound for current axis.
+
+        Args:
+            is_max: True to adjust max bound, False for min bound
+            direction: 1 for increase, -1 for decrease
+        """
+        axis = self.current_axis
+        step = self.filter_step * direction
+
+        if is_max:
+            new_value = self.filter_max[axis] + step
+            # Ensure max >= min
+            if new_value >= self.filter_min[axis]:
+                self.filter_max[axis] = new_value
+        else:
+            new_value = self.filter_min[axis] + step
+            # Ensure min <= max
+            if new_value <= self.filter_max[axis]:
+                self.filter_min[axis] = new_value
+
+        self.update_visualization()
+
+    def reset_filters(self):
+        """Reset all filter bounds to original bounding box."""
+        self.filter_min = self.original_bbox_min.copy()
+        self.filter_max = self.original_bbox_max.copy()
+        console.print("[green]Filter bounds reset to original bounding box")
+        self.update_visualization()
+
+    def start_filtering(self):
+        """Start the interactive filter tool."""
+        console.print("[bold green]Starting F3RM Pointcloud Filter Tool")
+        console.print(self.data.get_info())
+
+        console.print("\n[bold blue]Filter Mode Controls:")
+        console.print("  Mouse: Normal Open3D viewing controls")
+        console.print("  'N': Cycle between X, Y, Z axis filtering")
+        console.print("  ↑/↓ Arrow: Adjust max bound for current axis")
+        console.print("  ←/→ Arrow: Adjust min bound for current axis")
+        console.print("  'R': Reset all filters to original bounds")
+        console.print("  'S': Save filter bounds and exit")
+        console.print("  'Q': Quit without saving")
+        console.print("\n[bold yellow]Goal: Set bounding box filters to remove unwanted regions")
+        console.print("[bold yellow]Colored planes show filter bounds: Red=X, Green=Y, Blue=Z")
+        console.print("[bold yellow]Darker planes = min bounds, Brighter planes = max bounds")
+
+        # Load RGB pointcloud
+        self.original_pcd = self.data.rgb_pointcloud
+
+        # Create reference geometries
+        self.reference_geoms = self.create_reference_geometries()
+
+        # Initialize visualizer
+        self.vis = o3d.visualization.VisualizerWithKeyCallback()
+        self.vis.create_window(
+            window_name="F3RM Pointcloud Filter Tool",
+            width=1400, height=900
+        )
+
+        # Register key callbacks
+        self.vis.register_key_callback(ord('N'), lambda vis: self.cycle_axis())
+        self.vis.register_key_callback(ord('R'), lambda vis: self.reset_filters())
+        self.vis.register_key_callback(ord('S'), lambda vis: self.save_and_exit(vis))
+        self.vis.register_key_callback(ord('Q'), lambda vis: self.quit_without_save(vis))
+
+        # Arrow key controls for adjusting bounds
+        # Up Arrow = 265, Down Arrow = 264, Left Arrow = 263, Right Arrow = 262
+        self.vis.register_key_callback(265, lambda vis: self.adjust_bound(True, 1))    # Up: increase max
+        self.vis.register_key_callback(264, lambda vis: self.adjust_bound(True, -1))   # Down: decrease max
+        self.vis.register_key_callback(262, lambda vis: self.adjust_bound(False, 1))   # Right: increase min
+        self.vis.register_key_callback(263, lambda vis: self.adjust_bound(False, -1))  # Left: decrease min
+
+        # Initial visualization update
+        self.update_visualization()
+
+        console.print("\n[dim]Detailed Controls:")
+        console.print("  N: Cycle axis (X → Y → Z → X)")
+        console.print("  ↑/↓: Adjust max bound (+/-)")
+        console.print("  ←/→: Adjust min bound (-/+)")
+        console.print("  R: Reset filters")
+        console.print("  S: Save and exit")
+        console.print("  Q: Quit without saving")
+        console.print(f"\n[dim]Filter step size: {self.filter_step} units")
+        console.print(f"[bold {self.axis_colors[self.current_axis]}]Starting with {self.axis_names[self.current_axis]} axis")
+
+        # Run visualization
+        self.vis.run()
+        self.vis.destroy_window()
+
+    def save_and_exit(self, vis):
+        """Save filter bounds and exit."""
+        self.save_filter_bounds()
+        vis.close()
+        return True
+
+    def quit_without_save(self, vis):
+        """Quit without saving."""
+        console.print("[yellow]Exiting without saving filter bounds")
+        vis.close()
+        return True
+
+    def save_filter_bounds(self):
+        """Save the current filter bounds to metadata."""
+        console.print(f"\n[bold green]Saving filter bounds...")
+
+        # Print filter bounds
+        console.print("[cyan]Filter bounds:")
+        for i, axis_name in enumerate(self.axis_names):
+            color = self.axis_colors[i]
+            console.print(f"  [{color}]{axis_name}: {self.filter_min[i]:.3f} to {self.filter_max[i]:.3f}")
+
+        # Update metadata
+        metadata_path = self.data.data_dir / "metadata.json"
+        with open(metadata_path, 'r') as f:
+            metadata = json.load(f)
+
+        # Add filter bounds to metadata
+        metadata['filter_bounds'] = {
+            'min': self.filter_min.tolist(),
+            'max': self.filter_max.tolist(),
+            'applied': True
+        }
+
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+
+        console.print("[bold green]✓ Filter bounds saved to metadata")
+
+        # Show final statistics
+        filtered_count, total_count = self.apply_filter()
+        console.print(f"[cyan]Final result: {filtered_count:,}/{total_count:,} points within filter bounds")
+        console.print(f"[cyan]Filtered out: {total_count - filtered_count:,} points ({100*(total_count - filtered_count)/total_count:.1f}%)")
+
+
 def align_pointcloud(data_dir: Path, rotation_step: float = 10.0, translation_step: float = 0.1) -> None:
     """
     Main function to align pointcloud data.
@@ -376,14 +720,56 @@ def align_pointcloud(data_dir: Path, rotation_step: float = 10.0, translation_st
     alignment_tool.start_alignment()
 
 
+def filter_pointcloud(data_dir: Path, filter_step: float = 0.05) -> None:
+    """
+    Main function to set bounding box filters for pointcloud data.
+
+    Args:
+        data_dir: Directory containing exported pointcloud data
+        filter_step: Filter adjustment step size in units (default: 0.05)
+    """
+    console.print(f"[bold blue]F3RM Pointcloud Filter Tool")
+    console.print(f"[bold blue]Data directory: {data_dir}")
+    console.print(f"[bold blue]Filter step: {filter_step} units")
+
+    # Load pointcloud data
+    try:
+        data = FeaturePointcloudData(data_dir)
+        console.print("[green]✓ Pointcloud data loaded successfully")
+    except Exception as e:
+        console.print(f"[red]Error loading pointcloud data: {e}")
+        return
+
+    # Check if filters already exist
+    if 'filter_bounds' in data.metadata and data.metadata['filter_bounds'].get('applied', False):
+        console.print("[yellow]Warning: This pointcloud already has filter bounds set")
+        console.print(f"[yellow]Current bounds: {data.metadata['filter_bounds']}")
+        response = input("Continue anyway? (y/N): ").strip().lower()
+        if response != 'y':
+            console.print("[yellow]Filtering cancelled")
+            return
+
+    # Start filter tool
+    filter_tool = InteractiveFilterTool(data, filter_step)
+    filter_tool.start_filtering()
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Align F3RM feature pointclouds with coordinate axes")
+    parser = argparse.ArgumentParser(description="Align or filter F3RM feature pointclouds")
     parser.add_argument("--data-dir", type=Path, required=True,
                         help="Directory containing exported pointcloud data")
+    parser.add_argument("--mode", choices=["align", "filter"], default="align",
+                        help="Tool mode: 'align' for alignment, 'filter' for bounding box filtering")
+
+    # Alignment mode arguments
     parser.add_argument("--rotation-step", type=float, default=10.0,
-                        help="Rotation step size in degrees (default: 10.0)")
+                        help="Rotation step size in degrees (default: 10.0, align mode)")
     parser.add_argument("--translation-step", type=float, default=0.1,
-                        help="Translation step size in units (default: 0.1)")
+                        help="Translation step size in units (default: 0.1, align mode)")
+
+    # Filter mode arguments
+    parser.add_argument("--filter-step", type=float, default=0.05,
+                        help="Filter adjustment step size in units (default: 0.05, filter mode)")
 
     args = parser.parse_args()
 
@@ -409,7 +795,10 @@ def main():
         return
 
     try:
-        align_pointcloud(args.data_dir, args.rotation_step, args.translation_step)
+        if args.mode == "align":
+            align_pointcloud(args.data_dir, args.rotation_step, args.translation_step)
+        elif args.mode == "filter":
+            filter_pointcloud(args.data_dir, args.filter_step)
     except Exception as e:
         console.print(f"[bold red]Error: {e}")
         raise
