@@ -138,7 +138,8 @@ class SemanticSimilarityUtils:
         features: np.ndarray,
         text_queries: List[str],
         has_negatives: bool = True,
-        softmax_temp: float = 1.0
+        softmax_temp: float = 1.0,
+        chunk_size: int = 100000
     ) -> np.ndarray:
         """
         Compute similarity between pointcloud features and text queries.
@@ -148,28 +149,52 @@ class SemanticSimilarityUtils:
             text_queries: List of text queries. First is positive, rest are negatives
             has_negatives: Whether to use contrastive computation
             softmax_temp: Temperature for softmax
+            chunk_size: Number of features to process at once to avoid CUDA OOM
 
         Returns:
             Similarity scores (N,) for each point
         """
         self._load_clip_model()
 
-        # Convert features to torch
-        features_torch = torch.from_numpy(features).to(self.device)
-
-        # Encode text queries
+        # Encode text queries once
         text_tokens = self.tokenizer(text_queries).to(self.device)
         with torch.no_grad():
             text_features = self.clip_model.encode_text(text_tokens)
 
-        # Compute similarities using the same method as in opt.py
-        similarities = compute_similarity_text2vis(
-            features_torch, text_features,
-            has_negatives=has_negatives,
-            softmax_temp=softmax_temp
-        )
+        # Process features in chunks to avoid CUDA memory issues
+        n_points = features.shape[0]
+        all_similarities = []
 
-        return similarities.cpu().numpy().squeeze()
+        console.print(f"[yellow]Processing {n_points:,} points in chunks of {chunk_size:,}...")
+
+        for i in range(0, n_points, chunk_size):
+            end_idx = min(i + chunk_size, n_points)
+            chunk_features = features[i:end_idx]
+
+            # Convert chunk to torch and move to device
+            features_torch = torch.from_numpy(chunk_features).to(self.device)
+
+            with torch.no_grad():
+                # Compute similarities for this chunk
+                chunk_similarities = compute_similarity_text2vis(
+                    features_torch, text_features,
+                    has_negatives=has_negatives,
+                    softmax_temp=softmax_temp
+                )
+
+                # Move to CPU and store
+                all_similarities.append(chunk_similarities.cpu().numpy())
+
+            # Clear GPU memory for this chunk
+            del features_torch
+            torch.cuda.empty_cache()
+
+            if (i // chunk_size + 1) % 10 == 0:
+                console.print(f"[yellow]Processed {end_idx:,}/{n_points:,} points...")
+
+        # Concatenate all chunks
+        similarities = np.concatenate(all_similarities, axis=0)
+        return similarities.squeeze()
 
     def create_similarity_pointcloud(
         self,
