@@ -4,11 +4,12 @@ This directory contains tools for exporting, visualizing, and analyzing F3RM fea
 
 ## Overview
 
-The tools consist of three main components:
+The tools consist of four main components:
 
 1. **`export_feature_pointcloud.py`** - Export RGB, features, and feature_PCA pointclouds with bounding box filtering
-2. **`visualize_feature_pointcloud.py`** - Simple visualization with RGB/PCA/semantic modes and coordinate guides
-3. **`semantic_similarity_utils.py`** - Advanced semantic analysis utilities (reuses visualizer code)
+2. **`align_pointcloud.py`** - Interactive alignment tool to orient pointclouds with coordinate axes
+3. **`visualize_feature_pointcloud.py`** - Simple visualization with RGB/PCA/semantic modes and coordinate guides
+4. **`semantic_similarity_utils.py`** - Advanced semantic analysis utilities (reuses visualizer code)
 
 ## Quick Start
 
@@ -27,15 +28,29 @@ python export_feature_pointcloud.py \
 
 **Bounding Box Filtering**: The default bbox of `[-1,-1,-1]` to `[1,1,1]` removes outlier points that are too far away, keeping only the core scene content.
 
-This creates:
-- `pointcloud_rgb.ply` - Standard RGB pointcloud
-- `pointcloud_feature_pca.ply` - PCA-projected feature visualization  
-- `features_float16.npy` - Compressed feature vectors
-- `points.npy` - Point coordinates
-- `pca_params.pkl` - PCA parameters for consistency
-- `metadata.json` - Export metadata
+### 2. Align Pointcloud (Optional but Recommended)
 
-### 2. Simple Visualization
+Interactively align your pointcloud with the coordinate system for better visualization:
+
+```bash
+python align_pointcloud.py --data-dir exports/sitting_pcd_features/
+```
+
+**Interactive Controls:**
+- **Mouse**: Normal Open3D viewing (rotate, zoom, pan)
+- **X/1**: Rotate ±10° around X-axis (Red)
+- **Y/2**: Rotate ±10° around Y-axis (Green)  
+- **Z/3**: Rotate ±10° around Z-axis (Blue)
+- **W/T**: Move forward/back (±Y)
+- **A/D**: Move left/right (±X)
+- **F/V**: Move up/down (±Z)
+- **R**: Reset transform
+- **S**: Save transform and exit
+- **Q**: Quit without saving
+
+**Goal**: Align so the floor is on the XY plane and objects are properly oriented with the coordinate axes.
+
+### 3. Visualize and Analyze
 
 Visualize with direct control (following opt.py approach):
 
@@ -58,7 +73,34 @@ python visualize_feature_pointcloud.py \
 
 **Coordinate Guides**: Shows origin (0,0,0), axes (Red=X, Green=Y, Blue=Z), bounding box wireframe, and grid lines for spatial reference.
 
-### 3. Advanced Semantic Analysis
+## Complete Workflow
+
+The recommended workflow is:
+
+```bash
+# Step 1: Export pointcloud with features
+python export_feature_pointcloud.py \
+    --config outputs/scene/f3rm/config.yml \
+    --output-dir exports/scene_pcd \
+    --num-points 1000000
+
+# Step 2: Align pointcloud with coordinate system
+python align_pointcloud.py --data-dir exports/scene_pcd
+
+# Step 3: Visualize and analyze
+python visualize_feature_pointcloud.py --data-dir exports/scene_pcd --mode rgb
+python visualize_feature_pointcloud.py --data-dir exports/scene_pcd --mode semantic --query "chair"
+```
+
+This creates:
+- `pointcloud_rgb.ply` - Standard RGB pointcloud (aligned)
+- `pointcloud_feature_pca.ply` - PCA-projected feature visualization (aligned)
+- `features_float16.npy` - Compressed feature vectors (unchanged)
+- `points.npy` - Point coordinates (aligned)
+- `pca_params.pkl` - PCA parameters for consistency
+- `metadata.json` - Export metadata with alignment transform
+
+### 4. Advanced Semantic Analysis
 
 Use the semantic similarity utilities for programmatic analysis:
 
@@ -66,7 +108,7 @@ Use the semantic similarity utilities for programmatic analysis:
 from f3rm.semantic_similarity_utils import SemanticPointcloudAnalyzer
 import numpy as np
 
-# Load exported data
+# Load exported data (automatically uses aligned data if available)
 points = np.load("exports/sitting_pcd_features/points.npy")
 features = np.load("exports/sitting_pcd_features/features_float16.npy")
 

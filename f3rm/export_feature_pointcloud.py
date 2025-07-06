@@ -117,8 +117,9 @@ def sample_feature_pointcloud(
                 collected_points += len(nerf_points)
                 progress.update(task, completed=min(collected_points, num_points))
 
-                # Clear GPU cache periodically
-                torch.cuda.empty_cache()
+                # Clear GPU cache periodically to prevent OOM
+                if len(points_list) % 10 == 0:  # Every 10 chunks
+                    torch.cuda.empty_cache()
 
                 # Break if we have enough points
                 if collected_points >= num_points:
@@ -128,18 +129,44 @@ def sample_feature_pointcloud(
     if not points_list:
         raise RuntimeError("No valid points were sampled. Try expanding the bounding box.")
 
-    points = torch.cat(points_list, dim=0)
-    rgbs = torch.cat(rgbs_list, dim=0)
-    features = torch.cat(features_list, dim=0)
+    console.print(f"[yellow]Concatenating {len(points_list)} chunks...")
+
+    # Move to CPU and concatenate to save GPU memory
+    points_cpu = []
+    rgbs_cpu = []
+    features_cpu = []
+
+    for points_chunk, rgbs_chunk, features_chunk in zip(points_list, rgbs_list, features_list):
+        points_cpu.append(points_chunk.cpu())
+        rgbs_cpu.append(rgbs_chunk.cpu())
+        features_cpu.append(features_chunk.cpu())
+
+    # Clear GPU lists to free memory
+    del points_list, rgbs_list, features_list
+    torch.cuda.empty_cache()
+
+    # Concatenate on CPU
+    points = torch.cat(points_cpu, dim=0)
+    rgbs = torch.cat(rgbs_cpu, dim=0)
+    features = torch.cat(features_cpu, dim=0)
+
+    # Clear CPU lists to free memory
+    del points_cpu, rgbs_cpu, features_cpu
 
     # Subsample to exactly num_points if we have more
     if len(points) > num_points:
+        console.print(f"[yellow]Subsampling from {len(points):,} to {num_points:,} points...")
         indices = torch.randperm(len(points))[:num_points]
         points = points[indices]
         rgbs = rgbs[indices]
         features = features[indices]
 
     console.print(f"[bold green]Collected {len(points):,} points")
+
+    # Move back to GPU for PCA computation
+    points = points.to(device)
+    rgbs = rgbs.to(device)
+    features = features.to(device)
 
     # Apply consistent PCA to all features
     console.print("[bold green]Computing PCA projection for features...")
@@ -323,7 +350,7 @@ def main():
     parser = argparse.ArgumentParser(description="Export F3RM feature pointclouds")
     parser.add_argument("--config", type=Path, required=True, help="Path to F3RM model config.yml")
     parser.add_argument("--output-dir", type=Path, required=True, help="Output directory")
-    parser.add_argument("--num-points", type=int, default=10000000, help="Number of points to sample")
+    parser.add_argument("--num-points", type=int, default=5000000, help="Number of points to sample (default: 1M, try 100K-500K for large scenes)")
     parser.add_argument("--no-compress", action="store_true", help="Don't compress features (use float32)")
 
     # Bounding box arguments with reasonable defaults for indoor scenes
@@ -347,6 +374,11 @@ def main():
     if not args.no_bbox:
         console.print(f"[bold blue]Bounding box: {bbox_min} to {bbox_max}")
         console.print(f"[dim]Use --no-bbox to disable filtering, or adjust --bbox-min/--bbox-max")
+
+    # Memory usage warning
+    if args.num_points > 5000000:
+        console.print(f"[yellow]Warning: {args.num_points:,} points may require significant GPU memory")
+        console.print(f"[yellow]Consider using fewer points (e.g., --num-points 1000000) if you encounter OOM errors")
 
     try:
         export_feature_pointcloud(
