@@ -581,9 +581,10 @@ def visualize_semantic(
     semantic_filter_mode: Optional[str] = None,
     semantic_threshold: float = 0.502,
     semantic_softmax_temp: float = 1.0,
-    semantic_negatives: Optional[List[str]] = None
+    semantic_negatives: Optional[List[str]] = None,
+    background_alpha: float = 0.3
 ):
-    """Visualize semantic similarity pointcloud with optional filtering."""
+    """Visualize semantic similarity pointcloud with RGB background and optional filtering."""
     console.print(f"[bold green]Visualizing semantic similarity for query: '{query}'")
     console.print(data.get_info())
 
@@ -610,30 +611,66 @@ def visualize_semantic(
     console.print(f"  Using threshold: {threshold:.3f}")
     console.print(f"  Points above threshold: {above_thresh:,} / {len(similarities):,}")
 
-    # Create similarity pointcloud (before additional filtering)
-    sim_pcd = semantic_utils.create_similarity_pointcloud(
-        data.points, similarities, threshold=threshold
-    )
+    # Get original RGB pointcloud for background
+    rgb_pcd = data.rgb_pointcloud
+    all_points = np.asarray(rgb_pcd.points)
+    all_rgb_colors = np.asarray(rgb_pcd.colors)
 
-    points = np.asarray(sim_pcd.points)
-    colors = np.asarray(sim_pcd.colors)
+    # Create mask for points above threshold
+    above_threshold_mask = similarities > threshold
 
-    console.print(f"[green]Created similarity pointcloud with {len(points)} points")
+    # Create combined pointcloud with RGB background and semantic heatmap
+    combined_points = all_points.copy()
+    combined_colors = all_rgb_colors.copy()
+
+    if background_alpha > 0:
+        # Make RGB background transparent by reducing intensity
+        combined_colors = combined_colors * background_alpha
+        console.print(f"[cyan]Applied {background_alpha:.1f} transparency to RGB background")
+
+    # Apply semantic heatmap to points above threshold
+    if above_threshold_mask.any():
+        # Get similarity scores for points above threshold
+        above_thresh_similarities = similarities[above_threshold_mask]
+        above_thresh_points = all_points[above_threshold_mask]
+
+        # Create heatmap colors for points above threshold
+        sim_min, sim_max = above_thresh_similarities.min(), above_thresh_similarities.max()
+        if sim_max - sim_min < 1e-8:
+            # All similarities are the same
+            sim_norm = np.ones_like(above_thresh_similarities) * 0.5
+        else:
+            sim_norm = (above_thresh_similarities - sim_min) / (sim_max - sim_min)
+
+        # Apply colormap for heatmap
+        import matplotlib.pyplot as plt
+        cmap = plt.get_cmap("turbo")
+        heatmap_colors = cmap(sim_norm)[:, :3]  # Remove alpha channel
+
+        # Replace colors for points above threshold with heatmap colors
+        combined_colors[above_threshold_mask] = heatmap_colors
+
+        console.print(f"[green]Applied semantic heatmap to {above_thresh_similarities.shape[0]:,} points above threshold")
+    else:
+        console.print("[yellow]No points above threshold - showing only RGB background")
 
     # Apply additional filters if requested (bbox and semantic filters)
-    points, colors = apply_filters(
-        data, points, colors, bbox_filter_min, bbox_filter_max,
+    filtered_points, filtered_colors = apply_filters(
+        data, combined_points, combined_colors, bbox_filter_min, bbox_filter_max,
         semantic_filter_query, semantic_filter_mode, semantic_threshold,
         semantic_softmax_temp, semantic_negatives
     )
 
-    # Create final filtered pointcloud
-    filtered_pcd = o3d.geometry.PointCloud()
-    filtered_pcd.points = o3d.utility.Vector3dVector(points)
-    filtered_pcd.colors = o3d.utility.Vector3dVector(colors)
+    # Create final combined pointcloud
+    combined_pcd = o3d.geometry.PointCloud()
+    combined_pcd.points = o3d.utility.Vector3dVector(filtered_points)
+    combined_pcd.colors = o3d.utility.Vector3dVector(filtered_colors)
 
-    # Start with filtered pointcloud
-    all_geometries = [filtered_pcd]
+    console.print(f"[green]Created combined pointcloud with {len(filtered_points):,} points")
+    console.print(f"[cyan]Background alpha: {background_alpha:.1f} (0.0=invisible, 1.0=full RGB)")
+
+    # Start with combined pointcloud
+    all_geometries = [combined_pcd]
 
     # Add reference geometries if requested
     if show_guides:
@@ -647,16 +684,25 @@ def visualize_semantic(
             guide_msg += "; Orange=filter bounds"
         console.print(guide_msg)
 
-    # Save if requested (save the original similarity result, not filtered)
+    # Save if requested (save the original similarity result, not the combined one)
     if save_result:
+        # Create and save the pure similarity pointcloud (without RGB background)
+        sim_pcd = semantic_utils.create_similarity_pointcloud(
+            data.points, similarities, threshold=threshold
+        )
         output_path = data.data_dir / f"semantic_query_{query.replace(' ', '_')}.ply"
-        o3d.io.write_point_cloud(str(output_path), sim_pcd)  # Save original, not filtered
-        console.print(f"[green]Saved similarity pointcloud: {output_path}")
+        o3d.io.write_point_cloud(str(output_path), sim_pcd)
+        console.print(f"[green]Saved pure similarity pointcloud: {output_path}")
+
+        # Also save the combined version with RGB background
+        combined_output_path = data.data_dir / f"semantic_query_{query.replace(' ', '_')}_with_background.ply"
+        o3d.io.write_point_cloud(str(combined_output_path), combined_pcd)
+        console.print(f"[green]Saved combined pointcloud with RGB background: {combined_output_path}")
 
     # Simple visualization
     o3d.visualization.draw_geometries(
         all_geometries,
-        window_name=f"F3RM Semantic Similarity: '{query}'",
+        window_name=f"F3RM Semantic Similarity: '{query}' (α={background_alpha:.1f})",
         width=1200,
         height=800,
         left=50,
@@ -692,6 +738,10 @@ def main():
                         help="Filter: softmax temperature for semantic filtering (default: 1.0)")
     parser.add_argument("--semantic-negatives", nargs="*", default=["object"],
                         help="Filter: negative queries for semantic filtering (default: ['object'])")
+
+    # Semantic mode background arguments
+    parser.add_argument("--background-alpha", type=float, default=0.3,
+                        help="Semantic mode: transparency of RGB background (0.0=invisible, 1.0=full RGB, default: 0.3)")
 
     args = parser.parse_args()
 
@@ -774,7 +824,8 @@ def main():
                 args.semantic_filter_mode,
                 args.semantic_threshold,
                 args.semantic_softmax_temp,
-                args.semantic_negatives
+                args.semantic_negatives,
+                args.background_alpha
             )
 
     except Exception as e:
