@@ -48,10 +48,14 @@ console = Console()
 class InteractiveAlignmentTool:
     """Interactive tool for aligning pointclouds with coordinate axes."""
 
-    def __init__(self, data: FeaturePointcloudData):
+    def __init__(self, data: FeaturePointcloudData, rotation_step: float = 10.0, translation_step: float = 0.1):
         self.data = data
         self.transform = np.eye(4)  # Current transformation matrix
         self.vis = None
+
+        # Step sizes for transformations
+        self.rotation_step = rotation_step  # degrees
+        self.translation_step = translation_step  # units
 
         # Store original geometries
         self.original_pcd = None
@@ -103,10 +107,6 @@ class InteractiveAlignmentTool:
         # Restore camera parameters to maintain view
         view_control.convert_from_pinhole_camera_parameters(camera_params)
 
-        # Update the visualization
-        self.vis.poll_events()
-        self.vis.update_renderer()
-
     def key_callback(self, vis, key, action):
         """Handle key press events."""
         if action == 1:  # Key press
@@ -132,8 +132,14 @@ class InteractiveAlignmentTool:
         self.update_transformed_pointcloud()
         console.print("[green]Transform reset to identity")
 
-    def apply_rotation(self, axis: str, angle_deg: float):
-        """Apply rotation around specified axis."""
+    def apply_rotation(self, axis: str, direction: int = 1):
+        """Apply rotation around specified axis.
+
+        Args:
+            axis: 'x', 'y', or 'z'
+            direction: 1 for positive rotation, -1 for negative
+        """
+        angle_deg = self.rotation_step * direction
         angle_rad = np.radians(angle_deg)
 
         if axis == 'x':
@@ -165,8 +171,18 @@ class InteractiveAlignmentTool:
         self.transform = transform @ self.transform
         self.update_transformed_pointcloud()
 
-    def apply_translation(self, dx: float, dy: float, dz: float):
-        """Apply translation."""
+    def apply_translation(self, dx_direction: int, dy_direction: int, dz_direction: int):
+        """Apply translation.
+
+        Args:
+            dx_direction: direction multiplier for X (-1, 0, or 1)
+            dy_direction: direction multiplier for Y (-1, 0, or 1) 
+            dz_direction: direction multiplier for Z (-1, 0, or 1)
+        """
+        dx = self.translation_step * dx_direction
+        dy = self.translation_step * dy_direction
+        dz = self.translation_step * dz_direction
+
         translation = np.eye(4)
         translation[:3, 3] = [dx, dy, dz]
 
@@ -212,24 +228,24 @@ class InteractiveAlignmentTool:
 
         # Arrow key rotation controls (Open3D key codes)
         # Up Arrow = 265, Down Arrow = 264, Left Arrow = 263, Right Arrow = 262
-        self.vis.register_key_callback(265, lambda vis: self.apply_rotation('x', 10))    # Up Arrow: +X rotation
-        self.vis.register_key_callback(264, lambda vis: self.apply_rotation('x', -10))   # Down Arrow: -X rotation
-        self.vis.register_key_callback(263, lambda vis: self.apply_rotation('y', 10))    # Left Arrow: +Y rotation
-        self.vis.register_key_callback(262, lambda vis: self.apply_rotation('y', -10))   # Right Arrow: -Y rotation
+        self.vis.register_key_callback(265, lambda vis: self.apply_rotation('x', 1))    # Up Arrow: +X rotation
+        self.vis.register_key_callback(264, lambda vis: self.apply_rotation('x', -1))   # Down Arrow: -X rotation
+        self.vis.register_key_callback(263, lambda vis: self.apply_rotation('y', 1))    # Left Arrow: +Y rotation
+        self.vis.register_key_callback(262, lambda vis: self.apply_rotation('y', -1))   # Right Arrow: -Y rotation
 
         # Z/X keys for Z rotation (much more convenient than Page Up/Down)
-        self.vis.register_key_callback(ord('Z'), lambda vis: self.apply_rotation('z', 10))    # Z: +Z rotation
-        self.vis.register_key_callback(ord('X'), lambda vis: self.apply_rotation('z', -10))   # X: -Z rotation
+        self.vis.register_key_callback(ord('Z'), lambda vis: self.apply_rotation('z', 1))    # Z: +Z rotation
+        self.vis.register_key_callback(ord('X'), lambda vis: self.apply_rotation('z', -1))   # X: -Z rotation
 
         # IJKL controls for translation (like vim navigation)
-        self.vis.register_key_callback(ord('I'), lambda vis: self.apply_translation(0, 0.1, 0))   # I: +Y (forward)
-        self.vis.register_key_callback(ord('K'), lambda vis: self.apply_translation(0, -0.1, 0))  # K: -Y (back)
-        self.vis.register_key_callback(ord('J'), lambda vis: self.apply_translation(-0.1, 0, 0))  # J: -X (left)
-        self.vis.register_key_callback(ord('L'), lambda vis: self.apply_translation(0.1, 0, 0))   # L: +X (right)
+        self.vis.register_key_callback(ord('I'), lambda vis: self.apply_translation(0, 1, 0))   # I: +Y (forward)
+        self.vis.register_key_callback(ord('K'), lambda vis: self.apply_translation(0, -1, 0))  # K: -Y (back)
+        self.vis.register_key_callback(ord('J'), lambda vis: self.apply_translation(-1, 0, 0))  # J: -X (left)
+        self.vis.register_key_callback(ord('L'), lambda vis: self.apply_translation(1, 0, 0))   # L: +X (right)
 
         # U/O for up/down translation
-        self.vis.register_key_callback(ord('U'), lambda vis: self.apply_translation(0, 0, 0.1))   # U: +Z (up)
-        self.vis.register_key_callback(ord('O'), lambda vis: self.apply_translation(0, 0, -0.1))  # O: -Z (down)
+        self.vis.register_key_callback(ord('U'), lambda vis: self.apply_translation(0, 0, 1))   # U: +Z (up)
+        self.vis.register_key_callback(ord('O'), lambda vis: self.apply_translation(0, 0, -1))  # O: -Z (down)
 
         # Add initial geometries
         self.update_transformed_pointcloud()
@@ -244,7 +260,8 @@ class InteractiveAlignmentTool:
         console.print("  R: Reset transform")
         console.print("  S: Save and exit")
         console.print("  Q: Quit without saving")
-        console.print("\n[dim]Note: Use small incremental adjustments for precise alignment")
+        console.print(f"\n[dim]Step sizes: Rotation={self.rotation_step}°, Translation={self.translation_step} units")
+        console.print("[dim]Note: Use small incremental adjustments for precise alignment")
 
         # Run visualization
         self.vis.run()
@@ -325,15 +342,18 @@ class InteractiveAlignmentTool:
         console.print("[dim]Note: Feature vectors unchanged (view-invariant)")
 
 
-def align_pointcloud(data_dir: Path) -> None:
+def align_pointcloud(data_dir: Path, rotation_step: float = 10.0, translation_step: float = 0.1) -> None:
     """
     Main function to align pointcloud data.
 
     Args:
         data_dir: Directory containing exported pointcloud data
+        rotation_step: Rotation step size in degrees (default: 10.0)
+        translation_step: Translation step size in units (default: 0.1)
     """
     console.print(f"[bold blue]F3RM Pointcloud Alignment Tool")
     console.print(f"[bold blue]Data directory: {data_dir}")
+    console.print(f"[bold blue]Rotation step: {rotation_step}° | Translation step: {translation_step}")
 
     # Load pointcloud data
     try:
@@ -352,7 +372,7 @@ def align_pointcloud(data_dir: Path) -> None:
             return
 
     # Start alignment tool
-    alignment_tool = InteractiveAlignmentTool(data)
+    alignment_tool = InteractiveAlignmentTool(data, rotation_step, translation_step)
     alignment_tool.start_alignment()
 
 
@@ -360,6 +380,10 @@ def main():
     parser = argparse.ArgumentParser(description="Align F3RM feature pointclouds with coordinate axes")
     parser.add_argument("--data-dir", type=Path, required=True,
                         help="Directory containing exported pointcloud data")
+    parser.add_argument("--rotation-step", type=float, default=10.0,
+                        help="Rotation step size in degrees (default: 10.0)")
+    parser.add_argument("--translation-step", type=float, default=0.1,
+                        help="Translation step size in units (default: 0.1)")
 
     args = parser.parse_args()
 
@@ -385,7 +409,7 @@ def main():
         return
 
     try:
-        align_pointcloud(args.data_dir)
+        align_pointcloud(args.data_dir, args.rotation_step, args.translation_step)
     except Exception as e:
         console.print(f"[bold red]Error: {e}")
         raise

@@ -34,6 +34,12 @@ Interactively align your pointcloud with the coordinate system for better visual
 
 ```bash
 python align_pointcloud.py --data-dir exports/sitting_pcd_features/
+
+# With custom step sizes for finer control
+python align_pointcloud.py \
+    --data-dir exports/sitting_pcd_features/ \
+    --rotation-step 5.0 \
+    --translation-step 0.05
 ```
 
 **Interactive Controls:**
@@ -47,10 +53,15 @@ python align_pointcloud.py --data-dir exports/sitting_pcd_features/
 - **S**: Save transform and exit
 - **Q**: Quit without saving
 
+**Command Line Options:**
+- `--rotation-step`: Rotation step size in degrees (default: 10.0)
+- `--translation-step`: Translation step size in units (default: 0.1)
+
 **Features:**
 - Camera view is preserved during transforms for real-time visual feedback
 - Keyboard-only controls avoid conflicts with Open3D's built-in mouse controls
 - See coordinate axes move in real-time as you apply transformations
+- Configurable step sizes for precise or coarse adjustments
 
 **Goal**: Align so the floor is on the XY plane and objects are properly oriented with the coordinate axes.
 
