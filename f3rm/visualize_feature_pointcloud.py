@@ -2,13 +2,15 @@
 """
 F3RM Feature Pointcloud Visualizer
 
-This script provides interactive visualization of F3RM pointclouds with:
-- RGB/feature_PCA switching capability  
+This script provides visualization of F3RM pointclouds with:
+- RGB/feature_PCA modes via command line flags
 - Open-vocabulary semantic similarity queries
-- Interactive filtering and selection
+- Simple and reliable Open3D visualization
 
 Usage:
-    python visualize_feature_pointcloud.py --data-dir path/to/exported/pointcloud/
+    python visualize_feature_pointcloud.py --data-dir path/to/exported/pointcloud/ --mode rgb
+    python visualize_feature_pointcloud.py --data-dir path/to/exported/pointcloud/ --mode pca
+    python visualize_feature_pointcloud.py --data-dir path/to/exported/pointcloud/ --mode semantic --query "chair"
 """
 
 import argparse
@@ -227,315 +229,116 @@ class SemanticSimilarityUtils:
 
         return pcd
 
-    def find_similar_regions(
-        self,
-        features: np.ndarray,
-        points: np.ndarray,
-        text_query: str,
-        negative_queries: Optional[List[str]] = None,
-        threshold: float = 0.5,
-        min_cluster_size: int = 10
-    ) -> Tuple[np.ndarray, List[np.ndarray]]:
-        """
-        Find regions in the pointcloud that match a text query.
 
-        Args:
-            features: Feature vectors (N, feature_dim)
-            points: Point coordinates (N, 3)
-            text_query: Positive text query
-            negative_queries: Optional negative queries for contrast
-            threshold: Similarity threshold
-            min_cluster_size: Minimum points per cluster
+def visualize_rgb(data: FeaturePointcloudData):
+    """Visualize RGB pointcloud."""
+    console.print("[bold green]Visualizing RGB pointcloud...")
+    console.print(data.get_info())
 
-        Returns:
-            Tuple of (similarities, list of cluster point indices)
-        """
-        # Prepare text queries
-        queries = [text_query]
-        if negative_queries:
-            queries.extend(negative_queries)
+    pcd = data.rgb_pointcloud
+    console.print(f"[green]Loaded pointcloud with {len(pcd.points)} points")
 
-        # Compute similarities
-        similarities = self.compute_text_similarities(
-            features, queries,
-            has_negatives=len(queries) > 1
-        )
-
-        # Use adaptive threshold if the provided threshold is too high
-        sim_mean = similarities.mean()
-        sim_std = similarities.std()
-        adaptive_threshold = min(sim_mean + 0.5 * sim_std, similarities.max() * 0.8)
-        adaptive_threshold = max(adaptive_threshold, sim_mean)
-
-        if (similarities > threshold).sum() == 0:
-            console.print(f"[yellow]Threshold {threshold:.3f} too high, using adaptive threshold {adaptive_threshold:.3f}")
-            threshold = adaptive_threshold
-
-        # Filter by threshold
-        high_sim_mask = similarities > threshold
-        high_sim_points = points[high_sim_mask]
-
-        if len(high_sim_points) < min_cluster_size:
-            console.print(f"[yellow]Warning: Only {len(high_sim_points)} points above threshold {threshold:.3f}")
-            return similarities, []
-
-        # Cluster similar points
-        from sklearn.cluster import DBSCAN
-
-        clustering = DBSCAN(eps=0.05, min_samples=min_cluster_size)
-        cluster_labels = clustering.fit_predict(high_sim_points)
-
-        # Extract clusters
-        clusters = []
-        high_sim_indices = np.where(high_sim_mask)[0]
-
-        for cluster_id in range(cluster_labels.max() + 1):
-            cluster_mask = cluster_labels == cluster_id
-            cluster_indices = high_sim_indices[cluster_mask]
-            if len(cluster_indices) >= min_cluster_size:
-                clusters.append(cluster_indices)
-
-        console.print(f"[green]Found {len(clusters)} clusters matching '{text_query}'")
-
-        return similarities, clusters
+    # Simple visualization
+    o3d.visualization.draw_geometries(
+        [pcd],
+        window_name="F3RM RGB Pointcloud",
+        width=1200,
+        height=800,
+        left=50,
+        top=50
+    )
 
 
-class InteractivePointcloudVisualizer:
-    """Interactive pointcloud visualizer with RGB/PCA switching."""
+def visualize_pca(data: FeaturePointcloudData):
+    """Visualize PCA feature pointcloud."""
+    console.print("[bold green]Visualizing PCA feature pointcloud...")
+    console.print(data.get_info())
 
-    def __init__(self, data: FeaturePointcloudData):
-        self.data = data
-        self.semantic_utils = SemanticSimilarityUtils()
-        self.vis = None
-        self.current_mode = "rgb"
-        self.current_query = None
-        self.current_similarities = None
+    pcd = data.pca_pointcloud
+    console.print(f"[green]Loaded pointcloud with {len(pcd.points)} points")
 
-    def start_visualization(self):
-        """Start the interactive visualization."""
-        console.print(self.data.get_info())
-        console.print("[bold green]Starting interactive pointcloud visualizer...")
-        console.print("[bold blue]Controls:")
-        console.print("  'r' - Switch to RGB mode")
-        console.print("  'p' - Switch to PCA mode")
-        console.print("  's' - Perform semantic query")
-        console.print("  'q' - Quit")
-
-        # Initialize Open3D visualizer
-        self.vis = o3d.visualization.VisualizerWithKeyCallback()
-        self.vis.create_window(window_name="F3RM Feature Pointcloud Visualizer", width=1200, height=800)
-
-        # Register key callbacks
-        self.vis.register_key_callback(ord('R'), self._switch_to_rgb)
-        self.vis.register_key_callback(ord('P'), self._switch_to_pca)
-        self.vis.register_key_callback(ord('S'), self._semantic_query)
-        self.vis.register_key_callback(ord('Q'), self._quit)
-
-        # Start with RGB pointcloud
-        self._switch_to_rgb(self.vis)
-
-        # Run visualization loop
-        self.vis.run()
-        self.vis.destroy_window()
-
-    def _switch_to_rgb(self, vis):
-        """Switch to RGB visualization mode."""
-        if self.current_mode != "rgb":
-            vis.clear_geometries()
-            vis.add_geometry(self.data.rgb_pointcloud)
-            self.current_mode = "rgb"
-            console.print("[green]Switched to RGB mode")
-        return False
-
-    def _switch_to_pca(self, vis):
-        """Switch to PCA visualization mode."""
-        if self.current_mode != "pca":
-            vis.clear_geometries()
-            vis.add_geometry(self.data.pca_pointcloud)
-            self.current_mode = "pca"
-            console.print("[green]Switched to PCA mode")
-        return False
-
-    def _semantic_query(self, vis):
-        """Perform semantic similarity query."""
-        console.print("\n[bold blue]Semantic Query Mode")
-
-        # Get query from user
-        positive_query = input("Enter positive query (e.g., 'chair'): ").strip()
-        if not positive_query:
-            console.print("[yellow]No query entered, returning to visualization")
-            return False
-
-        negative_input = input("Enter negative queries (comma-separated, optional): ").strip()
-        negative_queries = [q.strip() for q in negative_input.split(",")] if negative_input else ["object"]
-
-        try:
-            # Compute similarities first to get statistics
-            console.print(f"[yellow]Computing similarities for '{positive_query}'...")
-            queries = [positive_query] + negative_queries
-            similarities = self.semantic_utils.compute_text_similarities(
-                self.data.features, queries, has_negatives=len(negative_queries) > 0
-            )
-
-            # Compute adaptive threshold
-            sim_mean = similarities.mean()
-            sim_std = similarities.std()
-            adaptive_threshold = min(sim_mean + 0.5 * sim_std, similarities.max() * 0.8)
-            adaptive_threshold = max(adaptive_threshold, sim_mean)
-
-            console.print(f"[cyan]Similarity statistics:")
-            console.print(f"  Range: {similarities.min():.3f} - {similarities.max():.3f}")
-            console.print(f"  Mean ± std: {sim_mean:.3f} ± {sim_std:.3f}")
-            console.print(f"  Suggested threshold: {adaptive_threshold:.3f}")
-
-            threshold_input = input(f"Enter similarity threshold (default {adaptive_threshold:.3f}): ").strip()
-            if threshold_input:
-                try:
-                    threshold = float(threshold_input)
-                except ValueError:
-                    console.print(f"[yellow]Invalid threshold, using suggested {adaptive_threshold:.3f}")
-                    threshold = adaptive_threshold
-            else:
-                threshold = adaptive_threshold
-
-            # Create similarity pointcloud
-            sim_pcd = self.semantic_utils.create_similarity_pointcloud(
-                self.data.points, similarities, threshold=threshold
-            )
-
-            # Update visualization
-            vis.clear_geometries()
-            vis.add_geometry(sim_pcd)
-            self.current_mode = "semantic"
-            self.current_query = positive_query
-            self.current_similarities = similarities
-
-            # Print statistics
-            above_thresh = (similarities > threshold).sum()
-            console.print(f"[green]✓ Query: '{positive_query}'")
-            console.print(f"[green]  Points above threshold {threshold:.3f}: {above_thresh:,} / {len(similarities):,}")
-            console.print(f"[green]  Similarity range: {similarities.min():.3f} - {similarities.max():.3f}")
-
-            # Find clusters
-            _, clusters = self.semantic_utils.find_similar_regions(
-                self.data.features, self.data.points, positive_query,
-                negative_queries, threshold
-            )
-
-            if clusters:
-                console.print(f"[green]  Found {len(clusters)} distinct regions")
-                for i, cluster in enumerate(clusters):
-                    center = self.data.points[cluster].mean(axis=0)
-                    console.print(f"    Cluster {i+1}: {len(cluster)} points at {center}")
-
-        except Exception as e:
-            console.print(f"[red]Error during semantic query: {e}")
-
-        return False
-
-    def _quit(self, vis):
-        """Quit the visualizer."""
-        console.print("[yellow]Quitting visualizer...")
-        vis.close()
-        return True
+    # Simple visualization
+    o3d.visualization.draw_geometries(
+        [pcd],
+        window_name="F3RM PCA Feature Pointcloud",
+        width=1200,
+        height=800,
+        left=50,
+        top=50
+    )
 
 
-def demonstrate_semantic_similarity(data: FeaturePointcloudData, queries: List[str]):
-    """Demonstrate semantic similarity capabilities."""
-    console.print("[bold blue]Demonstrating semantic similarity capabilities...")
+def visualize_semantic(
+    data: FeaturePointcloudData,
+    query: str,
+    negative_queries: Optional[List[str]] = None,
+    threshold: Optional[float] = None,
+    save_result: bool = False
+):
+    """Visualize semantic similarity pointcloud."""
+    console.print(f"[bold green]Visualizing semantic similarity for query: '{query}'")
+    console.print(data.get_info())
 
-    semantic_utils = SemanticSimilarityUtils()
-
-    for query in queries:
-        console.print(f"\n[bold yellow]Query: '{query}'")
-
-        # Default negative queries
+    if negative_queries is None:
         negative_queries = ["object", "background", "floor"]
 
-        # Compute similarities
-        similarities = semantic_utils.compute_text_similarities(
-            data.features, [query] + negative_queries, has_negatives=True
-        )
+    # Initialize semantic utils
+    semantic_utils = SemanticSimilarityUtils()
 
-        # Statistics
-        sim_min, sim_max = similarities.min(), similarities.max()
+    # Compute similarities
+    console.print(f"[yellow]Computing similarities for '{query}'...")
+    queries = [query] + negative_queries
+    similarities = semantic_utils.compute_text_similarities(
+        data.features, queries, has_negatives=len(negative_queries) > 0
+    )
+
+    # Compute adaptive threshold if not provided
+    if threshold is None:
         sim_mean = similarities.mean()
         sim_std = similarities.std()
+        threshold = min(sim_mean + 0.5 * sim_std, similarities.max() * 0.8)
+        threshold = max(threshold, sim_mean)
 
-        # Use adaptive threshold based on statistics
-        # Use mean + 0.5 * std, but cap it to be reasonable
-        adaptive_threshold = min(sim_mean + 0.5 * sim_std, sim_max * 0.8)
-        threshold = max(adaptive_threshold, sim_mean)  # At least above mean
+    # Print statistics
+    above_thresh = (similarities > threshold).sum()
+    console.print(f"[cyan]Similarity statistics:")
+    console.print(f"  Range: {similarities.min():.3f} - {similarities.max():.3f}")
+    console.print(f"  Mean ± std: {similarities.mean():.3f} ± {similarities.std():.3f}")
+    console.print(f"  Using threshold: {threshold:.3f}")
+    console.print(f"  Points above threshold: {above_thresh:,} / {len(similarities):,}")
 
-        above_thresh = (similarities > threshold).sum()
+    # Create similarity pointcloud
+    sim_pcd = semantic_utils.create_similarity_pointcloud(
+        data.points, similarities, threshold=threshold
+    )
 
-        console.print(f"  Similarity range: {sim_min:.3f} - {sim_max:.3f}")
-        console.print(f"  Mean ± std: {sim_mean:.3f} ± {sim_std:.3f}")
-        console.print(f"  Using adaptive threshold: {threshold:.3f}")
-        console.print(f"  Points above threshold: {above_thresh:,} / {len(similarities):,}")
+    console.print(f"[green]Created similarity pointcloud with {len(sim_pcd.points)} points")
 
-        # Find clusters
-        _, clusters = semantic_utils.find_similar_regions(
-            data.features, data.points, query, negative_queries, threshold
-        )
-
-        if clusters:
-            console.print(f"  Found {len(clusters)} distinct regions:")
-            for i, cluster in enumerate(clusters):
-                center = data.points[cluster].mean(axis=0)
-                console.print(f"    Region {i+1}: {len(cluster)} points at [{center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f}]")
-
-        # Save similarity pointcloud
-        sim_pcd = semantic_utils.create_similarity_pointcloud(
-            data.points, similarities, threshold=threshold
-        )
-
+    # Save if requested
+    if save_result:
         output_path = data.data_dir / f"semantic_query_{query.replace(' ', '_')}.ply"
         o3d.io.write_point_cloud(str(output_path), sim_pcd)
-        console.print(f"  Saved similarity pointcloud: {output_path}")
+        console.print(f"[green]Saved similarity pointcloud: {output_path}")
 
-
-def visualize_feature_pointcloud(
-    data_dir: Path,
-    interactive: bool = True,
-    demo_queries: Optional[List[str]] = None,
-) -> None:
-    """
-    Main function to visualize feature pointclouds.
-
-    Args:
-        data_dir: Directory containing exported pointcloud data
-        interactive: Whether to start interactive visualization
-        demo_queries: Optional list of queries to demonstrate
-    """
-    console.print(f"[bold blue]F3RM Feature Pointcloud Visualizer")
-    console.print(f"[bold blue]Data directory: {data_dir}")
-
-    # Load pointcloud data
-    try:
-        data = FeaturePointcloudData(data_dir)
-        console.print("[green]✓ Pointcloud data loaded successfully")
-    except Exception as e:
-        console.print(f"[red]Error loading pointcloud data: {e}")
-        return
-
-    # Demonstrate semantic similarity if queries provided
-    if demo_queries:
-        demonstrate_semantic_similarity(data, demo_queries)
-
-    # Start interactive visualization
-    if interactive:
-        visualizer = InteractivePointcloudVisualizer(data)
-        visualizer.start_visualization()
-    else:
-        console.print(data.get_info())
+    # Simple visualization
+    o3d.visualization.draw_geometries(
+        [sim_pcd],
+        window_name=f"F3RM Semantic Similarity: '{query}'",
+        width=1200,
+        height=800,
+        left=50,
+        top=50
+    )
 
 
 def main():
     parser = argparse.ArgumentParser(description="Visualize F3RM feature pointclouds")
     parser.add_argument("--data-dir", type=Path, required=True, help="Directory containing exported pointcloud data")
-    parser.add_argument("--no-interactive", action="store_true", help="Skip interactive visualization")
-    parser.add_argument("--demo-queries", nargs="*", help="Demonstration queries for semantic similarity")
+    parser.add_argument("--mode", choices=["rgb", "pca", "semantic"], default="rgb", help="Visualization mode")
+    parser.add_argument("--query", type=str, help="Semantic query (required for semantic mode)")
+    parser.add_argument("--negative-queries", nargs="*", help="Negative queries for semantic mode")
+    parser.add_argument("--threshold", type=float, help="Similarity threshold for semantic mode (auto if not specified)")
+    parser.add_argument("--save", action="store_true", help="Save semantic similarity results")
 
     args = parser.parse_args()
 
@@ -544,15 +347,33 @@ def main():
         console.print(f"[bold red]Data directory not found: {args.data_dir}")
         return
 
-    # Default demo queries if none provided
-    demo_queries = args.demo_queries or ["chair", "table", "lamp", "book"]
+    if args.mode == "semantic" and not args.query:
+        console.print("[bold red]--query is required for semantic mode")
+        return
+
+    console.print(f"[bold blue]F3RM Feature Pointcloud Visualizer")
+    console.print(f"[bold blue]Data directory: {args.data_dir}")
+    console.print(f"[bold blue]Mode: {args.mode}")
 
     try:
-        visualize_feature_pointcloud(
-            data_dir=args.data_dir,
-            interactive=not args.no_interactive,
-            demo_queries=demo_queries if not args.no_interactive else None,
-        )
+        # Load pointcloud data
+        data = FeaturePointcloudData(args.data_dir)
+        console.print("[green]✓ Pointcloud data loaded successfully")
+
+        # Visualize based on mode
+        if args.mode == "rgb":
+            visualize_rgb(data)
+        elif args.mode == "pca":
+            visualize_pca(data)
+        elif args.mode == "semantic":
+            visualize_semantic(
+                data,
+                args.query,
+                args.negative_queries,
+                args.threshold,
+                args.save
+            )
+
     except Exception as e:
         console.print(f"[bold red]Error: {e}")
         raise
