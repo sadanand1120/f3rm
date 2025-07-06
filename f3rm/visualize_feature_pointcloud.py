@@ -188,14 +188,32 @@ class SemanticSimilarityUtils:
         Returns:
             Colored pointcloud
         """
+        original_points = points.copy()
+        original_similarities = similarities.copy()
+
         # Filter by threshold if provided
         if threshold is not None:
             mask = similarities > threshold
-            points = points[mask]
-            similarities = similarities[mask]
+            if mask.sum() == 0:
+                console.print(f"[yellow]Warning: No points above threshold {threshold}, showing all points")
+                # Don't filter, show all points
+                pass
+            else:
+                points = points[mask]
+                similarities = similarities[mask]
+
+        # Handle empty arrays
+        if len(similarities) == 0:
+            console.print("[yellow]Warning: No similarities to visualize")
+            return o3d.geometry.PointCloud()
 
         # Normalize similarities to [0, 1]
-        sim_norm = (similarities - similarities.min()) / (similarities.max() - similarities.min() + 1e-8)
+        sim_min, sim_max = similarities.min(), similarities.max()
+        if sim_max - sim_min < 1e-8:
+            # All similarities are the same
+            sim_norm = np.ones_like(similarities) * 0.5
+        else:
+            sim_norm = (similarities - sim_min) / (sim_max - sim_min)
 
         # Apply colormap
         import matplotlib.pyplot as plt
@@ -243,12 +261,22 @@ class SemanticSimilarityUtils:
             has_negatives=len(queries) > 1
         )
 
+        # Use adaptive threshold if the provided threshold is too high
+        sim_mean = similarities.mean()
+        sim_std = similarities.std()
+        adaptive_threshold = min(sim_mean + 0.5 * sim_std, similarities.max() * 0.8)
+        adaptive_threshold = max(adaptive_threshold, sim_mean)
+
+        if (similarities > threshold).sum() == 0:
+            console.print(f"[yellow]Threshold {threshold:.3f} too high, using adaptive threshold {adaptive_threshold:.3f}")
+            threshold = adaptive_threshold
+
         # Filter by threshold
         high_sim_mask = similarities > threshold
         high_sim_points = points[high_sim_mask]
 
         if len(high_sim_points) < min_cluster_size:
-            console.print(f"[yellow]Warning: Only {len(high_sim_points)} points above threshold {threshold}")
+            console.print(f"[yellow]Warning: Only {len(high_sim_points)} points above threshold {threshold:.3f}")
             return similarities, []
 
         # Cluster similar points
@@ -341,21 +369,34 @@ class InteractivePointcloudVisualizer:
         negative_input = input("Enter negative queries (comma-separated, optional): ").strip()
         negative_queries = [q.strip() for q in negative_input.split(",")] if negative_input else ["object"]
 
-        threshold = 0.5
-        threshold_input = input(f"Enter similarity threshold (default {threshold}): ").strip()
-        if threshold_input:
-            try:
-                threshold = float(threshold_input)
-            except ValueError:
-                console.print(f"[yellow]Invalid threshold, using default {threshold}")
-
         try:
-            # Compute similarities
+            # Compute similarities first to get statistics
             console.print(f"[yellow]Computing similarities for '{positive_query}'...")
             queries = [positive_query] + negative_queries
             similarities = self.semantic_utils.compute_text_similarities(
                 self.data.features, queries, has_negatives=len(negative_queries) > 0
             )
+
+            # Compute adaptive threshold
+            sim_mean = similarities.mean()
+            sim_std = similarities.std()
+            adaptive_threshold = min(sim_mean + 0.5 * sim_std, similarities.max() * 0.8)
+            adaptive_threshold = max(adaptive_threshold, sim_mean)
+
+            console.print(f"[cyan]Similarity statistics:")
+            console.print(f"  Range: {similarities.min():.3f} - {similarities.max():.3f}")
+            console.print(f"  Mean ± std: {sim_mean:.3f} ± {sim_std:.3f}")
+            console.print(f"  Suggested threshold: {adaptive_threshold:.3f}")
+
+            threshold_input = input(f"Enter similarity threshold (default {adaptive_threshold:.3f}): ").strip()
+            if threshold_input:
+                try:
+                    threshold = float(threshold_input)
+                except ValueError:
+                    console.print(f"[yellow]Invalid threshold, using suggested {adaptive_threshold:.3f}")
+                    threshold = adaptive_threshold
+            else:
+                threshold = adaptive_threshold
 
             # Create similarity pointcloud
             sim_pcd = self.semantic_utils.create_similarity_pointcloud(
@@ -372,7 +413,7 @@ class InteractivePointcloudVisualizer:
             # Print statistics
             above_thresh = (similarities > threshold).sum()
             console.print(f"[green]✓ Query: '{positive_query}'")
-            console.print(f"[green]  Points above threshold {threshold}: {above_thresh:,} / {len(similarities):,}")
+            console.print(f"[green]  Points above threshold {threshold:.3f}: {above_thresh:,} / {len(similarities):,}")
             console.print(f"[green]  Similarity range: {similarities.min():.3f} - {similarities.max():.3f}")
 
             # Find clusters
@@ -417,11 +458,21 @@ def demonstrate_semantic_similarity(data: FeaturePointcloudData, queries: List[s
         )
 
         # Statistics
-        threshold = 0.5
+        sim_min, sim_max = similarities.min(), similarities.max()
+        sim_mean = similarities.mean()
+        sim_std = similarities.std()
+
+        # Use adaptive threshold based on statistics
+        # Use mean + 0.5 * std, but cap it to be reasonable
+        adaptive_threshold = min(sim_mean + 0.5 * sim_std, sim_max * 0.8)
+        threshold = max(adaptive_threshold, sim_mean)  # At least above mean
+
         above_thresh = (similarities > threshold).sum()
 
-        console.print(f"  Similarity range: {similarities.min():.3f} - {similarities.max():.3f}")
-        console.print(f"  Points above threshold {threshold}: {above_thresh:,} / {len(similarities):,}")
+        console.print(f"  Similarity range: {sim_min:.3f} - {sim_max:.3f}")
+        console.print(f"  Mean ± std: {sim_mean:.3f} ± {sim_std:.3f}")
+        console.print(f"  Using adaptive threshold: {threshold:.3f}")
+        console.print(f"  Points above threshold: {above_thresh:,} / {len(similarities):,}")
 
         # Find clusters
         _, clusters = semantic_utils.find_similar_regions(

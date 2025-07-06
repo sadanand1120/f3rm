@@ -10,7 +10,7 @@ cd /robodata/smodak/repos/f3rm/Hierarchical-Localization
 pip install -e .
 cd /robodata/smodak/repos/f3rm
 pip3 install torchtyping==0.1.5 && pip3 install typeguard==4.4.2
-pip3 install open3d==0.16.0 && pip3 install timm==0.6.7 && pip3 install open_clip_torch
+pip3 install open3d==0.16.0 && pip3 install timm==0.6.7 && pip3 install open_clip_torch spatialmath-python
 ns-install-cli
 conda deactivate && conda activate f3rm
 ns-train --help
