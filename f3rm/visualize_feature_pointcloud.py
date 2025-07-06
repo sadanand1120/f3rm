@@ -230,7 +230,94 @@ class SemanticSimilarityUtils:
         return pcd
 
 
-def visualize_rgb(data: FeaturePointcloudData):
+def create_coordinate_frame(size: float = 0.2) -> List[o3d.geometry.Geometry]:
+    """Create coordinate frame with X(red), Y(green), Z(blue) axes at origin."""
+    geometries = []
+
+    # Create coordinate frame
+    coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=size)
+    geometries.append(coord_frame)
+
+    return geometries
+
+
+def create_bounding_box_lines(bbox_min: np.ndarray, bbox_max: np.ndarray) -> List[o3d.geometry.Geometry]:
+    """Create wireframe bounding box visualization."""
+    geometries = []
+
+    # Create bounding box wireframe
+    bbox = o3d.geometry.AxisAlignedBoundingBox(bbox_min, bbox_max)
+    bbox_lines = o3d.geometry.LineSet.create_from_axis_aligned_bounding_box(bbox)
+    bbox_lines.paint_uniform_color([0.7, 0.7, 0.7])  # Gray color
+    geometries.append(bbox_lines)
+
+    return geometries
+
+
+def create_grid_lines(bbox_min: np.ndarray, bbox_max: np.ndarray, grid_size: float = 0.5) -> List[o3d.geometry.Geometry]:
+    """Create grid lines for spatial reference."""
+    geometries = []
+
+    # Create grid lines on XY plane at Z=0 (if Z=0 is within bounds)
+    if bbox_min[2] <= 0 <= bbox_max[2]:
+        points = []
+        lines = []
+
+        # Vertical lines (parallel to Y axis)
+        x_coords = np.arange(
+            np.ceil(bbox_min[0] / grid_size) * grid_size,
+            bbox_max[0] + grid_size / 2,
+            grid_size
+        )
+        for x in x_coords:
+            if bbox_min[0] <= x <= bbox_max[0]:
+                start_idx = len(points)
+                points.extend([[x, bbox_min[1], 0], [x, bbox_max[1], 0]])
+                lines.append([start_idx, start_idx + 1])
+
+        # Horizontal lines (parallel to X axis)
+        y_coords = np.arange(
+            np.ceil(bbox_min[1] / grid_size) * grid_size,
+            bbox_max[1] + grid_size / 2,
+            grid_size
+        )
+        for y in y_coords:
+            if bbox_min[1] <= y <= bbox_max[1]:
+                start_idx = len(points)
+                points.extend([[bbox_min[0], y, 0], [bbox_max[0], y, 0]])
+                lines.append([start_idx, start_idx + 1])
+
+        if points:
+            grid = o3d.geometry.LineSet()
+            grid.points = o3d.utility.Vector3dVector(points)
+            grid.lines = o3d.utility.Vector2iVector(lines)
+            grid.paint_uniform_color([0.9, 0.9, 0.9])  # Light gray
+            geometries.append(grid)
+
+    return geometries
+
+
+def create_reference_geometries(data: FeaturePointcloudData) -> List[o3d.geometry.Geometry]:
+    """Create all reference geometries (coordinate frame, bounding box, grid)."""
+    geometries = []
+
+    # Get bounding box from metadata
+    bbox_min = np.array(data.metadata['bbox_min'])
+    bbox_max = np.array(data.metadata['bbox_max'])
+
+    # Coordinate frame at origin
+    geometries.extend(create_coordinate_frame(size=0.1))
+
+    # Bounding box wireframe
+    geometries.extend(create_bounding_box_lines(bbox_min, bbox_max))
+
+    # Grid lines for spatial reference
+    geometries.extend(create_grid_lines(bbox_min, bbox_max, grid_size=0.2))
+
+    return geometries
+
+
+def visualize_rgb(data: FeaturePointcloudData, show_guides: bool = True):
     """Visualize RGB pointcloud."""
     console.print("[bold green]Visualizing RGB pointcloud...")
     console.print(data.get_info())
@@ -238,9 +325,18 @@ def visualize_rgb(data: FeaturePointcloudData):
     pcd = data.rgb_pointcloud
     console.print(f"[green]Loaded pointcloud with {len(pcd.points)} points")
 
+    # Start with pointcloud
+    all_geometries = [pcd]
+
+    # Add reference geometries if requested
+    if show_guides:
+        reference_geoms = create_reference_geometries(data)
+        all_geometries.extend(reference_geoms)
+        console.print("[dim]Reference guides: Red=X, Green=Y, Blue=Z axes; Gray=bounding box; Light gray=grid")
+
     # Simple visualization
     o3d.visualization.draw_geometries(
-        [pcd],
+        all_geometries,
         window_name="F3RM RGB Pointcloud",
         width=1200,
         height=800,
@@ -249,7 +345,7 @@ def visualize_rgb(data: FeaturePointcloudData):
     )
 
 
-def visualize_pca(data: FeaturePointcloudData):
+def visualize_pca(data: FeaturePointcloudData, show_guides: bool = True):
     """Visualize PCA feature pointcloud."""
     console.print("[bold green]Visualizing PCA feature pointcloud...")
     console.print(data.get_info())
@@ -257,9 +353,18 @@ def visualize_pca(data: FeaturePointcloudData):
     pcd = data.pca_pointcloud
     console.print(f"[green]Loaded pointcloud with {len(pcd.points)} points")
 
+    # Start with pointcloud
+    all_geometries = [pcd]
+
+    # Add reference geometries if requested
+    if show_guides:
+        reference_geoms = create_reference_geometries(data)
+        all_geometries.extend(reference_geoms)
+        console.print("[dim]Reference guides: Red=X, Green=Y, Blue=Z axes; Gray=bounding box; Light gray=grid")
+
     # Simple visualization
     o3d.visualization.draw_geometries(
-        [pcd],
+        all_geometries,
         window_name="F3RM PCA Feature Pointcloud",
         width=1200,
         height=800,
@@ -273,7 +378,8 @@ def visualize_semantic(
     query: str,
     negative_queries: Optional[List[str]] = None,
     threshold: Optional[float] = None,
-    save_result: bool = False
+    save_result: bool = False,
+    show_guides: bool = True
 ):
     """Visualize semantic similarity pointcloud."""
     console.print(f"[bold green]Visualizing semantic similarity for query: '{query}'")
@@ -314,6 +420,15 @@ def visualize_semantic(
 
     console.print(f"[green]Created similarity pointcloud with {len(sim_pcd.points)} points")
 
+    # Start with pointcloud
+    all_geometries = [sim_pcd]
+
+    # Add reference geometries if requested
+    if show_guides:
+        reference_geoms = create_reference_geometries(data)
+        all_geometries.extend(reference_geoms)
+        console.print("[dim]Reference guides: Red=X, Green=Y, Blue=Z axes; Gray=bounding box; Light gray=grid")
+
     # Save if requested
     if save_result:
         output_path = data.data_dir / f"semantic_query_{query.replace(' ', '_')}.ply"
@@ -322,7 +437,7 @@ def visualize_semantic(
 
     # Simple visualization
     o3d.visualization.draw_geometries(
-        [sim_pcd],
+        all_geometries,
         window_name=f"F3RM Semantic Similarity: '{query}'",
         width=1200,
         height=800,
@@ -339,6 +454,7 @@ def main():
     parser.add_argument("--negative-queries", nargs="*", help="Negative queries for semantic mode")
     parser.add_argument("--threshold", type=float, help="Similarity threshold for semantic mode (auto if not specified)")
     parser.add_argument("--save", action="store_true", help="Save semantic similarity results")
+    parser.add_argument("--no-guides", action="store_true", help="Hide coordinate frame and reference guides")
 
     args = parser.parse_args()
 
@@ -360,18 +476,21 @@ def main():
         data = FeaturePointcloudData(args.data_dir)
         console.print("[green]✓ Pointcloud data loaded successfully")
 
+        show_guides = not args.no_guides
+
         # Visualize based on mode
         if args.mode == "rgb":
-            visualize_rgb(data)
+            visualize_rgb(data, show_guides)
         elif args.mode == "pca":
-            visualize_pca(data)
+            visualize_pca(data, show_guides)
         elif args.mode == "semantic":
             visualize_semantic(
                 data,
                 args.query,
                 args.negative_queries,
                 args.threshold,
-                args.save
+                args.save,
+                show_guides
             )
 
     except Exception as e:
