@@ -323,7 +323,7 @@ def main():
     parser = argparse.ArgumentParser(description="Export F3RM feature pointclouds")
     parser.add_argument("--config", type=Path, required=True, help="Path to F3RM model config.yml")
     parser.add_argument("--output-dir", type=Path, required=True, help="Output directory")
-    parser.add_argument("--num-points", type=int, default=1000000, help="Number of points to sample")
+    parser.add_argument("--num-points", type=int, default=10000000, help="Number of points to sample")
     parser.add_argument("--no-compress", action="store_true", help="Don't compress features (use float32)")
 
     # Bounding box arguments with reasonable defaults for indoor scenes

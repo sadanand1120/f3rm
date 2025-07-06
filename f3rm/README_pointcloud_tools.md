@@ -6,15 +6,15 @@ This directory contains tools for exporting, visualizing, and analyzing F3RM fea
 
 The tools consist of three main components:
 
-1. **`export_feature_pointcloud.py`** - Export RGB, features, and feature_PCA pointclouds
-2. **`visualize_feature_pointcloud.py`** - Interactive visualization with RGB/PCA switching  
-3. **`semantic_similarity_utils.py`** - Open-vocabulary semantic similarity utilities
+1. **`export_feature_pointcloud.py`** - Export RGB, features, and feature_PCA pointclouds with bounding box filtering
+2. **`visualize_feature_pointcloud.py`** - Simple visualization with RGB/PCA/semantic modes and coordinate guides
+3. **`semantic_similarity_utils.py`** - Advanced semantic analysis utilities (reuses visualizer code)
 
 ## Quick Start
 
 ### 1. Export Feature Pointcloud
 
-First, export a pointcloud from your trained F3RM model:
+Export a pointcloud from your trained F3RM model with bounding box filtering to remove outliers:
 
 ```bash
 python export_feature_pointcloud.py \
@@ -25,6 +25,8 @@ python export_feature_pointcloud.py \
     --bbox-max 1 1 1
 ```
 
+**Bounding Box Filtering**: The default bbox of `[-1,-1,-1]` to `[1,1,1]` removes outlier points that are too far away, keeping only the core scene content.
+
 This creates:
 - `pointcloud_rgb.ply` - Standard RGB pointcloud
 - `pointcloud_feature_pca.ply` - PCA-projected feature visualization  
@@ -33,24 +35,32 @@ This creates:
 - `pca_params.pkl` - PCA parameters for consistency
 - `metadata.json` - Export metadata
 
-### 2. Interactive Visualization
+### 2. Simple Visualization
 
-Launch the interactive visualizer:
+Visualize with direct control (following opt.py approach):
 
 ```bash
+# RGB mode with coordinate guides
+python visualize_feature_pointcloud.py --data-dir exports/sitting_pcd_features/ --mode rgb
+
+# PCA mode without guides
+python visualize_feature_pointcloud.py --data-dir exports/sitting_pcd_features/ --mode pca --no-guides
+
+# Semantic mode with direct threshold control (like opt.py)
 python visualize_feature_pointcloud.py \
-    --data-dir exports/sitting_pcd_features/
+    --data-dir exports/sitting_pcd_features/ \
+    --mode semantic \
+    --query "magazine" \
+    --threshold 0.502 \
+    --softmax-temp 1.0 \
+    --negative-queries "object"
 ```
 
-**Controls:**
-- `R` - Switch to RGB mode
-- `P` - Switch to PCA mode  
-- `S` - Perform semantic similarity query
-- `Q` - Quit
+**Coordinate Guides**: Shows origin (0,0,0), axes (Red=X, Green=Y, Blue=Z), bounding box wireframe, and grid lines for spatial reference.
 
-### 3. Semantic Analysis
+### 3. Advanced Semantic Analysis
 
-Use the semantic similarity utilities following the `opt.py` approach:
+Use the semantic similarity utilities for programmatic analysis:
 
 ```python
 from f3rm.semantic_similarity_utils import SemanticPointcloudAnalyzer
@@ -64,11 +74,11 @@ features = np.load("exports/sitting_pcd_features/features_float16.npy")
 analyzer = SemanticPointcloudAnalyzer(features, points)
 
 # Query for objects (same as opt.py)
-similarities = analyzer.query_similarity("magazine", negatives=["object"])
+similarities = analyzer.query_similarity("magazine", negatives=["object"], softmax_temp=1.0)
 magazine_mask = similarities > 0.502  # Same threshold as opt.py
 
 # Find object instances
-clusters = analyzer.find_object_instances("magazine", threshold=0.502)
+clusters = analyzer.find_object_instances("magazine", threshold=0.502, softmax_temp=1.0)
 for i, cluster in enumerate(clusters):
     center = points[cluster].mean(axis=0)
     print(f"Magazine {i+1}: {len(cluster)} points at {center}")
@@ -78,95 +88,80 @@ for i, cluster in enumerate(clusters):
 
 ### Export Options
 
-The export script provides several optimization options:
+The export script provides bounding box filtering to remove outliers:
 
 ```bash
 python export_feature_pointcloud.py \
     --config path/to/config.yml \
     --output-dir path/to/output/ \
     --num-points 50000000 \           # Number of points to sample
-    --bbox-min -1 -1 -1 \             # Bounding box minimum  
-    --bbox-max 1 1 1 \                # Bounding box maximum
+    --bbox-min -1 -1 -1 \             # Bounding box minimum (filters outliers)
+    --bbox-max 1 1 1 \                # Bounding box maximum  
     --no-bbox \                       # Disable bounding box filtering
     --no-compress                     # Use float32 instead of float16
 ```
 
-**Data Type Optimization:**
-- Features are saved as `float16` by default (50% size reduction)
-- Use `--no-compress` for full `float32` precision if needed
-- RGB and PCA pointclouds use standard PLY format
+**Why Bounding Box Filtering?**
+- Removes outlier points that are far from the main scene
+- Default `[-1,-1,-1]` to `[1,1,1]` works well for indoor scenes
+- Use `--no-bbox` to disable if you need the full point range
+- Adjust `--bbox-min`/`--bbox-max` for different scene scales
 
-### Semantic Similarity Features
+### Semantic Similarity (Following opt.py)
 
-The semantic utilities implement the same approach as `opt.py`:
+The semantic tools implement the exact same approach as `opt.py`:
 
 ```python
 # Same method as opt.py
-text_queries = ["magazine", "object"]
-text_features = model.encode_text(tokenizer(text_queries))
-sims = compute_similarity_text2vis(features, text_features, has_negatives=True, softmax_temp=1.0)
-magazine_mask = (sims > 0.502)
+text_queries = ["magazine", "object"]  # positive, then negatives
+similarities = compute_similarity_text2vis(features, text_features, 
+                                         has_negatives=True, softmax_temp=1.0)
+magazine_mask = (similarities > 0.502)  # Same threshold
 ```
 
-**Key capabilities:**
-- **Object Detection**: Find instances of specific objects
-- **Multi-Query Comparison**: Compare different semantic queries
-- **Spatial Analysis**: Analyze spatial distribution of matches
-- **Clustering**: Group semantically similar regions
-- **Export Analysis**: Save comprehensive analysis to JSON
+**Direct Control (No Adaptive Logic):**
+- `--threshold 0.502` - Same default threshold as opt.py
+- `--softmax-temp 1.0` - Same default temperature as opt.py  
+- `--negative-queries "object"` - Same default negative as opt.py
+- No adaptive threshold computation - you control the exact values
 
-### Interactive Visualization
+### Coordinate Guides
 
-The visualizer provides:
+The visualizer shows helpful spatial references:
 
-- **Mode Switching**: Toggle between RGB and feature_PCA visualization
-- **Semantic Queries**: Real-time open-vocabulary queries  
-- **Threshold Control**: Adjust similarity thresholds interactively
-- **Cluster Analysis**: Automatic clustering of similar regions
-- **Statistics**: Display query statistics and cluster information
+- **Origin**: Coordinate frame at (0,0,0) with colored axes
+- **Axes**: Red=X, Green=Y, Blue=Z directions
+- **Bounding Box**: Gray wireframe showing data extent
+- **Grid**: Light gray grid lines on XY plane for scale reference
+- **Control**: Use `--no-guides` to hide all reference elements
 
-### Example Workflow
+### Advanced Analysis Features
 
-Complete workflow for semantic analysis:
+The semantic analyzer provides:
 
 ```python
-# 1. Export pointcloud
-python export_feature_pointcloud.py --config config.yml --output-dir data/
+# Multi-query comparison
+queries = ["chair", "table", "book", "magazine"]
+results = analyzer.compare_queries(queries, threshold=0.502, softmax_temp=1.0)
 
-# 2. Load and analyze
-from f3rm.semantic_similarity_utils import SemanticPointcloudAnalyzer
-analyzer = SemanticPointcloudAnalyzer(features, points)
-
-# 3. Find objects
-magazine_clusters = analyzer.find_object_instances("magazine", threshold=0.502)
-chair_clusters = analyzer.find_object_instances("chair", threshold=0.5)
-
-# 4. Compare queries  
-results = analyzer.compare_queries(["chair", "table", "book", "magazine"])
-
-# 5. Spatial analysis
-spatial_info = analyzer.spatial_analysis("chair", threshold=0.5)
+# Spatial analysis  
+spatial_info = analyzer.spatial_analysis("chair", threshold=0.502, softmax_temp=1.0)
 print(f"Chair density: {spatial_info['density']:.3f} points/volume")
 
-# 6. Export comprehensive analysis
-analyzer.export_semantic_analysis(
-    ["chair", "table", "book", "magazine"], 
-    "semantic_analysis.json"
-)
-
-# 7. Interactive visualization
-python visualize_feature_pointcloud.py --data-dir data/
+# Export comprehensive analysis
+analyzer.export_semantic_analysis(queries, "analysis.json", threshold=0.502, softmax_temp=1.0)
 ```
 
 ## Integration with Existing F3RM Code
 
 These tools are designed to integrate seamlessly with existing F3RM workflows:
 
-- **Consistent with `opt.py`**: Uses the same `compute_similarity_text2vis` function and approach
+- **Consistent with `opt.py`**: Uses the same `compute_similarity_text2vis` function and thresholds
 - **Same CLIP model**: Uses `CLIPArgs.model_name` and `CLIPArgs.model_pretrained`  
 - **Compatible with `render_feature_video.py`**: Uses the same PCA projection for consistency
-- **Memory efficient**: Chunked processing for large pointclouds
+- **Memory efficient**: Chunked processing with bounding box filtering
 - **GPU accelerated**: Automatic GPU usage when available
+- **No code duplication**: semantic_similarity_utils.py reuses code from visualize_feature_pointcloud.py
 
 ## File Structure
 
@@ -180,46 +175,100 @@ exports/sitting_pcd_features/
 ├── points.npy                   # Point coordinates
 ├── pca_params.pkl              # PCA parameters
 ├── metadata.json               # Export metadata
-└── semantic_query_*.ply        # Generated by queries
+└── semantic_query_*.ply        # Generated by semantic queries
+```
+
+## Example Workflows
+
+### Basic Visualization Workflow
+
+```bash
+# 1. Export with bounding box filtering
+python export_feature_pointcloud.py \
+    --config outputs/scene/f3rm/config.yml \
+    --output-dir exports/scene_pcd \
+    --bbox-min -1 -1 -1 --bbox-max 1 1 1
+
+# 2. Visualize RGB with guides
+python visualize_feature_pointcloud.py --data-dir exports/scene_pcd --mode rgb
+
+# 3. Visualize PCA features  
+python visualize_feature_pointcloud.py --data-dir exports/scene_pcd --mode pca
+
+# 4. Semantic query (following opt.py approach)
+python visualize_feature_pointcloud.py \
+    --data-dir exports/scene_pcd --mode semantic \
+    --query "magazine" --threshold 0.502 --softmax-temp 1.0
+```
+
+### Advanced Analysis Workflow
+
+```python
+# Load data
+import numpy as np
+from f3rm.semantic_similarity_utils import SemanticPointcloudAnalyzer
+
+points = np.load("exports/scene_pcd/points.npy")
+features = np.load("exports/scene_pcd/features_float16.npy")
+analyzer = SemanticPointcloudAnalyzer(features, points)
+
+# Find object instances (same as opt.py)
+magazine_clusters = analyzer.find_object_instances("magazine", threshold=0.502, softmax_temp=1.0)
+chair_clusters = analyzer.find_object_instances("chair", threshold=0.502, softmax_temp=1.0)
+
+# Compare multiple objects
+results = analyzer.compare_queries(["chair", "table", "magazine"], threshold=0.502, softmax_temp=1.0)
+
+# Analyze spatial distribution
+spatial_info = analyzer.spatial_analysis("chair", threshold=0.502, softmax_temp=1.0)
+
+# Export comprehensive analysis
+analyzer.export_semantic_analysis(["chair", "table", "magazine"], "analysis.json", 
+                                 threshold=0.502, softmax_temp=1.0)
 ```
 
 ## Performance Considerations
 
-- **Memory Usage**: Features are compressed to `float16` by default
+- **Bounding Box**: Reduces point count and improves performance
+- **Memory Usage**: Features compressed to `float16` by default (50% reduction)
 - **GPU Memory**: Chunked processing prevents OOM errors
 - **Caching**: Semantic queries are cached for repeated analysis
-- **Parallel Processing**: Uses efficient PyTorch operations
+- **Code Reuse**: No duplication between visualizer and semantic utils
 
 ## Comparison with ns-export pointcloud
 
 Unlike the standard `ns-export pointcloud`, these tools provide:
 
 ✅ **Feature extraction** in addition to RGB  
+✅ **Bounding box filtering** to remove outliers  
 ✅ **Consistent PCA projection** across all points  
 ✅ **Memory optimization** with float16 compression  
-✅ **Open-vocabulary semantic queries**  
-✅ **Interactive visualization** with mode switching  
-✅ **Spatial clustering** and analysis  
-✅ **Export compatibility** with analysis tools  
+✅ **Open-vocabulary semantic queries** following opt.py approach  
+✅ **Direct threshold control** (no adaptive logic)  
+✅ **Coordinate guides** for spatial understanding  
+✅ **Advanced analysis** with clustering and spatial statistics  
+✅ **No code duplication** between components  
 
-The standard export only provides RGB pointclouds, while these tools extract the full semantic feature representation for analysis.
+The standard export only provides RGB pointclouds, while these tools extract the full semantic feature representation with proper filtering and analysis capabilities.
 
 ## Troubleshooting
 
 **Common Issues:**
 
-1. **Out of Memory**: Reduce `--num-points` or use smaller `chunk_size`
-2. **CLIP Loading**: Ensure you have `open_clip` installed and GPU access
-3. **File Not Found**: Check paths and ensure export completed successfully  
+1. **Out of Memory**: Reduce `--num-points` or use smaller bounding box
+2. **No Points**: Expand bounding box with `--bbox-min`/`--bbox-max` or use `--no-bbox`
+3. **CLIP Loading**: Ensure you have `open_clip` installed and GPU access
 4. **Visualization Issues**: Ensure Open3D is installed with GUI support
+5. **Import Errors**: Make sure f3rm package is in Python path
 
 **Performance Tips:**
 
 - Use bounding box filtering to focus on regions of interest
-- Start with fewer points for initial testing
+- Start with fewer points for initial testing  
+- Use direct threshold control instead of adaptive logic
 - Cache semantic queries for repeated analysis
 - Use compressed features unless full precision is needed
 
 ---
 
-These tools extend F3RM's capabilities from video rendering to comprehensive pointcloud analysis with open-vocabulary semantic understanding, following the same principled approach demonstrated in `opt.py`. 
+These tools extend F3RM's capabilities from video rendering to comprehensive pointcloud analysis with open-vocabulary semantic understanding, following the same principled approach demonstrated in `opt.py` while avoiding code duplication and providing spatial filtering capabilities. 

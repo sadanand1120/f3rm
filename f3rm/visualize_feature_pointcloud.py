@@ -377,7 +377,8 @@ def visualize_semantic(
     data: FeaturePointcloudData,
     query: str,
     negative_queries: Optional[List[str]] = None,
-    threshold: Optional[float] = None,
+    threshold: float = 0.502,  # Same default as opt.py
+    softmax_temp: float = 1.0,  # Same default as opt.py
     save_result: bool = False,
     show_guides: bool = True
 ):
@@ -386,24 +387,19 @@ def visualize_semantic(
     console.print(data.get_info())
 
     if negative_queries is None:
-        negative_queries = ["object", "background", "floor"]
+        negative_queries = ["object"]  # Same default as opt.py
 
     # Initialize semantic utils
     semantic_utils = SemanticSimilarityUtils()
 
     # Compute similarities
-    console.print(f"[yellow]Computing similarities for '{query}'...")
+    console.print(f"[yellow]Computing similarities for '{query}' with threshold {threshold}, softmax_temp {softmax_temp}...")
     queries = [query] + negative_queries
     similarities = semantic_utils.compute_text_similarities(
-        data.features, queries, has_negatives=len(negative_queries) > 0
+        data.features, queries,
+        has_negatives=len(negative_queries) > 0,
+        softmax_temp=softmax_temp
     )
-
-    # Compute adaptive threshold if not provided
-    if threshold is None:
-        sim_mean = similarities.mean()
-        sim_std = similarities.std()
-        threshold = min(sim_mean + 0.5 * sim_std, similarities.max() * 0.8)
-        threshold = max(threshold, sim_mean)
 
     # Print statistics
     above_thresh = (similarities > threshold).sum()
@@ -451,8 +447,9 @@ def main():
     parser.add_argument("--data-dir", type=Path, required=True, help="Directory containing exported pointcloud data")
     parser.add_argument("--mode", choices=["rgb", "pca", "semantic"], default="rgb", help="Visualization mode")
     parser.add_argument("--query", type=str, help="Semantic query (required for semantic mode)")
-    parser.add_argument("--negative-queries", nargs="*", help="Negative queries for semantic mode")
-    parser.add_argument("--threshold", type=float, help="Similarity threshold for semantic mode (auto if not specified)")
+    parser.add_argument("--negative-queries", nargs="*", help="Negative queries for semantic mode (default: ['object'])")
+    parser.add_argument("--threshold", type=float, default=0.502, help="Similarity threshold for semantic mode (default: 0.502 like opt.py)")
+    parser.add_argument("--softmax-temp", type=float, default=1.0, help="Softmax temperature for semantic mode (default: 1.0 like opt.py)")
     parser.add_argument("--save", action="store_true", help="Save semantic similarity results")
     parser.add_argument("--no-guides", action="store_true", help="Hide coordinate frame and reference guides")
 
@@ -489,6 +486,7 @@ def main():
                 args.query,
                 args.negative_queries,
                 args.threshold,
+                args.softmax_temp,
                 args.save,
                 show_guides
             )

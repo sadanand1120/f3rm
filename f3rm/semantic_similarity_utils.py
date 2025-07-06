@@ -19,11 +19,9 @@ import numpy as np
 import torch
 from rich.console import Console
 from sklearn.cluster import DBSCAN
-from sklearn.mixture import GaussianMixture
 
-import open_clip
-from f3rm.features.clip_extract import CLIPArgs
-from f3rm.minimal.utils import compute_similarity_text2vis
+# Import the working SemanticSimilarityUtils class
+from f3rm.visualize_feature_pointcloud import SemanticSimilarityUtils
 
 console = Console()
 
@@ -35,6 +33,9 @@ class SemanticPointcloudAnalyzer:
     This class provides methods for open-vocabulary queries, object detection,
     and spatial clustering based on CLIP features, following the approach
     demonstrated in opt.py.
+
+    This class wraps and extends the SemanticSimilarityUtils from visualize_feature_pointcloud.py
+    to avoid code duplication.
     """
 
     def __init__(
@@ -55,25 +56,11 @@ class SemanticPointcloudAnalyzer:
         self.points = points
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Lazy loading for CLIP model
-        self._clip_model = None
-        self._tokenizer = None
+        # Use the working SemanticSimilarityUtils from visualize_feature_pointcloud.py
+        self.semantic_utils = SemanticSimilarityUtils(device=self.device)
 
         # Cache for computed similarities
         self._similarity_cache = {}
-
-    def _load_clip_model(self):
-        """Load CLIP model if not already loaded."""
-        if self._clip_model is None:
-            console.print("[yellow]Loading CLIP model...")
-            self._clip_model, _, _ = open_clip.create_model_and_transforms(
-                CLIPArgs.model_name,
-                pretrained=CLIPArgs.model_pretrained,
-                device=self.device
-            )
-            self._clip_model.eval()
-            self._tokenizer = open_clip.get_tokenizer(CLIPArgs.model_name)
-            console.print("[green]✓ CLIP model loaded")
 
     def query_similarity(
         self,
@@ -109,34 +96,18 @@ class SemanticPointcloudAnalyzer:
         if use_cache and cache_key in self._similarity_cache:
             return self._similarity_cache[cache_key]
 
-        self._load_clip_model()
-
-        # Prepare text queries (positive first, then negatives)
+        # Use the working semantic utils
         text_queries = [positive_query] + negatives
-
-        # Convert features to torch
-        features_torch = torch.from_numpy(self.features).to(self.device)
-
-        # Encode text queries
-        text_tokens = self._tokenizer(text_queries).to(self.device)
-        with torch.no_grad():
-            text_features = self._clip_model.encode_text(text_tokens)
-
-        # Compute similarities using the same method as in opt.py
-        has_negatives = len(negatives) > 0
-        similarities = compute_similarity_text2vis(
-            features_torch,
-            text_features,
-            has_negatives=has_negatives,
+        similarities = self.semantic_utils.compute_text_similarities(
+            self.features, text_queries,
+            has_negatives=len(negatives) > 0,
             softmax_temp=softmax_temp
         )
 
-        result = similarities.cpu().numpy().squeeze()
-
         if use_cache:
-            self._similarity_cache[cache_key] = result
+            self._similarity_cache[cache_key] = similarities
 
-        return result
+        return similarities
 
     def find_object_instances(
         self,
@@ -145,6 +116,7 @@ class SemanticPointcloudAnalyzer:
         negatives: Optional[List[str]] = None,
         min_cluster_size: int = 10,
         eps: float = 0.05,
+        softmax_temp: float = 1.0,
         return_details: bool = False
     ) -> Union[List[np.ndarray], Tuple[List[np.ndarray], Dict]]:
         """
@@ -156,6 +128,7 @@ class SemanticPointcloudAnalyzer:
             negatives: Negative queries for contrast
             min_cluster_size: Minimum points per cluster
             eps: DBSCAN clustering radius
+            softmax_temp: Temperature for softmax scaling
             return_details: Whether to return detailed analysis
 
         Returns:
@@ -169,7 +142,7 @@ class SemanticPointcloudAnalyzer:
                 print(f"Magazine {i+1}: {len(cluster)} points at {center}")
         """
         # Compute similarities
-        similarities = self.query_similarity(query, negatives)
+        similarities = self.query_similarity(query, negatives, softmax_temp)
 
         # Apply threshold (same as opt.py: magazine_mask = (sims > 0.502))
         high_sim_mask = similarities > threshold
@@ -200,6 +173,7 @@ class SemanticPointcloudAnalyzer:
         details = {
             'query': query,
             'threshold': threshold,
+            'softmax_temp': softmax_temp,
             'total_above_threshold': len(high_sim_points),
             'num_clusters': len(clusters),
             'similarity_stats': {
@@ -232,7 +206,8 @@ class SemanticPointcloudAnalyzer:
         self,
         queries: List[str],
         negatives: Optional[List[str]] = None,
-        threshold: float = 0.5
+        threshold: float = 0.502,
+        softmax_temp: float = 1.0
     ) -> Dict[str, Dict]:
         """
         Compare multiple queries and their similarity patterns.
@@ -241,21 +216,22 @@ class SemanticPointcloudAnalyzer:
             queries: List of queries to compare
             negatives: Shared negative queries
             threshold: Similarity threshold for analysis
+            softmax_temp: Temperature for softmax scaling
 
         Returns:
             Dictionary with analysis for each query
         """
         if negatives is None:
-            negatives = ["object", "background"]
+            negatives = ["object"]
 
         results = {}
 
         for query in queries:
-            similarities = self.query_similarity(query, negatives)
+            similarities = self.query_similarity(query, negatives, softmax_temp)
             above_threshold = (similarities > threshold).sum()
 
             clusters, details = self.find_object_instances(
-                query, threshold, negatives, return_details=True
+                query, threshold, negatives, softmax_temp=softmax_temp, return_details=True
             )
 
             results[query] = {
@@ -271,7 +247,8 @@ class SemanticPointcloudAnalyzer:
         self,
         query: str,
         negatives: Optional[List[str]] = None,
-        threshold: float = 0.5,
+        threshold: float = 0.502,
+        softmax_temp: float = 1.0,
         grid_resolution: float = 0.1
     ) -> Dict:
         """
@@ -281,12 +258,13 @@ class SemanticPointcloudAnalyzer:
             query: Query text
             negatives: Negative queries
             threshold: Similarity threshold
+            softmax_temp: Temperature for softmax scaling
             grid_resolution: Spatial grid resolution
 
         Returns:
             Dictionary with spatial analysis results
         """
-        similarities = self.query_similarity(query, negatives)
+        similarities = self.query_similarity(query, negatives, softmax_temp)
         high_sim_mask = similarities > threshold
 
         if not high_sim_mask.any():
@@ -321,6 +299,8 @@ class SemanticPointcloudAnalyzer:
 
         return {
             'query': query,
+            'threshold': threshold,
+            'softmax_temp': softmax_temp,
             'num_points': len(high_sim_points),
             'bbox_min': bbox_min,
             'bbox_max': bbox_max,
@@ -336,60 +316,12 @@ class SemanticPointcloudAnalyzer:
             }
         }
 
-    def create_similarity_heatmap(
-        self,
-        query: str,
-        negatives: Optional[List[str]] = None,
-        resolution: Tuple[int, int, int] = (50, 50, 50)
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Create a 3D similarity heatmap for visualization.
-
-        Args:
-            query: Query text
-            negatives: Negative queries
-            resolution: 3D grid resolution
-
-        Returns:
-            Tuple of (grid_coordinates, similarity_values)
-        """
-        similarities = self.query_similarity(query, negatives)
-
-        # Create 3D grid
-        bbox_min = self.points.min(axis=0)
-        bbox_max = self.points.max(axis=0)
-
-        x = np.linspace(bbox_min[0], bbox_max[0], resolution[0])
-        y = np.linspace(bbox_min[1], bbox_max[1], resolution[1])
-        z = np.linspace(bbox_min[2], bbox_max[2], resolution[2])
-
-        grid_x, grid_y, grid_z = np.meshgrid(x, y, z, indexing='ij')
-        grid_coords = np.stack([grid_x, grid_y, grid_z], axis=-1)
-
-        # Interpolate similarities to grid
-        from scipy.spatial import cKDTree
-
-        tree = cKDTree(self.points)
-        grid_flat = grid_coords.reshape(-1, 3)
-
-        # Find nearest neighbors for each grid point
-        distances, indices = tree.query(grid_flat, k=5)
-
-        # Weight by inverse distance
-        weights = 1.0 / (distances + 1e-8)
-        weights = weights / weights.sum(axis=1, keepdims=True)
-
-        # Interpolate similarities
-        grid_similarities = (similarities[indices] * weights).sum(axis=1)
-        grid_similarities = grid_similarities.reshape(resolution)
-
-        return grid_coords, grid_similarities
-
     def export_semantic_analysis(
         self,
         queries: List[str],
         output_path: str,
-        threshold: float = 0.5
+        threshold: float = 0.502,
+        softmax_temp: float = 1.0
     ) -> None:
         """
         Export comprehensive semantic analysis to file.
@@ -398,6 +330,7 @@ class SemanticPointcloudAnalyzer:
             queries: List of queries to analyze
             output_path: Output file path
             threshold: Similarity threshold
+            softmax_temp: Temperature for softmax scaling
         """
         import json
         from pathlib import Path
@@ -408,6 +341,7 @@ class SemanticPointcloudAnalyzer:
                 'feature_dim': self.features.shape[1],
                 'queries': queries,
                 'threshold': threshold,
+                'softmax_temp': softmax_temp,
                 'bbox_min': self.points.min(axis=0).tolist(),
                 'bbox_max': self.points.max(axis=0).tolist()
             },
@@ -418,15 +352,15 @@ class SemanticPointcloudAnalyzer:
             console.print(f"[yellow]Analyzing query: '{query}'")
 
             # Basic similarity analysis
-            similarities = self.query_similarity(query)
+            similarities = self.query_similarity(query, softmax_temp=softmax_temp)
 
             # Find clusters
             clusters, details = self.find_object_instances(
-                query, threshold, return_details=True
+                query, threshold, softmax_temp=softmax_temp, return_details=True
             )
 
             # Spatial analysis
-            spatial_info = self.spatial_analysis(query, threshold=threshold)
+            spatial_info = self.spatial_analysis(query, threshold=threshold, softmax_temp=softmax_temp)
 
             results['query_results'][query] = {
                 'similarities_stats': {
@@ -480,25 +414,26 @@ for i, cluster in enumerate(clusters):
 
 # Compare multiple queries
 queries = ["chair", "table", "book", "magazine"]
-results = analyzer.compare_queries(queries)
+results = analyzer.compare_queries(queries, threshold=0.502, softmax_temp=1.0)
 
 # Spatial analysis
-spatial_info = analyzer.spatial_analysis("chair", threshold=0.5)
+spatial_info = analyzer.spatial_analysis("chair", threshold=0.502, softmax_temp=1.0)
 print(f"Chair density: {spatial_info['density']:.3f} points per unit volume")
 
 # Export comprehensive analysis
-analyzer.export_semantic_analysis(queries, "semantic_analysis.json")
+analyzer.export_semantic_analysis(queries, "semantic_analysis.json", threshold=0.502, softmax_temp=1.0)
 '''
 
     console.print(example_code)
 
     console.print("\n[bold yellow]Key Features:")
     console.print("• Same method as opt.py: compute_similarity_text2vis with negatives")
+    console.print("• Direct threshold and softmax_temp control (no adaptive logic)")
     console.print("• Object instance detection with spatial clustering")
     console.print("• Multi-query comparison and analysis")
     console.print("• Spatial density and distribution analysis")
-    console.print("• 3D similarity heatmaps for visualization")
     console.print("• Comprehensive export for further analysis")
+    console.print("• Reuses working code from visualize_feature_pointcloud.py")
 
     console.print("\n[bold green]Integration with F3RM:")
     console.print("• Compatible with exported feature pointclouds")
