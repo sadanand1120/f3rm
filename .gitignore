@@ -21,6 +21,7 @@ datasets/
 *outputs*/
 
 renders/
+exports/
 
 **/*notrack*/
 **/*notrack*
