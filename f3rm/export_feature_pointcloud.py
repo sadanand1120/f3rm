@@ -30,6 +30,8 @@ console = Console()
 def sample_feature_pointcloud(
     pipeline,
     num_points: int,
+    bbox_min: Optional[Tuple[float, float, float]] = None,
+    bbox_max: Optional[Tuple[float, float, float]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Sample a pointcloud with RGB, features, and consistent PCA features.
@@ -39,6 +41,8 @@ def sample_feature_pointcloud(
     Args:
         pipeline: The F3RM pipeline
         num_points: Target number of points to sample
+        bbox_min: Optional minimum bounding box coordinates (x, y, z)
+        bbox_max: Optional maximum bounding box coordinates (x, y, z)
 
     Returns:
         Tuple of (points, rgb, features, feature_pca) tensors
@@ -46,6 +50,9 @@ def sample_feature_pointcloud(
     device = pipeline.device
 
     console.print(f"[bold green]Sampling {num_points:,} points from F3RM model...")
+
+    if bbox_min is not None and bbox_max is not None:
+        console.print(f"[bold green]Using bounding box: {bbox_min} to {bbox_max}")
 
     points_list = []
     rgbs_list = []
@@ -60,15 +67,15 @@ def sample_feature_pointcloud(
         TextColumn("[bold blue]{task.description}"),
         BarColumn(),
         TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-        TextColumn("({task.completed}/{task.total})"),
         TimeElapsedColumn(),
         TimeRemainingColumn(),
         console=console,
     ) as progress:
 
         task = progress.add_task("Sampling points", total=num_points)
+        collected_points = 0
 
-        while progress.tasks[0].completed < num_points:
+        while collected_points < num_points:
             with torch.no_grad():
                 # Get rays from datamanager
                 ray_bundle, _ = pipeline.datamanager.next_train(0)
@@ -83,22 +90,43 @@ def sample_feature_pointcloud(
                 # Convert depth to world coordinates
                 nerf_points = ray_bundle.origins + ray_bundle.directions * depth
 
+                # Apply bounding box filtering if specified
+                if bbox_min is not None and bbox_max is not None:
+                    bbox_min_tensor = torch.tensor(bbox_min, device=device)
+                    bbox_max_tensor = torch.tensor(bbox_max, device=device)
+
+                    # Create mask for points within bounding box
+                    within_bbox = torch.all(
+                        (nerf_points >= bbox_min_tensor) & (nerf_points <= bbox_max_tensor),
+                        dim=-1
+                    )
+
+                    # Filter points, RGB, and features
+                    if within_bbox.any():
+                        nerf_points = nerf_points[within_bbox]
+                        rgb = rgb[within_bbox]
+                        features = features[within_bbox]
+                    else:
+                        # No points within bbox, skip this batch
+                        continue
+
                 points_list.append(nerf_points)
                 rgbs_list.append(rgb)
                 features_list.append(features)
 
-                progress.update(task, advance=len(nerf_points))
+                collected_points += len(nerf_points)
+                progress.update(task, completed=min(collected_points, num_points))
 
                 # Clear GPU cache periodically
                 torch.cuda.empty_cache()
 
                 # Break if we have enough points
-                if progress.tasks[0].completed >= num_points:
+                if collected_points >= num_points:
                     break
 
     # Concatenate all collected data
     if not points_list:
-        raise RuntimeError("No valid points were sampled.")
+        raise RuntimeError("No valid points were sampled. Try expanding the bounding box.")
 
     points = torch.cat(points_list, dim=0)
     rgbs = torch.cat(rgbs_list, dim=0)
@@ -243,6 +271,8 @@ def export_feature_pointcloud(
     output_dir: Path,
     num_points: int = 1000000,
     compress_features: bool = True,
+    bbox_min: Optional[Tuple[float, float, float]] = None,
+    bbox_max: Optional[Tuple[float, float, float]] = None,
 ) -> None:
     """
     Export F3RM pointcloud with RGB, features, and feature_PCA.
@@ -252,6 +282,8 @@ def export_feature_pointcloud(
         output_dir: Output directory
         num_points: Number of points to sample
         compress_features: Whether to compress features to save space
+        bbox_min: Optional minimum bounding box coordinates (x, y, z)
+        bbox_max: Optional maximum bounding box coordinates (x, y, z)
     """
     console.print(f"[bold blue]F3RM Feature Pointcloud Exporter")
     console.print(f"[bold blue]Config: {config_path}")
@@ -267,6 +299,8 @@ def export_feature_pointcloud(
     points, rgbs, features, feature_pca, pca_proj, pca_min, pca_max = sample_feature_pointcloud(
         pipeline=pipeline,
         num_points=num_points,
+        bbox_min=bbox_min,
+        bbox_max=bbox_max,
     )
 
     # Save all data
@@ -292,6 +326,13 @@ def main():
     parser.add_argument("--num-points", type=int, default=1000000, help="Number of points to sample")
     parser.add_argument("--no-compress", action="store_true", help="Don't compress features (use float32)")
 
+    # Bounding box arguments with reasonable defaults for indoor scenes
+    parser.add_argument("--bbox-min", type=float, nargs=3, default=[-1.0, -1.0, -1.0],
+                        help="Minimum bounding box coordinates (x y z) - default: -1 -1 -1")
+    parser.add_argument("--bbox-max", type=float, nargs=3, default=[1.0, 1.0, 1.0],
+                        help="Maximum bounding box coordinates (x y z) - default: 1 1 1")
+    parser.add_argument("--no-bbox", action="store_true", help="Disable bounding box filtering")
+
     args = parser.parse_args()
 
     # Validate inputs
@@ -299,12 +340,22 @@ def main():
         console.print(f"[bold red]Config file not found: {args.config}")
         return
 
+    # Set up bounding box
+    bbox_min = None if args.no_bbox else tuple(args.bbox_min)
+    bbox_max = None if args.no_bbox else tuple(args.bbox_max)
+
+    if not args.no_bbox:
+        console.print(f"[bold blue]Bounding box: {bbox_min} to {bbox_max}")
+        console.print(f"[dim]Use --no-bbox to disable filtering, or adjust --bbox-min/--bbox-max")
+
     try:
         export_feature_pointcloud(
             config_path=args.config,
             output_dir=args.output_dir,
             num_points=args.num_points,
             compress_features=not args.no_compress,
+            bbox_min=bbox_min,
+            bbox_max=bbox_max,
         )
     except Exception as e:
         console.print(f"[bold red]Error: {e}")
