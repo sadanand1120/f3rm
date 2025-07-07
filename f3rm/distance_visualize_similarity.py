@@ -110,7 +110,7 @@ def visualize_distance_semantic(
         heatmap_colors = cmap(sim_norm)[:, :3]
         combined_colors[main_mask] = heatmap_colors
 
-        console.print(f"[green]Applied heatmap to {main_mask.sum():,} points for '{main_query}'")
+        console.print(f"[green]Applied turbo heatmap to {main_mask.sum():,} points for '{main_query}'")
 
     # Find floor points within distance threshold of main query points
     if main_mask.any() and floor_mask.any():
@@ -174,13 +174,21 @@ def visualize_distance_semantic(
         near_floor_mask = (min_distances >= distance_lower) & (min_distances <= distance_upper)
         near_floor_indices = floor_indices_sampled[near_floor_mask]
 
-        # Color near floor points in light green
-        light_green = np.array([0.6, 1.0, 0.6])  # Light green
-        combined_colors[near_floor_indices] = light_green
+        # Remove any overlap between main query and floor points to avoid color conflicts
+        near_floor_indices_clean = near_floor_indices[~np.isin(near_floor_indices, np.where(main_mask)[0])]
+
+        # Color near floor points in bright green (completely overriding RGB background)
+        bright_green = np.array([0.0, 1.0, 0.0])  # Pure bright green
+        combined_colors[near_floor_indices_clean] = bright_green
 
         total_time = time.time() - start_time
         console.print(f"[green]Distance computation completed in {total_time:.1f}s")
-        console.print(f"[green]Highlighted {near_floor_mask.sum():,} floor points within distance bounds [{distance_lower:.3f}, {distance_upper:.3f}] in light green")
+        console.print(f"[green]Highlighted {len(near_floor_indices_clean):,} floor points (excluding overlaps) within distance bounds [{distance_lower:.3f}, {distance_upper:.3f}] in bright green")
+
+        # Report overlaps if any
+        num_overlaps = len(near_floor_indices) - len(near_floor_indices_clean)
+        if num_overlaps > 0:
+            console.print(f"[yellow]Excluded {num_overlaps:,} floor points that overlap with main query points")
     else:
         console.print(f"[yellow]No valid points for distance computation")
 
@@ -200,9 +208,10 @@ def visualize_distance_semantic(
 
     # Visualize
     console.print(f"[cyan]Legend:")
-    console.print(f"  Turbo heatmap: '{main_query}' similarity")
-    console.print(f"  Light green: '{floor_query}' within distance bounds [{distance_lower:.3f}, {distance_upper:.3f}]")
+    console.print(f"  Turbo heatmap (red/yellow/blue): '{main_query}' similarity")
+    console.print(f"  Bright green: '{floor_query}' within distance bounds [{distance_lower:.3f}, {distance_upper:.3f}]")
     console.print(f"  Transparent RGB: background context (alpha={background_alpha:.1f})")
+    console.print(f"  Note: Floor points overlapping with main query are excluded to avoid color conflicts")
 
     o3d.visualization.draw_geometries(
         [result_pcd, coord_frame],
