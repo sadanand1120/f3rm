@@ -118,9 +118,23 @@ def visualize_distance_semantic(
 
         console.print(f"[yellow]Computing distances between {len(main_points):,} main points and {len(floor_points):,} floor points...")
 
-        # Compute distances efficiently
-        distances = cdist(floor_points, main_points)
-        min_distances = distances.min(axis=1)
+        # Process in chunks to avoid memory issues
+        chunk_size = 10000  # Process 10k floor points at a time
+        min_distances = np.full(len(floor_points), np.inf)
+
+        for i in range(0, len(floor_points), chunk_size):
+            end_idx = min(i + chunk_size, len(floor_points))
+            chunk_floor_points = floor_points[i:end_idx]
+
+            # Compute distances for this chunk
+            chunk_distances = cdist(chunk_floor_points, main_points)
+            chunk_min_distances = chunk_distances.min(axis=1)
+
+            # Store minimum distances
+            min_distances[i:end_idx] = chunk_min_distances
+
+            if (i // chunk_size + 1) % 10 == 0:
+                console.print(f"[yellow]Processed {end_idx:,}/{len(floor_points):,} floor points...")
 
         # Find floor points within distance bounds
         near_floor_mask = (min_distances >= distance_lower) & (min_distances <= distance_upper)
