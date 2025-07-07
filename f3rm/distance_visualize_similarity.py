@@ -32,7 +32,8 @@ def visualize_distance_semantic(
     background_alpha: float = 0.3,
     semantic_threshold: float = 0.502,
     softmax_temp: float = 1.0,
-    save_result: bool = False
+    save_result: bool = False,
+    chunk_size: int = 1000
 ):
     """
     Visualize semantic similarity with distance-based floor highlighting.
@@ -47,6 +48,7 @@ def visualize_distance_semantic(
         semantic_threshold: Similarity threshold
         softmax_temp: Softmax temperature
         save_result: Whether to save result
+        chunk_size: Number of floor points to process per chunk (for memory management)
     """
     console.print(f"[bold green]Distance-based semantic visualization:")
     console.print(f"  Main query: '{main_query}'")
@@ -119,8 +121,11 @@ def visualize_distance_semantic(
         console.print(f"[yellow]Computing distances between {len(main_points):,} main points and {len(floor_points):,} floor points...")
 
         # Process in chunks to avoid memory issues
-        chunk_size = 10000  # Process 10k floor points at a time
+        # Each chunk creates chunk_size × num_main_points float64 matrix
+        # Estimated memory: chunk_size × num_main_points × 8 bytes
         min_distances = np.full(len(floor_points), np.inf)
+
+        console.print(f"[yellow]Processing in chunks of {chunk_size:,} floor points (estimated {chunk_size * len(main_points) * 8 / (1024**3):.1f} GB per chunk)...")
 
         for i in range(0, len(floor_points), chunk_size):
             end_idx = min(i + chunk_size, len(floor_points))
@@ -133,7 +138,7 @@ def visualize_distance_semantic(
             # Store minimum distances
             min_distances[i:end_idx] = chunk_min_distances
 
-            if (i // chunk_size + 1) % 10 == 0:
+            if (i // chunk_size + 1) % 50 == 0:
                 console.print(f"[yellow]Processed {end_idx:,}/{len(floor_points):,} floor points...")
 
         # Find floor points within distance bounds
@@ -198,6 +203,8 @@ def main():
                         help="Softmax temperature (default: 1.0)")
     parser.add_argument("--save", action="store_true",
                         help="Save visualization result")
+    parser.add_argument("--chunk-size", type=int, default=1000,
+                        help="Number of floor points to process per chunk for memory management (default: 1000)")
 
     args = parser.parse_args()
 
@@ -224,7 +231,8 @@ def main():
             args.background_alpha,
             args.threshold,
             args.softmax_temp,
-            args.save
+            args.save,
+            args.chunk_size
         )
 
     except Exception as e:
