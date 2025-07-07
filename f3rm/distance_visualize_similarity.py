@@ -8,7 +8,7 @@ and highlights floor points within a distance threshold in light green.
 
 Usage:
     python distance_visualize_similarity.py --data-dir path/to/exported/pointcloud/ \
-        --query "chair" --distance-threshold 0.5
+        --query "chair" --distance-lower 0.0 --distance-upper 0.5
 """
 
 import argparse
@@ -26,7 +26,8 @@ console = Console()
 def visualize_distance_semantic(
     data: FeaturePointcloudData,
     main_query: str,
-    distance_threshold: float,
+    distance_lower: float,
+    distance_upper: float,
     floor_query: str = "floor",
     background_alpha: float = 0.3,
     semantic_threshold: float = 0.502,
@@ -39,7 +40,8 @@ def visualize_distance_semantic(
     Args:
         data: Pointcloud data
         main_query: Main semantic query (e.g., "chair")
-        distance_threshold: Distance threshold for floor highlighting
+        distance_lower: Lower distance bound for floor highlighting
+        distance_upper: Upper distance bound for floor highlighting
         floor_query: Floor semantic query (default: "floor")
         background_alpha: RGB background transparency
         semantic_threshold: Similarity threshold
@@ -49,7 +51,7 @@ def visualize_distance_semantic(
     console.print(f"[bold green]Distance-based semantic visualization:")
     console.print(f"  Main query: '{main_query}'")
     console.print(f"  Floor query: '{floor_query}'")
-    console.print(f"  Distance threshold: {distance_threshold:.3f}")
+    console.print(f"  Distance bounds: [{distance_lower:.3f}, {distance_upper:.3f}]")
     console.print(f"  Background alpha: {background_alpha:.1f}")
 
     # Initialize semantic utils
@@ -120,15 +122,15 @@ def visualize_distance_semantic(
         distances = cdist(floor_points, main_points)
         min_distances = distances.min(axis=1)
 
-        # Find floor points within distance threshold
-        near_floor_mask = min_distances <= distance_threshold
+        # Find floor points within distance bounds
+        near_floor_mask = (min_distances >= distance_lower) & (min_distances <= distance_upper)
         near_floor_indices = floor_indices[near_floor_mask]
 
         # Color near floor points in light green
         light_green = np.array([0.6, 1.0, 0.6])  # Light green
         combined_colors[near_floor_indices] = light_green
 
-        console.print(f"[green]Highlighted {near_floor_mask.sum():,} floor points within {distance_threshold:.3f} distance in light green")
+        console.print(f"[green]Highlighted {near_floor_mask.sum():,} floor points within distance bounds [{distance_lower:.3f}, {distance_upper:.3f}] in light green")
     else:
         console.print(f"[yellow]No valid points for distance computation")
 
@@ -142,19 +144,19 @@ def visualize_distance_semantic(
 
     # Save if requested
     if save_result:
-        output_path = data.data_dir / f"distance_semantic_{main_query.replace(' ', '_')}_dist{distance_threshold:.2f}.ply"
+        output_path = data.data_dir / f"distance_semantic_{main_query.replace(' ', '_')}_dist{distance_lower:.2f}-{distance_upper:.2f}.ply"
         o3d.io.write_point_cloud(str(output_path), result_pcd)
         console.print(f"[green]Saved result: {output_path}")
 
     # Visualize
     console.print(f"[cyan]Legend:")
     console.print(f"  Turbo heatmap: '{main_query}' similarity")
-    console.print(f"  Light green: '{floor_query}' within {distance_threshold:.3f} distance")
+    console.print(f"  Light green: '{floor_query}' within distance bounds [{distance_lower:.3f}, {distance_upper:.3f}]")
     console.print(f"  Transparent RGB: background context (alpha={background_alpha:.1f})")
 
     o3d.visualization.draw_geometries(
         [result_pcd, coord_frame],
-        window_name=f"Distance Semantic: '{main_query}' + near '{floor_query}' (d≤{distance_threshold:.2f})",
+        window_name=f"Distance Semantic: '{main_query}' + '{floor_query}' (d∈[{distance_lower:.2f}, {distance_upper:.2f}])",
         width=1200,
         height=800,
         left=50,
@@ -168,8 +170,10 @@ def main():
                         help="Directory containing exported pointcloud data")
     parser.add_argument("--query", type=str, required=True,
                         help="Main semantic query (e.g., 'chair')")
-    parser.add_argument("--distance-threshold", type=float, required=True,
-                        help="Distance threshold for floor highlighting")
+    parser.add_argument("--distance-lower", type=float, default=0.0,
+                        help="Lower distance bound for floor highlighting (default: 0.0)")
+    parser.add_argument("--distance-upper", type=float, required=True,
+                        help="Upper distance bound for floor highlighting")
     parser.add_argument("--floor-query", type=str, default="floor",
                         help="Floor semantic query (default: 'floor')")
     parser.add_argument("--background-alpha", type=float, default=0.3,
@@ -200,7 +204,8 @@ def main():
         visualize_distance_semantic(
             data,
             args.query,
-            args.distance_threshold,
+            args.distance_lower,
+            args.distance_upper,
             args.floor_query,
             args.background_alpha,
             args.threshold,
