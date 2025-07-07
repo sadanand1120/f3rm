@@ -118,37 +118,68 @@ def visualize_distance_semantic(
         floor_points = all_points[floor_mask]
         floor_indices = np.where(floor_mask)[0]
 
-        console.print(f"[yellow]Computing distances between {len(main_points):,} main points and {len(floor_points):,} floor points...")
+        console.print(f"[yellow]Original: {len(main_points):,} main points and {len(floor_points):,} floor points")
 
-        # Process in chunks to avoid memory issues
-        # Each chunk creates chunk_size × num_main_points float64 matrix
-        # Estimated memory: chunk_size × num_main_points × 8 bytes
-        min_distances = np.full(len(floor_points), np.inf)
+        # Downsample for faster computation
+        max_main_points = 10000  # Limit main points
+        max_floor_points = 50000  # Limit floor points
 
-        console.print(f"[yellow]Processing in chunks of {chunk_size:,} floor points (estimated {chunk_size * len(main_points) * 8 / (1024**3):.1f} GB per chunk)...")
+        if len(main_points) > max_main_points:
+            main_sample_indices = np.random.choice(len(main_points), max_main_points, replace=False)
+            main_points_sampled = main_points[main_sample_indices]
+            console.print(f"[cyan]Downsampled main points: {len(main_points):,} → {len(main_points_sampled):,}")
+        else:
+            main_points_sampled = main_points
 
-        for i in range(0, len(floor_points), chunk_size):
-            end_idx = min(i + chunk_size, len(floor_points))
-            chunk_floor_points = floor_points[i:end_idx]
+        if len(floor_points) > max_floor_points:
+            floor_sample_indices = np.random.choice(len(floor_points), max_floor_points, replace=False)
+            floor_points_sampled = floor_points[floor_sample_indices]
+            floor_indices_sampled = floor_indices[floor_sample_indices]
+            console.print(f"[cyan]Downsampled floor points: {len(floor_points):,} → {len(floor_points_sampled):,}")
+        else:
+            floor_points_sampled = floor_points
+            floor_indices_sampled = floor_indices
+
+        console.print(f"[yellow]Computing distances between {len(main_points_sampled):,} main points and {len(floor_points_sampled):,} floor points...")
+
+        # Process in smaller chunks with progress
+        chunk_size = min(chunk_size, 5000)  # Cap chunk size for speed
+        min_distances = np.full(len(floor_points_sampled), np.inf)
+
+        estimated_memory = chunk_size * len(main_points_sampled) * 8 / (1024**3)
+        console.print(f"[yellow]Processing in chunks of {chunk_size:,} floor points (estimated {estimated_memory:.1f} GB per chunk)...")
+
+        import time
+        start_time = time.time()
+        total_chunks = (len(floor_points_sampled) + chunk_size - 1) // chunk_size
+
+        for chunk_idx, i in enumerate(range(0, len(floor_points_sampled), chunk_size)):
+            end_idx = min(i + chunk_size, len(floor_points_sampled))
+            chunk_floor_points = floor_points_sampled[i:end_idx]
 
             # Compute distances for this chunk
-            chunk_distances = cdist(chunk_floor_points, main_points)
+            chunk_distances = cdist(chunk_floor_points, main_points_sampled)
             chunk_min_distances = chunk_distances.min(axis=1)
 
             # Store minimum distances
             min_distances[i:end_idx] = chunk_min_distances
 
-            if (i // chunk_size + 1) % 50 == 0:
-                console.print(f"[yellow]Processed {end_idx:,}/{len(floor_points):,} floor points...")
+            # Progress reporting
+            progress = (chunk_idx + 1) / total_chunks * 100
+            elapsed = time.time() - start_time
+            eta = elapsed / (chunk_idx + 1) * (total_chunks - chunk_idx - 1)
+            console.print(f"[yellow]Chunk {chunk_idx + 1}/{total_chunks} ({progress:.1f}%) - {end_idx:,}/{len(floor_points_sampled):,} points - ETA: {eta:.1f}s")
 
         # Find floor points within distance bounds
         near_floor_mask = (min_distances >= distance_lower) & (min_distances <= distance_upper)
-        near_floor_indices = floor_indices[near_floor_mask]
+        near_floor_indices = floor_indices_sampled[near_floor_mask]
 
         # Color near floor points in light green
         light_green = np.array([0.6, 1.0, 0.6])  # Light green
         combined_colors[near_floor_indices] = light_green
 
+        total_time = time.time() - start_time
+        console.print(f"[green]Distance computation completed in {total_time:.1f}s")
         console.print(f"[green]Highlighted {near_floor_mask.sum():,} floor points within distance bounds [{distance_lower:.3f}, {distance_upper:.3f}] in light green")
     else:
         console.print(f"[yellow]No valid points for distance computation")
