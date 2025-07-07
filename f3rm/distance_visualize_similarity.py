@@ -33,7 +33,9 @@ def visualize_distance_semantic(
     semantic_threshold: float = 0.502,
     softmax_temp: float = 1.0,
     save_result: bool = False,
-    chunk_size: int = 1000
+    chunk_size: int = 1000,
+    max_main_points: int = 10000,
+    max_floor_points: int = 50000
 ):
     """
     Visualize semantic similarity with distance-based floor highlighting.
@@ -49,6 +51,8 @@ def visualize_distance_semantic(
         softmax_temp: Softmax temperature
         save_result: Whether to save result
         chunk_size: Number of floor points to process per chunk (for memory management)
+        max_main_points: Maximum number of main query points to sample (for speed)
+        max_floor_points: Maximum number of floor points to sample (for speed)
     """
     console.print(f"[bold green]Distance-based semantic visualization:")
     console.print(f"  Main query: '{main_query}'")
@@ -89,28 +93,11 @@ def visualize_distance_semantic(
     console.print(f"[cyan]Main query '{main_query}': {main_mask.sum():,} points above threshold")
     console.print(f"[cyan]Floor query '{floor_query}': {floor_mask.sum():,} points above threshold")
 
-    # Start with RGB background (with transparency)
+    # Start with RGB background (with transparency) - no coloring of main query
     combined_points = all_points.copy()
     combined_colors = all_rgb_colors.copy() * background_alpha
 
-    # Apply main query heatmap to points above threshold
-    if main_mask.any():
-        main_sims = main_similarities[main_mask]
-
-        # Normalize similarities for colormap
-        sim_min, sim_max = main_sims.min(), main_sims.max()
-        if sim_max - sim_min > 1e-8:
-            sim_norm = (main_sims - sim_min) / (sim_max - sim_min)
-        else:
-            sim_norm = np.ones_like(main_sims) * 0.5
-
-        # Apply turbo colormap for main query
-        import matplotlib.pyplot as plt
-        cmap = plt.get_cmap("turbo")
-        heatmap_colors = cmap(sim_norm)[:, :3]
-        combined_colors[main_mask] = heatmap_colors
-
-        console.print(f"[green]Applied turbo heatmap to {main_mask.sum():,} points for '{main_query}'")
+    console.print(f"[green]Main query '{main_query}': {main_mask.sum():,} points (keeping original RGB colors)")
 
     # Find floor points within distance threshold of main query points
     if main_mask.any() and floor_mask.any():
@@ -121,8 +108,6 @@ def visualize_distance_semantic(
         console.print(f"[yellow]Original: {len(main_points):,} main points and {len(floor_points):,} floor points")
 
         # Downsample for faster computation
-        max_main_points = 10000  # Limit main points
-        max_floor_points = 50000  # Limit floor points
 
         if len(main_points) > max_main_points:
             main_sample_indices = np.random.choice(len(main_points), max_main_points, replace=False)
@@ -174,21 +159,13 @@ def visualize_distance_semantic(
         near_floor_mask = (min_distances >= distance_lower) & (min_distances <= distance_upper)
         near_floor_indices = floor_indices_sampled[near_floor_mask]
 
-        # Remove any overlap between main query and floor points to avoid color conflicts
-        near_floor_indices_clean = near_floor_indices[~np.isin(near_floor_indices, np.where(main_mask)[0])]
-
-        # Color near floor points in bright green (completely overriding RGB background)
+        # Color ALL floor points within distance bounds in bright green (no need to exclude overlaps now)
         bright_green = np.array([0.0, 1.0, 0.0])  # Pure bright green
-        combined_colors[near_floor_indices_clean] = bright_green
+        combined_colors[near_floor_indices] = bright_green
 
         total_time = time.time() - start_time
         console.print(f"[green]Distance computation completed in {total_time:.1f}s")
-        console.print(f"[green]Highlighted {len(near_floor_indices_clean):,} floor points (excluding overlaps) within distance bounds [{distance_lower:.3f}, {distance_upper:.3f}] in bright green")
-
-        # Report overlaps if any
-        num_overlaps = len(near_floor_indices) - len(near_floor_indices_clean)
-        if num_overlaps > 0:
-            console.print(f"[yellow]Excluded {num_overlaps:,} floor points that overlap with main query points")
+        console.print(f"[green]Highlighted {near_floor_mask.sum():,} floor points within distance bounds [{distance_lower:.3f}, {distance_upper:.3f}] in bright green")
     else:
         console.print(f"[yellow]No valid points for distance computation")
 
@@ -208,10 +185,9 @@ def visualize_distance_semantic(
 
     # Visualize
     console.print(f"[cyan]Legend:")
-    console.print(f"  Turbo heatmap (red/yellow/blue): '{main_query}' similarity")
+    console.print(f"  Original RGB: '{main_query}' objects (no special coloring)")
     console.print(f"  Bright green: '{floor_query}' within distance bounds [{distance_lower:.3f}, {distance_upper:.3f}]")
     console.print(f"  Transparent RGB: background context (alpha={background_alpha:.1f})")
-    console.print(f"  Note: Floor points overlapping with main query are excluded to avoid color conflicts")
 
     o3d.visualization.draw_geometries(
         [result_pcd, coord_frame],
@@ -245,6 +221,10 @@ def main():
                         help="Save visualization result")
     parser.add_argument("--chunk-size", type=int, default=1000,
                         help="Number of floor points to process per chunk for memory management (default: 1000)")
+    parser.add_argument("--max-main-points", type=int, default=10000,
+                        help="Maximum number of main query points to sample for speed (default: 10000)")
+    parser.add_argument("--max-floor-points", type=int, default=50000,
+                        help="Maximum number of floor points to sample for speed (default: 50000)")
 
     args = parser.parse_args()
 
@@ -272,7 +252,9 @@ def main():
             args.threshold,
             args.softmax_temp,
             args.save,
-            args.chunk_size
+            args.chunk_size,
+            args.max_main_points,
+            args.max_floor_points
         )
 
     except Exception as e:
