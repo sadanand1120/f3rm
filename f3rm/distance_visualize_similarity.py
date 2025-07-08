@@ -221,9 +221,9 @@ def main():
                         help="Save visualization result")
     parser.add_argument("--chunk-size", type=int, default=1000,
                         help="Number of floor points to process per chunk for memory management (default: 1000)")
-    parser.add_argument("--max-main-points", type=int, default=10000,
+    parser.add_argument("--max-main-points", type=int, default=100000,
                         help="Maximum number of main query points to sample for speed (default: 10000)")
-    parser.add_argument("--max-floor-points", type=int, default=50000,
+    parser.add_argument("--max-floor-points", type=int, default=500000,
                         help="Maximum number of floor points to sample for speed (default: 50000)")
 
     args = parser.parse_args()
