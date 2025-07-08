@@ -90,29 +90,85 @@ def generate_test_data(
     return data
 
 
-def precompute_5d_representations(points: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+# --- 5D Mapping and Distance Functions ---
+def map_xyz_to_5d_f(points: torch.Tensor) -> torch.Tensor:
     """
-    Precompute 5D representations for the dot trick.
-
-    For a 3D point p=(x,y,z):
-    f(p) = [x, y, z, ‖p‖², 1]
-    g(p) = [-2x, -2y, -2z, 1, ‖p‖²]
-
-    Then f(p) · g(q) = ‖p‖² + ‖q‖² - 2 p·q = ‖p - q‖²
+    Map 3D points to 5D f representation: [x, y, z, ||p||^2, 1]
     """
     if points.shape[1] != 3:
         raise ValueError("5D dot trick only works with 3D points")
-
     x, y, z = points[:, 0], points[:, 1], points[:, 2]
-    norm_sq = torch.sum(points**2, dim=1)
-
-    # f representation
+    norm_sq = torch.sum(points ** 2, dim=1)
     f_repr = torch.stack([x, y, z, norm_sq, torch.ones_like(x)], dim=1)
+    return f_repr
 
-    # g representation
+
+def map_xyz_to_5d_g(points: torch.Tensor) -> torch.Tensor:
+    """
+    Map 3D points to 5D g representation: [-2x, -2y, -2z, 1, ||p||^2]
+    """
+    if points.shape[1] != 3:
+        raise ValueError("5D dot trick only works with 3D points")
+    x, y, z = points[:, 0], points[:, 1], points[:, 2]
+    norm_sq = torch.sum(points ** 2, dim=1)
     g_repr = torch.stack([-2 * x, -2 * y, -2 * z, torch.ones_like(x), norm_sq], dim=1)
+    return g_repr
 
-    return f_repr, g_repr
+
+def compute_5d_distance_matrix(f_repr: torch.Tensor, g_repr: torch.Tensor) -> torch.Tensor:
+    """
+    Compute the distance matrix between 5D f and g representations.
+    Returns sqrt(clamp(g @ f.T, min=0)).
+    """
+    dist_sq = torch.mm(g_repr, f_repr.T)
+    dist = torch.sqrt(torch.clamp(dist_sq, min=0))
+    return dist
+
+# --- Refactored 5D dot trick methods ---
+
+
+def method_5d_dot_onthefly(main_points: torch.Tensor, floor_points: torch.Tensor, chunk_size: int = 1000, progress_update_fn=None, run_idx=0, num_runs=1, method_name='', device='', data_type='') -> float:
+    """Method 6: 5D dot trick with on-the-fly computation (mapping + distance)."""
+    start_time = time.time()
+    # Map main and floor points to 5D
+    main_f = map_xyz_to_5d_f(main_points)
+    min_distances = torch.full((len(floor_points),), float('inf'), device=floor_points.device)
+    total_chunks = (len(floor_points) + chunk_size - 1) // chunk_size
+    for chunk_idx, i in enumerate(range(0, len(floor_points), chunk_size)):
+        end_idx = min(i + chunk_size, len(floor_points))
+        chunk_floor = floor_points[i:end_idx]
+        chunk_floor_g = map_xyz_to_5d_g(chunk_floor)
+        chunk_distances = compute_5d_distance_matrix(main_f, chunk_floor_g)
+        chunk_min_distances = chunk_distances.min(dim=1)[0]
+        min_distances[i:end_idx] = chunk_min_distances
+        if progress_update_fn:
+            progress_update_fn(run_idx, num_runs, chunk_idx + 1, total_chunks, method_name, device, data_type)
+    if floor_points.device.type == 'cuda':
+        torch.cuda.synchronize()
+    return time.time() - start_time
+
+
+def method_5d_dot_precomputed(main_points: torch.Tensor, floor_points: torch.Tensor, chunk_size: int = 1000, progress_update_fn=None, run_idx=0, num_runs=1, method_name='', device='', data_type='') -> float:
+    """Method 5: 5D dot trick with precomputed mapping - ONLY times distance computation."""
+    # Do the mapping for main points (NOT timed)
+    main_f = map_xyz_to_5d_f(main_points)
+    min_distances = torch.full((len(floor_points),), float('inf'), device=floor_points.device)
+    total_chunks = (len(floor_points) + chunk_size - 1) // chunk_size
+
+    # START timing - ONLY distance computation
+    start_time = time.time()
+    for chunk_idx, i in enumerate(range(0, len(floor_points), chunk_size)):
+        end_idx = min(i + chunk_size, len(floor_points))
+        chunk_floor = floor_points[i:end_idx]
+        chunk_floor_g = map_xyz_to_5d_g(chunk_floor)
+        chunk_distances = compute_5d_distance_matrix(main_f, chunk_floor_g)
+        chunk_min_distances = chunk_distances.min(dim=1)[0]
+        min_distances[i:end_idx] = chunk_min_distances
+        if progress_update_fn:
+            progress_update_fn(run_idx, num_runs, chunk_idx + 1, total_chunks, method_name, device, data_type)
+    if floor_points.device.type == 'cuda':
+        torch.cuda.synchronize()
+    return time.time() - start_time
 
 
 def method_scipy_cdist(main_points: np.ndarray, floor_points: np.ndarray, chunk_size: int = 1000, progress_update_fn=None, run_idx=0, num_runs=1, method_name='', device='', data_type='') -> float:
@@ -210,170 +266,6 @@ def method_dot_product(main_points: torch.Tensor, floor_points: torch.Tensor, ch
     return time.time() - start_time
 
 
-def method_5d_dot_precomputed(main_f: torch.Tensor, floor_g: torch.Tensor, chunk_size: int = 1000, progress_update_fn=None, run_idx=0, num_runs=1, method_name='', device='', data_type='') -> float:
-    """Method 5: 5D dot trick with precomputed representations."""
-    start_time = time.time()
-
-    min_distances = torch.full((len(floor_g),), float('inf'), device=floor_g.device)
-    total_chunks = (len(floor_g) + chunk_size - 1) // chunk_size
-
-    for chunk_idx, i in enumerate(range(0, len(floor_g), chunk_size)):
-        end_idx = min(i + chunk_size, len(floor_g))
-        chunk_floor_g = floor_g[i:end_idx]
-
-        # Compute squared distances using dot product
-        chunk_distances_sq = torch.mm(chunk_floor_g, main_f.T)
-        chunk_distances = torch.sqrt(torch.clamp(chunk_distances_sq, min=0))
-        chunk_min_distances = chunk_distances.min(dim=1)[0]
-        min_distances[i:end_idx] = chunk_min_distances
-        if progress_update_fn:
-            progress_update_fn(run_idx, num_runs, chunk_idx + 1, total_chunks, method_name, device, data_type)
-
-    if floor_g.device.type == 'cuda':
-        torch.cuda.synchronize()
-
-    return time.time() - start_time
-
-
-def precompute_and_save_5d_representations(
-    main_points: torch.Tensor,
-    floor_points: torch.Tensor,
-    temp_dir: Path,
-    chunk_size: int = 10000
-) -> Tuple[Path, Path]:
-    """
-    Precompute and save 5D representations to disk for large datasets.
-    This function's execution time is NOT included in benchmarks.
-    """
-    temp_dir.mkdir(exist_ok=True)
-
-    # Precompute main points (f representation)
-    main_f, _ = precompute_5d_representations(main_points)
-    main_f_path = temp_dir / "main_f.npy"
-    np.save(main_f_path, main_f.cpu().numpy())
-
-    # Precompute floor points (g representation) in chunks and save
-    floor_g_path = temp_dir / "floor_g.npy"
-
-    # For very large datasets, process in chunks
-    if len(floor_points) > chunk_size:
-        # Create memory-mapped array for large datasets
-        floor_g_shape = (len(floor_points), 5)  # 5D representation
-        floor_g_mmap = np.memmap(floor_g_path, dtype=np.float32, mode='w+', shape=floor_g_shape)
-
-        for i in range(0, len(floor_points), chunk_size):
-            end_idx = min(i + chunk_size, len(floor_points))
-            chunk_floor = floor_points[i:end_idx]
-
-            _, chunk_floor_g = precompute_5d_representations(chunk_floor)
-            floor_g_mmap[i:end_idx] = chunk_floor_g.cpu().numpy()
-
-        # Force write to disk
-        del floor_g_mmap
-    else:
-        # Small dataset, process all at once
-        _, floor_g = precompute_5d_representations(floor_points)
-        np.save(floor_g_path, floor_g.cpu().numpy())
-
-    return main_f_path, floor_g_path
-
-
-def method_5d_dot_precomputed_from_disk(
-    main_f_path: Path,
-    floor_g_path: Path,
-    device: torch.device,
-    chunk_size: int = 1000,
-    load_chunk_size: int = 10000,
-    progress_update_fn=None,
-    run_idx=0,
-    num_runs=1,
-    method_name='',
-    device_str='',
-    data_type=''
-) -> float:
-    """
-    Method 5: 5D dot trick loading precomputed representations from disk.
-    Only the actual distance computation time is measured, not loading time.
-    """
-    # Load main_f (should be small enough to fit in memory)
-    main_f = torch.from_numpy(np.load(main_f_path)).to(device)
-
-    # Get floor_g size and shape
-    floor_g_mmap = np.memmap(floor_g_path, dtype=np.float32, mode='r')
-    total_floor_points = floor_g_mmap.shape[0] // 5
-
-    min_distances = torch.full((total_floor_points,), float('inf'), device=device)
-
-    # Start timing ONLY the distance computation
-    start_time = time.time()
-
-    # Process floor_g in chunks, loading from disk as needed
-    total_load_chunks = (total_floor_points + load_chunk_size - 1) // load_chunk_size
-    for load_chunk_idx, load_start in enumerate(range(0, total_floor_points, load_chunk_size)):
-        load_end = min(load_start + load_chunk_size, total_floor_points)
-        # Load chunk from disk and reshape to (chunk_size, 5)
-        pause_time = time.time()
-        chunk_flat = np.array(floor_g_mmap[load_start * 5:load_end * 5])
-        floor_g_chunk = torch.from_numpy(chunk_flat.reshape(-1, 5)).to(device)
-        start_time += (time.time() - pause_time)
-
-        # Process this loaded chunk in smaller computation chunks
-        total_chunks = (len(floor_g_chunk) + chunk_size - 1) // chunk_size
-        for chunk_idx, i in enumerate(range(0, len(floor_g_chunk), chunk_size)):
-            end_idx = min(i + chunk_size, len(floor_g_chunk))
-            chunk_floor_g = floor_g_chunk[i:end_idx]
-
-            # Compute squared distances using dot product
-            chunk_distances_sq = torch.mm(chunk_floor_g, main_f.T)
-            chunk_distances = torch.sqrt(torch.clamp(chunk_distances_sq, min=0))
-            chunk_min_distances = chunk_distances.min(dim=1)[0]
-
-            global_start_idx = load_start + i
-            global_end_idx = load_start + end_idx
-            min_distances[global_start_idx:global_end_idx] = chunk_min_distances
-            if progress_update_fn:
-                progress_update_fn(run_idx, num_runs, load_chunk_idx * total_chunks + chunk_idx + 1, total_load_chunks * total_chunks, method_name, device_str, data_type)
-
-        # Clear chunk from GPU memory
-        del floor_g_chunk
-        torch.cuda.empty_cache()
-    if device.type == 'cuda':
-        torch.cuda.synchronize()
-
-    return time.time() - start_time
-
-
-def method_5d_dot_onthefly(main_points: torch.Tensor, floor_points: torch.Tensor, chunk_size: int = 1000, progress_update_fn=None, run_idx=0, num_runs=1, method_name='', device='', data_type='') -> float:
-    """Method 6: 5D dot trick with on-the-fly computation."""
-    start_time = time.time()
-
-    # Precompute main points representation (f)
-    main_f, _ = precompute_5d_representations(main_points)
-
-    min_distances = torch.full((len(floor_points),), float('inf'), device=floor_points.device)
-    total_chunks = (len(floor_points) + chunk_size - 1) // chunk_size
-
-    for chunk_idx, i in enumerate(range(0, len(floor_points), chunk_size)):
-        end_idx = min(i + chunk_size, len(floor_points))
-        chunk_floor = floor_points[i:end_idx]
-
-        # Compute g representation for this chunk
-        _, chunk_floor_g = precompute_5d_representations(chunk_floor)
-
-        # Compute squared distances using dot product
-        chunk_distances_sq = torch.mm(chunk_floor_g, main_f.T)
-        chunk_distances = torch.sqrt(torch.clamp(chunk_distances_sq, min=0))
-        chunk_min_distances = chunk_distances.min(dim=1)[0]
-        min_distances[i:end_idx] = chunk_min_distances
-        if progress_update_fn:
-            progress_update_fn(run_idx, num_runs, chunk_idx + 1, total_chunks, method_name, device, data_type)
-
-    if floor_points.device.type == 'cuda':
-        torch.cuda.synchronize()
-
-    return time.time() - start_time
-
-
 def run_benchmarks(
     data: Dict[str, torch.Tensor],
     chunk_size: int = 1000,
@@ -457,14 +349,6 @@ def run_benchmarks(
                     continue
                 main_points = data[main_key]
                 floor_points = data[floor_key]
-                # For 5d_dot_precomputed, prepare disk storage (this time is NOT counted)
-                precomputed_paths = None
-                if method_name == "5d_dot_precomputed" and data_suffix == "3d":
-                    temp_dir = output_dir / f"temp_5d_{device.lower()}_{data_suffix}"
-                    console.print(f"[dim]Precomputing 5D representations for {method_name} {device} {data_type_name}...")
-                    precomputed_paths = precompute_and_save_5d_representations(
-                        main_points, floor_points, temp_dir, chunk_size=10000
-                    )
                 times = []
                 # --- Persistent method name in progress bar ---
                 persistent_desc = f"[cyan]{method_name} {device} {data_type_name}"
@@ -521,15 +405,13 @@ def run_benchmarks(
                                 data_type=data_type_name
                             )
                         elif method_name == "5d_dot_precomputed":
-                            main_f_path, floor_g_path = precomputed_paths
-                            device_obj = torch.device("cuda" if device_suffix == "gpu" else "cpu")
-                            elapsed = method_5d_dot_precomputed_from_disk(
-                                main_f_path, floor_g_path, device_obj, chunk_size, load_chunk_size=10000,
+                            elapsed = method_5d_dot_precomputed(
+                                main_points, floor_points, chunk_size,
                                 progress_update_fn=progress_update_fn,
                                 run_idx=run,
                                 num_runs=num_runs,
                                 method_name=method_name,
-                                device_str=device,
+                                device=device,
                                 data_type=data_type_name
                             )
                         elif method_name == "5d_dot_onthefly":
@@ -557,11 +439,7 @@ def run_benchmarks(
                     'Min_Time': np.min(times),
                     'Max_Time': np.max(times)
                 })
-                if method_name == "5d_dot_precomputed" and precomputed_paths is not None:
-                    temp_dir = output_dir / f"temp_5d_{device.lower()}_{data_suffix}"
-                    if temp_dir.exists():
-                        shutil.rmtree(temp_dir)
-                        console.print(f"[dim]Cleaned up temporary files for {method_name} {device} {data_type_name}")
+
                 global_progress.advance(task)
     return pd.DataFrame(results)
 
