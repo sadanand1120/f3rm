@@ -1,4 +1,4 @@
-conda create -n f3rm python=3.9 -y
+conda create -n f3rm python=3.10 -y
 conda activate f3rm
 conda install libffi==3.3 -y
 pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124 && pip install ninja git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch && pip3 install numpy==1.26.3
@@ -22,3 +22,5 @@ cp /robodata/smodak/repos/f3rm/nerfstudio_changes/record3d_utils.py /opt/minicon
 cp /robodata/smodak/repos/f3rm/nerfstudio_changes/hloc_utils.py /opt/miniconda3/envs/f3rm/lib/python3.9/site-packages/nerfstudio/process_data/
 cp /robodata/smodak/repos/f3rm/nerfstudio_changes/colmap_utils.py /opt/miniconda3/envs/f3rm/lib/python3.9/site-packages/nerfstudio/process_data/
 cp /robodata/smodak/repos/f3rm/nerfstudio_changes/base_model.py /opt/miniconda3/envs/f3rm/lib/python3.9/site-packages/nerfstudio/models/
+cd /robodata/smodak/repos/dinov2
+pip3 install -e '.[extras]' --extra-index-url https://download.pytorch.org/whl/cu124 --extra-index-url https://pypi.nvidia.com
