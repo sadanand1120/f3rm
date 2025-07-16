@@ -87,7 +87,6 @@ class NERFinterface:
             [0, 0, 1]
         ], dtype=np.float32)
 
-    @torch.inference_mode()
     def get_custom_camera_outputs(self, fx: float, fy: float, width: int, height: int, c2w: np.ndarray,
                                   cx: Optional[float] = None, cy: Optional[float] = None, cam_type: CameraType = CameraType.PERSPECTIVE, dist_params: Optional[list] = None,
                                   fars: Optional[float] = None, nears: Optional[float] = None, return_rays: bool = False) -> Cameras:

@@ -18,7 +18,7 @@ f3rm_method = MethodSpecification(
         max_num_iterations=30000,
         mixed_precision=True,
         # Seeding configuration - now with comprehensive support
-        enable_comprehensive_seeding=True,
+        enable_comprehensive_seeding=False,   # causing some issues with normals training, TODO: fix later
         seed_deterministic_algorithms=True,
         seed_warn_only=False,  # Set to True if you encounter issues with deterministic algorithms
         seed_cublas_workspace=True,
@@ -37,7 +37,7 @@ f3rm_method = MethodSpecification(
             # To support more GPUs, we reduce the num rays per chunk. The default was 1 << 15 which uses ~16GB of GPU
             # memory when training and using viewer. 1 << 14 uses ~12GB of GPU memory in comparison. The decrease in
             # rendering speed is not too important.
-            model=FeatureFieldModelConfig(eval_num_rays_per_chunk=1 << 14),
+            model=FeatureFieldModelConfig(eval_num_rays_per_chunk=1 << 14, predict_normals=True),
         ),
         optimizers={
             "proposal_networks": {

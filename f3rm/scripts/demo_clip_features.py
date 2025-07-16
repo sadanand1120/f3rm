@@ -48,6 +48,9 @@ def demo_clip_features(text_query: str) -> None:
         sim_norm = (sim - sim.min()) / (sim.max() - sim.min())
         heatmap = cmap(sim_norm.cpu().numpy())
         plt.imshow(heatmap)
+        # # Create a binary mask based on similarity threshold
+        # mask = (sim_norm > 0.501).cpu().numpy().astype(float)  # 1.0 for above threshold, 0.0 for below
+        # plt.imshow(mask, cmap="gray", vmin=0, vmax=1)
         plt.axis("off")
 
     plt.tight_layout()

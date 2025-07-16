@@ -293,7 +293,6 @@ class FeatureFieldModel(NerfactoModel):
             loss_dict["feature_loss"] = self.config.feat_loss_weight * F.mse_loss(outputs["feature"], target_feats)
         return loss_dict
 
-    @torch.no_grad()
     def get_outputs_for_camera_ray_bundle(self, camera_ray_bundle: RayBundle) -> Dict[str, torch.Tensor]:
         outputs = super().get_outputs_for_camera_ray_bundle(camera_ray_bundle)
 
