@@ -7,7 +7,7 @@ and caches them in shards at the exact same location and format as expected by
 the training pipeline. This allows pre-processing features independently of training.
 
 Usage:
-    python f3rm/scripts/extract_features_standalone.py \
+    python f3rm/features/extract_features_standalone.py \
         --data datasets/f3rm/custom/scene001 \
         --feature-type CLIP \
         --shard-size 64

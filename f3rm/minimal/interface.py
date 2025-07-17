@@ -25,12 +25,11 @@ class NERFinterface:
     def __init__(self, config_path: str, device: Optional[torch.device] = None):
         self.config_path = Path(config_path)
         self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        config, pipeline, *_ = self.eval_setup(config_path=self.config_path, test_mode="inference")
+        config, pipeline, *_ = self.eval_setup(config_path=self.config_path, test_mode="test")
         self.config = config
         self.pipeline = pipeline
         self.model = pipeline.model
 
-    @torch.inference_mode()
     def eval_setup(self, config_path: Path, eval_num_rays_per_chunk: Optional[int] = None, test_mode: Literal["test", "val", "inference"] = "test") -> Tuple[TrainerConfig, Pipeline, Path, int]:
         """Shared setup for loading a saved pipeline for evaluation. Modified from nerfstudio.utils.eval_utils.eval_setup.
         Args:

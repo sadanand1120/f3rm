@@ -53,14 +53,14 @@ line-length = 120
 f3rm = "f3rm.f3rm_config:f3rm_method"
 
 [project.scripts]
-f3rm-download-data = "f3rm.scripts.download_datasets:main"
+f3rm-download-data = "f3rm.utils.download_datasets:main"
 f3rm-optimize = "f3rm_robot.optimize:entrypoint"
 
 [tool.setuptools.packages]
 find = { include = ["f3rm", "f3rm.*", "f3rm_robot", "f3rm_robot.*"] }
 
 [tool.setuptools.package-data]
-"f3rm.scripts.images" = ["*.png"]  # images for demo CLIP and DINO features
+"f3rm.features.images" = ["*.png"]  # images for demo CLIP and DINO features
 "f3rm.features.clip" = ["bpe_simple_vocab_16e6.txt.gz", "README.md"]  # CLIP assets
 "f3rm_robot" = ["README.md"]
 "f3rm_robot.assets" = ["panda_gripper_visual.obj", "tasks/*.pt"]

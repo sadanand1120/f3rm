@@ -13,7 +13,7 @@ from nerfstudio.data.datamanagers.base_datamanager import (
 )
 from nerfstudio.utils.rich_utils import CONSOLE
 
-from f3rm.scripts.extract_features_standalone import (
+from f3rm.features.extract_features_standalone import (
     extract_features_for_dataset,
     LazyFeatures
 )

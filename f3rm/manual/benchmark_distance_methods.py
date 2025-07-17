@@ -13,7 +13,7 @@ This script benchmarks different distance calculation methods for pointcloud pro
 Tests both 3D coordinates and high-dimensional feature vectors.
 
 Usage:
-    python benchmark_distance_methods.py --num-main 10000 --num-floor 50000 --feature-dim 512
+    python f3rm/manual/benchmark_distance_methods.py --num-main 10000 --num-floor 50000 --feature-dim 512
 """
 
 import argparse

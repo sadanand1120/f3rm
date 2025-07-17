@@ -8,7 +8,7 @@ Integrates SAM2 instance segmentation with 3D axes annotation.
 3. Save both instance masks and axes annotations
 
 Usage:
-    python instance_axes_annotator.py --image_path /path/to/image.jpg
+    python f3rm/manual/instance_axes_annotator.py --image_path /path/to/image.jpg
 """
 
 import argparse
@@ -23,10 +23,7 @@ import math
 from scipy.spatial.distance import cdist
 
 # Import our SAM2 segmentation tool
-try:
-    from interactive_sam2_segmentation import InteractiveSAM2Segmenter, Colors, print_colored, print_status
-except:
-    from f3rm.manual.interactive_sam2_segmentation import InteractiveSAM2Segmenter, Colors, print_colored, print_status
+from f3rm.manual.interactive_sam2_segmentation import InteractiveSAM2Segmenter, Colors, print_colored, print_status
 
 
 class AxesAnnotator:

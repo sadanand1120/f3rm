@@ -6,7 +6,7 @@ This script exports pointclouds with RGB, features, and feature_PCA data from F3
 It samples points from the NeRF and extracts features and colors, saving them to optimized formats.
 
 Usage:
-    python export_feature_pointcloud.py --config path/to/config.yml --output-dir path/to/output/ --num-points 50000000
+    python f3rm/manual/export_feature_pointcloud.py --config path/to/config.yml --output-dir path/to/output/ --num-points 50000000
 """
 
 import argparse

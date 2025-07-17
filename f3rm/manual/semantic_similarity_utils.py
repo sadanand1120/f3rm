@@ -6,7 +6,7 @@ This module provides utility functions for open-vocabulary semantic similarity
 analysis on F3RM feature pointclouds, following the approach used in opt.py.
 
 Usage:
-    from f3rm.semantic_similarity_utils import SemanticPointcloudAnalyzer
+    from f3rm.manual.semantic_similarity_utils import SemanticPointcloudAnalyzer
     
     analyzer = SemanticPointcloudAnalyzer(features, points)
     similarities = analyzer.query_similarity("chair", negatives=["object"])
@@ -21,7 +21,7 @@ from rich.console import Console
 from sklearn.cluster import DBSCAN
 
 # Import the working SemanticSimilarityUtils class
-from f3rm.visualize_feature_pointcloud import SemanticSimilarityUtils
+from f3rm.manual.visualize_feature_pointcloud import SemanticSimilarityUtils
 
 console = Console()
 
@@ -34,7 +34,7 @@ class SemanticPointcloudAnalyzer:
     and spatial clustering based on CLIP features, following the approach
     demonstrated in opt.py.
 
-    This class wraps and extends the SemanticSimilarityUtils from visualize_feature_pointcloud.py
+    This class wraps and extends the SemanticSimilarityUtils from f3rm.manual.visualize_feature_pointcloud
     to avoid code duplication.
     """
 
@@ -56,7 +56,7 @@ class SemanticPointcloudAnalyzer:
         self.points = points
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Use the working SemanticSimilarityUtils from visualize_feature_pointcloud.py
+        # Use the working SemanticSimilarityUtils from f3rm.manual.visualize_feature_pointcloud
         self.semantic_utils = SemanticSimilarityUtils(device=self.device)
 
         # Cache for computed similarities
@@ -392,7 +392,7 @@ def demonstrate_semantic_analysis():
     console.print("\n[bold yellow]Example Usage:")
 
     example_code = '''
-from f3rm.semantic_similarity_utils import SemanticPointcloudAnalyzer
+from f3rm.manual.semantic_similarity_utils import SemanticPointcloudAnalyzer
 import numpy as np
 
 # Load your pointcloud data
@@ -433,7 +433,7 @@ analyzer.export_semantic_analysis(queries, "semantic_analysis.json", threshold=0
     console.print("• Multi-query comparison and analysis")
     console.print("• Spatial density and distribution analysis")
     console.print("• Comprehensive export for further analysis")
-    console.print("• Reuses working code from visualize_feature_pointcloud.py")
+    console.print("• Reuses working code from f3rm.manual.visualize_feature_pointcloud")
 
     console.print("\n[bold green]Integration with F3RM:")
     console.print("• Compatible with exported feature pointclouds")

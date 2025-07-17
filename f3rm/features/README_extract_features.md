@@ -28,23 +28,23 @@ To avoid code duplication and circular import issues, the architecture is design
 
 ```bash
 # Extract CLIP features
-python f3rm/scripts/extract_features_standalone.py \
+python f3rm/features/extract_features_standalone.py \
     --data datasets/f3rm/custom/scene001 \
     --feature-type CLIP
 
 # Extract DINO features with custom shard size
-python f3rm/scripts/extract_features_standalone.py \
+python f3rm/features/extract_features_standalone.py \
     --data datasets/f3rm/custom/scene001 \
     --feature-type DINO \
     --shard-size 32
 
 # Extract both DINO and CLIP for DINOCLIP training
-python f3rm/scripts/extract_features_standalone.py \
+python f3rm/features/extract_features_standalone.py \
     --data datasets/f3rm/custom/scene001 \
     --feature-type DINOCLIP
 
 # Force re-extraction even if cache exists
-python f3rm/scripts/extract_features_standalone.py \
+python f3rm/features/extract_features_standalone.py \
     --data datasets/f3rm/custom/scene001 \
     --feature-type CLIP \
     --force

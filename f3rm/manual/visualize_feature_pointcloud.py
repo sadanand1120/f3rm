@@ -8,9 +8,9 @@ This script provides visualization of F3RM pointclouds with:
 - Simple and reliable Open3D visualization
 
 Usage:
-    python visualize_feature_pointcloud.py --data-dir path/to/exported/pointcloud/ --mode rgb
-    python visualize_feature_pointcloud.py --data-dir path/to/exported/pointcloud/ --mode pca
-    python visualize_feature_pointcloud.py --data-dir path/to/exported/pointcloud/ --mode semantic --query "chair"
+    python f3rm/manual/visualize_feature_pointcloud.py --data-dir path/to/exported/pointcloud/ --mode rgb
+    python f3rm/manual/visualize_feature_pointcloud.py --data-dir path/to/exported/pointcloud/ --mode pca
+    python f3rm/manual/visualize_feature_pointcloud.py --data-dir path/to/exported/pointcloud/ --mode semantic --query "chair"
 """
 
 import argparse

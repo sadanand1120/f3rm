@@ -11,7 +11,7 @@ export HLOC_WORKERS=24 && export CUDA_VISIBLE_DEVICES='0' && export HLOC_LOG_LEV
 
 
 
-export CUDA_VISIBLE_DEVICES='3' && python3 f3rm/scripts/extract_features_standalone.py --data datasets/f3rm/custom/ahglabentry --feature-type CLIP
+export CUDA_VISIBLE_DEVICES='3' && python3 f3rm/features/extract_features_standalone.py --data datasets/f3rm/custom/ahglabentry --feature-type CLIP
 
 
 

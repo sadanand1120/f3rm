@@ -6,7 +6,7 @@ This script renders feature and feature_pca videos from camera paths,
 ensuring consistent PCA visualization across all frames.
 
 Usage:
-    python render_feature_video.py --config path/to/config.yml --camera-path path/to/camera_path.json --output path/to/output.mp4 --render-type feature_pca
+    python f3rm/manual/render_feature_video.py --config path/to/config.yml --camera-path path/to/camera_path.json --output path/to/output.mp4 --render-type feature_pca
 """
 
 import argparse

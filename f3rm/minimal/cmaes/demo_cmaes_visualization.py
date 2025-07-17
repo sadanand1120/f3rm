@@ -8,9 +8,9 @@ Simple example that runs optimization on one factory and creates animated plot.
 import numpy as np
 
 # Repo-specific imports
-from f3rm.minimal.parallel_cmaes import (cma_es_optimize, RastriginFactory, SchafferFactory,
-                                         ToyFactory, DiscreteCircleFactory)
-from f3rm.minimal.visualize_cmaes import visualize_optimization
+from f3rm.minimal.cmaes.parallel_cmaes import (cma_es_optimize, RastriginFactory, SchafferFactory,
+                                               ToyFactory, DiscreteCircleFactory)
+from f3rm.minimal.cmaes.visualize_cmaes import visualize_optimization
 
 if __name__ == "__main__":
     # Choose factory class to run - just change this line to try different functions!

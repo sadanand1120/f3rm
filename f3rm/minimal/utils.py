@@ -159,7 +159,7 @@ def compute_similarity_text2vis(img_patch_descriptors, text_embeddings, has_nega
 
 
 if __name__ == "__main__":
-    image_path = "/robodata/smodak/repos/f3rm/f3rm/scripts/images/frame_1.png"
+    image_path = "/robodata/smodak/repos/f3rm/f3rm/features/images/frame_1.png"
     descriptors = extract_clip_features([image_path], device=torch.device("cuda"), verbose=True).cpu().squeeze()  # (h, w, c)
     descriptors_flat = rearrange(descriptors, "h w c -> (h w) c")  # (h * w, c)
     projected_tokens = run_pca(descriptors_flat, n_components=3)  # (h * w, 3)

@@ -15,7 +15,7 @@ from PIL import Image
 from f3rm.features.clip_extract import CLIPArgs, extract_clip_features
 from f3rm.minimal.homography import Homography
 from f3rm.minimal.interface import NERFinterface
-from f3rm.minimal.parallel_cmaes import cma_es_optimize
+from f3rm.minimal.cmaes.parallel_cmaes import cma_es_optimize
 from f3rm.minimal.utils import (cluster_xyz, compute_similarity_text2vis,
                                 exp_to_homo_T, homo_T_to_exp, run_pca,
                                 se3_distance, viz_pca3)

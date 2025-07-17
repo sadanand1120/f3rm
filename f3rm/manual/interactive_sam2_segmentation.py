@@ -10,7 +10,7 @@ Allows users to interactively select points on an image for segmentation using S
 - Press 'u': Undo last point
 
 Usage:
-    python interactive_sam2_segmentation.py --image_path /path/to/image.jpg
+    python f3rm/manual/interactive_sam2_segmentation.py --image_path /path/to/image.jpg
 """
 
 import argparse

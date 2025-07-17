@@ -5,12 +5,12 @@ F3RM Pointcloud Alignment Tool
 This script provides interactive alignment of F3RM pointclouds with coordinate axes,
 and interactive bounding box filtering with visual feedback.
 
-Use this after export_feature_pointcloud.py and before visualize_feature_pointcloud.py
+Use this after f3rm/manual/export_feature_pointcloud.py and before f3rm/manual/visualize_feature_pointcloud.py
 to properly align your pointcloud with the coordinate system and/or filter out unwanted regions.
 
 Usage:
-    python align_pointcloud.py --data-dir exports/pointcloud_data/ --mode align
-    python align_pointcloud.py --data-dir exports/pointcloud_data/ --mode filter
+    python f3rm/manual/align_pointcloud.py --data-dir exports/pointcloud_data/ --mode align
+    python f3rm/manual/align_pointcloud.py --data-dir exports/pointcloud_data/ --mode filter
 
 Align Mode Controls:
     - Mouse: Normal Open3D viewing controls (camera only)
@@ -48,7 +48,7 @@ import torch
 from rich.console import Console
 
 # Import reference geometry functions from visualize script
-from f3rm.visualize_feature_pointcloud import (
+from f3rm.manual.visualize_feature_pointcloud import (
     FeaturePointcloudData,
     create_coordinate_frame,
     create_bounding_box_lines,
@@ -843,7 +843,7 @@ def main():
         return
 
     if not (args.data_dir / "metadata.json").exists():
-        console.print(f"[bold red]No metadata.json found. Run export_feature_pointcloud.py first.")
+        console.print(f"[bold red]No metadata.json found. Run f3rm/manual/export_feature_pointcloud.py first.")
         return
 
     # Check for required files
@@ -855,7 +855,7 @@ def main():
 
     if missing_files:
         console.print(f"[bold red]Missing required files: {', '.join(missing_files)}")
-        console.print("[bold red]Run export_feature_pointcloud.py first to generate all required files.")
+        console.print("[bold red]Run f3rm/manual/export_feature_pointcloud.py first to generate all required files.")
         return
 
     try:

@@ -210,11 +210,11 @@ feature field.
 We provide scripts to demonstrate how to extract CLIP and DINO features from their respective vision models. You can
 use these features for your own NeRF pipeline or for other downstream applications.
 
-- Run `python f3rm/scripts/demo_extract_features.py` for a general demo on how to extract CLIP and DINO features.
+- Run `python f3rm/features/demo_extract_features.py` for a general demo on how to extract CLIP and DINO features.
   This will create a plot showing the PCA of the CLIP and DINO features. The plot is saved
   to `demo_extract_features.png`.
 - For details on how to extract CLIP features and compare the extracted features with CLIP text embeddings, run
-  `python f3rm/scripts/demo_clip_features.py`. This script will create a plot showing the similarity heatmaps for a
+  `python f3rm/features/demo_clip_features.py`. This script will create a plot showing the similarity heatmaps for a
   given
   text query, and will save a plot to `demo_clip_features-{text_query}.png`.
 

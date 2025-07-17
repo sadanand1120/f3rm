@@ -18,7 +18,7 @@ The tools consist of four main components:
 Export a pointcloud from your trained F3RM model with bounding box filtering to remove outliers:
 
 ```bash
-python export_feature_pointcloud.py \
+python f3rm/manual/export_feature_pointcloud.py \
     --config outputs/sittingroom/f3rm/2025-04-07_123618/config.yml \
     --output-dir exports/sitting_pcd_features/ \
     --num-points 1000000 \
@@ -33,10 +33,10 @@ python export_feature_pointcloud.py \
 Interactively align your pointcloud with the coordinate system for better visualization:
 
 ```bash
-python align_pointcloud.py --data-dir exports/sitting_pcd_features/
+python f3rm/manual/align_pointcloud.py --data-dir exports/sitting_pcd_features/
 
 # With custom step sizes for finer control
-python align_pointcloud.py \
+python f3rm/manual/align_pointcloud.py \
     --data-dir exports/sitting_pcd_features/ \
     --rotation-step 5.0 \
     --translation-step 0.05
@@ -71,13 +71,13 @@ Visualize with direct control (following opt.py approach):
 
 ```bash
 # RGB mode with coordinate guides
-python visualize_feature_pointcloud.py --data-dir exports/sitting_pcd_features/ --mode rgb
+python f3rm/manual/visualize_feature_pointcloud.py --data-dir exports/sitting_pcd_features/ --mode rgb
 
 # PCA mode without guides
-python visualize_feature_pointcloud.py --data-dir exports/sitting_pcd_features/ --mode pca --no-guides
+python f3rm/manual/visualize_feature_pointcloud.py --data-dir exports/sitting_pcd_features/ --mode pca --no-guides
 
 # Semantic mode with direct threshold control (like opt.py)
-python visualize_feature_pointcloud.py \
+python f3rm/manual/visualize_feature_pointcloud.py \
     --data-dir exports/sitting_pcd_features/ \
     --mode semantic \
     --query "magazine" \
@@ -95,7 +95,7 @@ The visualizer supports two types of filtering that work in any mode:
 **1. Bounding Box Filtering:**
 ```bash
 # Only show points within a specific region
-python visualize_feature_pointcloud.py \
+python f3rm/manual/visualize_feature_pointcloud.py \
     --data-dir exports/data \
     --mode rgb \
     --bbox-filter-min -0.5 -0.5 0.0 \
@@ -105,7 +105,7 @@ python visualize_feature_pointcloud.py \
 **2. Semantic Filtering:**
 ```bash
 # Filter OUT floor points (remove floor, show everything else)
-python visualize_feature_pointcloud.py \
+python f3rm/manual/visualize_feature_pointcloud.py \
     --data-dir exports/data \
     --mode rgb \
     --semantic-filter-query "floor" \
@@ -113,7 +113,7 @@ python visualize_feature_pointcloud.py \
     --semantic-threshold 0.6
 
 # Filter IN only chair points (show only chairs)
-python visualize_feature_pointcloud.py \
+python f3rm/manual/visualize_feature_pointcloud.py \
     --data-dir exports/data \
     --mode pca \
     --semantic-filter-query "chair" \
@@ -124,7 +124,7 @@ python visualize_feature_pointcloud.py \
 **3. Combined Filtering:**
 ```bash
 # Show only chairs in a specific region, without floor
-python visualize_feature_pointcloud.py \
+python f3rm/manual/visualize_feature_pointcloud.py \
     --data-dir exports/data \
     --mode semantic \
     --query "cushion" \
@@ -148,17 +148,17 @@ The recommended workflow is:
 
 ```bash
 # Step 1: Export pointcloud with features
-python export_feature_pointcloud.py \
+python f3rm/manual/export_feature_pointcloud.py \
     --config outputs/scene/f3rm/config.yml \
     --output-dir exports/scene_pcd \
     --num-points 1000000
 
 # Step 2: Align pointcloud with coordinate system
-python align_pointcloud.py --data-dir exports/scene_pcd
+python f3rm/manual/align_pointcloud.py --data-dir exports/scene_pcd
 
 # Step 3: Visualize and analyze
-python visualize_feature_pointcloud.py --data-dir exports/scene_pcd --mode rgb
-python visualize_feature_pointcloud.py --data-dir exports/scene_pcd --mode semantic --query "chair"
+python f3rm/manual/visualize_feature_pointcloud.py --data-dir exports/scene_pcd --mode rgb
+python f3rm/manual/visualize_feature_pointcloud.py --data-dir exports/scene_pcd --mode semantic --query "chair"
 ```
 
 This creates:
@@ -174,7 +174,7 @@ This creates:
 Use the semantic similarity utilities for programmatic analysis:
 
 ```python
-from f3rm.semantic_similarity_utils import SemanticPointcloudAnalyzer
+from f3rm.manual.semantic_similarity_utils import SemanticPointcloudAnalyzer
 import numpy as np
 
 # Load exported data (automatically uses aligned data if available)
@@ -202,7 +202,7 @@ for i, cluster in enumerate(clusters):
 The export script provides bounding box filtering to remove outliers:
 
 ```bash
-python export_feature_pointcloud.py \
+python f3rm/manual/export_feature_pointcloud.py \
     --config path/to/config.yml \
     --output-dir path/to/output/ \
     --num-points 50000000 \           # Number of points to sample
@@ -295,19 +295,19 @@ exports/sitting_pcd_features/
 
 ```bash
 # 1. Export with bounding box filtering
-python export_feature_pointcloud.py \
+python f3rm/manual/export_feature_pointcloud.py \
     --config outputs/scene/f3rm/config.yml \
     --output-dir exports/scene_pcd \
     --bbox-min -1 -1 -1 --bbox-max 1 1 1
 
 # 2. Visualize RGB with guides
-python visualize_feature_pointcloud.py --data-dir exports/scene_pcd --mode rgb
+python f3rm/manual/visualize_feature_pointcloud.py --data-dir exports/scene_pcd --mode rgb
 
 # 3. Visualize PCA features  
-python visualize_feature_pointcloud.py --data-dir exports/scene_pcd --mode pca
+python f3rm/manual/visualize_feature_pointcloud.py --data-dir exports/scene_pcd --mode pca
 
 # 4. Semantic query (following opt.py approach)
-python visualize_feature_pointcloud.py \
+python f3rm/manual/visualize_feature_pointcloud.py \
     --data-dir exports/scene_pcd --mode semantic \
     --query "magazine" --threshold 0.502 --softmax-temp 1.0
 ```
@@ -317,7 +317,7 @@ python visualize_feature_pointcloud.py \
 ```python
 # Load data
 import numpy as np
-from f3rm.semantic_similarity_utils import SemanticPointcloudAnalyzer
+from f3rm.manual.semantic_similarity_utils import SemanticPointcloudAnalyzer
 
 points = np.load("exports/scene_pcd/points.npy")
 features = np.load("exports/scene_pcd/features_float16.npy")

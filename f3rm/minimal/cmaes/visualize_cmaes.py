@@ -20,7 +20,7 @@ from tqdm.auto import tqdm
 
 # Repo-specific imports
 from f3rm.minimal.opt import NERFOpt
-from f3rm.minimal.parallel_cmaes import (SchafferFactory, ToyFactory,
+from f3rm.minimal.cmaes.parallel_cmaes import (SchafferFactory, ToyFactory,
                                          RastriginFactory, HeavyFactory, DiscreteCircleFactory)
 
 

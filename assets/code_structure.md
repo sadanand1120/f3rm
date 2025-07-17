@@ -13,10 +13,10 @@ The F3RM codebase is split into two modules:
       aspect ratio as the input images.
     - See [`clip_extract.py`](/f3rm/features/clip_extract.py) and [`dino_extract.py`](/f3rm/features/dino_extract.py)
       for the main entrypoints.
-- [`scripts/`](/f3rm/scripts)
-    - Demo scripts for extracting CLIP and DINO features ([`demo_clip_features.py`](/f3rm/scripts/demo_clip_features.py)
-      and [`demo_extract_features.py`](/f3rm/scripts/demo_extract_features.py)).
-    - Script for downloading example datasets ([`download_datasets.py`](/f3rm/scripts/download_datasets.py)).
+    - Demo scripts for extracting CLIP and DINO features ([`demo_clip_features.py`](/f3rm/features/demo_clip_features.py)
+      and [`demo_extract_features.py`](/f3rm/features/demo_extract_features.py)).
+- [`utils/`](/f3rm/utils)
+    - Script for downloading example datasets ([`download_datasets.py`](/f3rm/utils/download_datasets.py)).
 - [`f3rm_config.py`](/f3rm/f3rm_config.py)
     - Nerfstudio method configuration for F3RM. This allows `f3rm` to show up as a method in `ns-train`.
 - [`feature_datamanager.py`](/f3rm/feature_datamanager.py)

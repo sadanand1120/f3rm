@@ -7,7 +7,7 @@ Shows a semantic query (e.g., "chair") as a heatmap with RGB background,
 and highlights floor points within a distance threshold in light green.
 
 Usage:
-    python distance_visualize_similarity.py --data-dir path/to/exported/pointcloud/ \
+    python f3rm/manual/distance_visualize_similarity.py --data-dir path/to/exported/pointcloud/ \
         --query "chair" --distance-lower 0.0 --distance-upper 0.5
 """
 
@@ -18,7 +18,7 @@ import open3d as o3d
 from rich.console import Console
 from scipy.spatial.distance import cdist
 
-from f3rm.visualize_feature_pointcloud import FeaturePointcloudData, SemanticSimilarityUtils
+from f3rm.manual.visualize_feature_pointcloud import FeaturePointcloudData, SemanticSimilarityUtils
 
 console = Console()
 
