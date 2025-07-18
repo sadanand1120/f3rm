@@ -9,5 +9,6 @@ allowed-local-media-path: /robodata/smodak
 tensor-parallel-size: 1
 data-parallel-size: 1
 gpu-memory-utilization: 0.95
-
-#limit-mm-per-prompt: '{"image":4}'
+max-model-len: 16K  # if actual prompt is longer -> errors out, so no silent fallback!
+# max-num-seqs: 8   # if OOM
+# limit-mm-per-prompt: '{"image":4}'

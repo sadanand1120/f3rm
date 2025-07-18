@@ -6,6 +6,7 @@ Requires: pip install openai
 import os
 import openai
 import json
+import yaml
 
 
 def chat_completion(model, messages, base_url=None, api_key=None, **kwargs):
@@ -44,12 +45,9 @@ def chat_completion(model, messages, base_url=None, api_key=None, **kwargs):
 
 
 if __name__ == "__main__":
-    # Load server configurations from servers.json
-    servers_json_path = "servers.json"
-    with open(servers_json_path, 'r') as f:
-        servers = json.load(f)
-    # Available options: openai-gpt4o, internvl3, llama3.1, llama3.2V
-    SELECT = "openai-gpt4o"  # Change this to switch server
+    with open("servers.yaml", "r") as f:
+        servers = yaml.safe_load(f)
+    SELECT = "openai-gpt4o"
     selected_server = servers[SELECT]
 
     messages = [

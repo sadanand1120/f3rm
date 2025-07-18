@@ -18,6 +18,7 @@ import openai
 from PIL import Image
 import requests
 import json
+import yaml
 
 
 def image_url_payload(url: str) -> Dict[str, Any]:
@@ -79,10 +80,8 @@ def chat_completion_multimodal(
 
 
 if __name__ == "__main__":
-    # Load server configurations from servers.json
-    servers_json_path = "servers.json"
-    with open(servers_json_path, 'r') as f:
-        servers = json.load(f)
+    with open("servers.yaml", "r") as f:
+        servers = yaml.safe_load(f)
     SELECT = "internvl3"
     selected_server = servers[SELECT]
 
@@ -155,7 +154,7 @@ if __name__ == "__main__":
             messages_img_file = [
                 {"role": "user", "content": [
                     {"type": "text",
-                        "text": "What's in this image? Point out any axes if you see them and point out what's their direction they are pointing to wrt to the object. Remember the convention of axes colors. Is the x-axes aligned PERFECTLY wrt to the front direction (if any) semantically of the object? If not, what corrective rotation is needed to align -- ie, rotate about which axis?"},
+                        "text": "What's in this image? Point out any axes if you see them and point out what's their direction they are pointing to wrt to the object. Remember the convention of axes colors, ie, RGB for x,y,z axes in that order. Is the x-axes aligned PERFECTLY wrt to the front direction (if any) semantically of the object? If not, what corrective rotation is needed to align -- ie, rotate about which axis?"},
                     image_file_payload(local_path),
                 ]}
             ]
