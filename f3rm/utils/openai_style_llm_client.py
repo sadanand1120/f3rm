@@ -65,7 +65,7 @@ if __name__ == "__main__":
             model="meta-llama/Llama-3.1-8B-Instruct",
             messages=messages,
             base_url="http://10.0.0.212:8001/v1",  # use diff ports for serving models, to avoid bugs
-            api_key="sm-gen-llm-textonly",
+            api_key="smgen",
             temperature=0.7,
         )
         print(response.choices[0].message.content)

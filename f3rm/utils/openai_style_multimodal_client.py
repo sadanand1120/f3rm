@@ -86,9 +86,9 @@ if __name__ == "__main__":
             "model": "gpt-4o",
         },
         "custom": {
-            "base_url": "http://10.0.0.212:8000/v1",
-            "api_key": "sm-gen-mllm",
-            "model": "OpenGVLab/InternVL3-8B",
+            "base_url": "http://10.0.0.212:8004/v1",
+            "api_key": "smgen",
+            "model": "OpenGVLab/InternVL3-38B",
         }
     }
 
@@ -158,12 +158,12 @@ if __name__ == "__main__":
 
     # Text + local file path (server must allow file://)
     print("--- Text + local file path ---")
-    local_path = "/robodata/smodak/repos/f3rm/f3rm/features/images/frame_1.png"
+    local_path = "/robodata/smodak/repos/f3rm/f3rm/utils/test_axes.png"
     if selected_server["base_url"] is not None and selected_server["base_url"].rstrip("/") != "https://api.openai.com/v1":
         try:
             messages_img_file = [
                 {"role": "user", "content": [
-                    {"type": "text", "text": "What's in this image?"},
+                    {"type": "text", "text": "What's in this image? Point out any axes if you see them and point out what's their direction they are pointing to wrt to the object. Remember the convention of axes colors. Is the x-axes aligned PERFECTLY wrt to the front direction (if any) semantically of the object? If not, what corrective rotation is needed to align -- ie, rotate about which axis?"},
                     image_file_payload(local_path),
                 ]}
             ]

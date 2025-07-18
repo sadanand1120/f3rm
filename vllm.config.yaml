@@ -1,0 +1,13 @@
+model: OpenGVLab/InternVL3-8B
+port: 8000
+
+api-key: smgen
+task: generate
+trust-remote-code: true
+dtype: auto
+allowed-local-media-path: /robodata/smodak
+tensor-parallel-size: 1
+data-parallel-size: 1
+gpu-memory-utilization: 0.95
+
+#limit-mm-per-prompt: '{"image":4}'
