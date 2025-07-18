@@ -1,0 +1,298 @@
+# Top-level options
+headless: false
+  # Run in headless mode. See multi-node data parallel documentation for more details.
+data-parallel-start-rank: 0  # Starting data parallel rank for secondary nodes. Requires --headless.
+api-server-count: 1  # How many API server processes to run.
+config: null
+  # Read CLI options from a config file. Must be a YAML with the following options: https://docs.vllm.ai/en/latest/configuration/serve_args.html
+use-v2-block-manager: true
+  # [DEPRECATED] block manager v1 has been removed and SelfAttnBlockSpaceManager (i.e. block manager v2) is now the default. Setting this flag to True or False has no effect on vLLM behavior.
+disable-log-stats: false  # Disable logging statistics.
+disable-log-requests: false  # Disable logging requests.
+
+# Frontend
+host: null  # Host name.
+port: 8000  # Port number.
+uvicorn-log-level: info
+  # Possible choices: critical , debug , error , info , trace , warning Log level for uvicorn.
+disable-uvicorn-access-log: false  # Disable uvicorn access log.
+allow-credentials: false  # Allow credentials.
+allowed-origins: - '*'  # Allowed origins.
+allowed-methods: - '*'  # Allowed methods.
+allowed-headers: - '*'  # Allowed headers.
+api-key: null  # If provided, the server will require this key to be presented in the header.
+lora-modules: null
+  # LoRA modules configurations in either 'name=path' format or JSON format or JSON list format. Example (old format): 'name=path' Example (new format): {"name": "name", "path": "lora_path", "base_model_name": "id"}
+prompt-adapters: null
+  # Prompt adapter configurations in the format name=path. Multiple adapters can be specified.
+chat-template: null
+  # The file path to the chat template, or the template in single-line form for the specified model.
+chat-template-content-format: auto
+  # Possible choices: auto , openai , string The format to render message content within a chat template. "string" will render the content as a string. Example: "Hello World" "openai" will render the content as a list of dictionaries, similar to OpenAI schema. Example: [{"type": "text", "text": "Hello world!"}]
+response-role: assistant  # The role name to return if request.add_generation_prompt=true .
+ssl-keyfile: null  # The file path to the SSL key file.
+ssl-certfile: null  # The file path to the SSL cert file.
+ssl-ca-certs: null  # The CA certificates file.
+enable-ssl-refresh: false  # Refresh SSL Context when SSL certificate files change
+ssl-cert-reqs: 0  # Whether client certificate is required (see stdlib ssl module's).
+root-path: null  # FastAPI root_path when app is behind a path based routing proxy.
+middleware: []
+  # Additional ASGI middleware to apply to the app. We accept multiple --middleware arguments. The value should be an import path. If a function is provided, vLLM will add it to the server using @app.middleware('http') . If a class is provided, vLLM will add it to the server using app.add_middleware() .
+return-tokens-as-token-ids: false
+  # When --max-logprobs is specified, represents single tokens as strings of the form 'token_id:{token_id}' so that tokens that are not JSON-encodable can be identified.
+disable-frontend-multiprocessing: false
+  # If specified, will run the OpenAI frontend server in the same process as the model serving engine.
+enable-request-id-headers: false
+  # If specified, API server will add X-Request-Id header to responses. Caution: this hurts performance at high QPS.
+enable-auto-tool-choice: false
+  # Enable auto tool choice for supported models. Use --tool-call-parser to specify which parser to use.
+tool-call-parser: null
+  # Possible choices: deepseek_v3 , granite-20b-fc , granite , hermes , hunyuan_a13b , internlm , jamba , kimi_k2 , llama4_pythonic , llama4_json , llama3_json , minimax , mistral , phi4_mini_json , pythonic , xlam Select the tool call parser depending on the model that you're using. This is used to parse the model-generated tool call into OpenAI API format. Required for --enable-auto-tool-choice . You can choose any option from the built-in parsers or register a plugin via --tool-parser-plugin .
+tool-parser-plugin: null
+  # Special the tool parser plugin write to parse the model-generated tool into OpenAI API format, the name register in this plugin can be used in --tool-call-parser .
+log-config-file: null  # Path to logging config JSON file for both vllm and uvicorn
+max-log-len: null
+  # Max number of prompt characters or prompt ID numbers being printed in log. The default of None means unlimited.
+disable-fastapi-docs: false  # Disable FastAPI's OpenAPI schema, Swagger UI, and ReDoc endpoint.
+enable-prompt-tokens-details: false  # If set to True, enable prompt_tokens_details in usage.
+enable-server-load-tracking: false  # If set to True, enable tracking server_load_metrics in the app state.
+enable-force-include-usage: false  # If set to True, including usage on every request.
+enable-tokenizer-info-endpoint: false
+  # Enable the /get_tokenizer_info endpoint. May expose chat templates and other tokenizer configuration.
+
+# ModelConfig
+model: Qwen/Qwen3-0.6B
+  # Name or path of the Hugging Face model to use. It is also used as the content for model_name tag in metrics output when served_model_name is not specified.
+task: auto
+  # Possible choices: auto , classify , draft , embed , embedding , generate , reward , score , transcription The task to use the model for. If the model supports more than one model runner, this is used to select which model runner to run. Note that the model may support other tasks using the same model runner.
+tokenizer: null
+  # Name or path of the Hugging Face tokenizer to use. If unspecified, model name or path will be used.
+tokenizer-mode: auto
+  # Possible choices: auto , custom , mistral , slow Tokenizer mode: "auto" will use the fast tokenizer if available. "slow" will always use the slow tokenizer. "mistral" will always use the tokenizer from mistral_common . "custom" will use --tokenizer to select the preregistered tokenizer.
+trust-remote-code: false
+  # Trust remote code (e.g., from HuggingFace) when downloading the model and tokenizer.
+dtype: auto
+  # Possible choices: auto , bfloat16 , float , float16 , float32 , half Data type for model weights and activations: "auto" will use FP16 precision for FP32 and FP16 models, and BF16 precision for BF16 models. "half" for FP16. Recommended for AWQ quantization. "float16" is the same as "half". "bfloat16" for a balance between precision and range. "float" is shorthand for FP32 precision. "float32" for FP32 precision.
+seed: null
+  # Random seed for reproducibility. Initialized to None in V0, but initialized to 0 in V1.
+hf-config-path: null
+  # Name or path of the Hugging Face config to use. If unspecified, model name or path will be used.
+allowed-local-media-path: null
+  # Allowing API requests to read local images or videos from directories specified by the server file system. This is a security risk. Should only be enabled in trusted environments.
+revision: null
+  # The specific model version to use. It can be a branch name, a tag name, or a commit id. If unspecified, will use the default version.
+code-revision: null
+  # The specific revision to use for the model code on the Hugging Face Hub. It can be a branch name, a tag name, or a commit id. If unspecified, will use the default version.
+rope-scaling: {}
+  # RoPE scaling configuration. For example, {"rope_type":"dynamic","factor":2.0} . Should either be a valid JSON string or JSON keys passed individually. For example, the following sets of arguments are equivalent: --json-arg '{"key1": "value1", "key2": {"key3": "value2"}}' --json-arg.key1 value1 --json-arg.key2.key3 value2 Additionally, list elements can be passed individually using + : --json-arg '{"key4": ["value3", "value4", "value5"]}' --json-arg.key4+ value3 --json-arg.key4+='value4,value5'
+rope-theta: null
+  # RoPE theta. Use with rope_scaling . In some cases, changing the RoPE theta improves the performance of the scaled model.
+tokenizer-revision: null
+  # The specific revision to use for the tokenizer on the Hugging Face Hub. It can be a branch name, a tag name, or a commit id. If unspecified, will use the default version.
+max-model-len: null
+  # Model context length (prompt and output). If unspecified, will be automatically derived from the model config. When passing via --max-model-len , supports k/m/g/K/M/G in human-readable format. Examples: 1k -> 1000 1K -> 1024 25.6k -> 25,600
+quantization: null
+  # Method used to quantize the weights. If None , we first check the quantization_config attribute in the model config file. If that is None , we assume the model weights are not quantized and use dtype to determine the data type of the weights.
+enforce-eager: false
+  # Whether to always use eager-mode PyTorch. If True, we will disable CUDA graph and always execute the model in eager mode. If False, we will use CUDA graph and eager execution in hybrid for maximal performance and flexibility.
+max-seq-len-to-capture: 8192
+  # Maximum sequence len covered by CUDA graphs. When a sequence has context length larger than this, we fall back to eager mode. Additionally for encoder-decoder models, if the sequence length of the encoder input is larger than this, we fall back to the eager mode.
+max-logprobs: 20
+  # Maximum number of log probabilities to return when logprobs is specified in SamplingParams . The default value comes the default for the OpenAI Chat Completions API.
+disable-sliding-window: false
+  # Whether to disable sliding window. If True, we will disable the sliding window functionality of the model, capping to sliding window size. If the model does not support sliding window, this argument is ignored.
+disable-cascade-attn: false
+  # Disable cascade attention for V1. While cascade attention does not change the mathematical correctness, disabling it could be useful for preventing potential numerical issues. Note that even if this is set to False, cascade attention will be only used when the heuristic tells that it's beneficial.
+skip-tokenizer-init: false
+  # Skip initialization of tokenizer and detokenizer. Expects valid prompt_token_ids and None for prompt from the input. The generated output will contain token ids.
+enable-prompt-embeds: false
+  # If True , enables passing text embeddings as inputs via the prompt_embeds key. Note that enabling this will double the time required for graph compilation.
+served-model-name: null
+  # The model name(s) used in the API. If multiple names are provided, the server will respond to any of the provided names. The model name in the model field of a response will be the first name in this list. If not specified, the model name will be the same as the --model argument. Noted that this name(s) will also be used in model_name tag content of prometheus metrics, if multiple names provided, metrics tag will take the first one.
+disable-async-output-proc: false  # Disable async output processing. This may result in lower performance.
+config-format: auto
+  # Possible choices: auto , hf , mistral The format of the model config to load: "auto" will try to load the config in hf format if available else it will try to load in mistral format. "hf" will load the config in hf format. "mistral" will load the config in mistral format.
+hf-token: null
+  # The token to use as HTTP bearer authorization for remote files . If True , will use the token generated when running huggingface-cli login (stored in ~/.huggingface ).
+hf-overrides: {}
+  # If a dictionary, contains arguments to be forwarded to the Hugging Face config. If a callable, it is called to update the HuggingFace config.
+override-neuron-config: {}
+  # Initialize non-default neuron config or override default neuron config that are specific to Neuron devices, this argument will be used to configure the neuron config that can not be gathered from the vllm arguments. e.g. {"cast_logits_dtype": "bfloat16"} . Should either be a valid JSON string or JSON keys passed individually. For example, the following sets of arguments are equivalent: --json-arg '{"key1": "value1", "key2": {"key3": "value2"}}' --json-arg.key1 value1 --json-arg.key2.key3 value2 Additionally, list elements can be passed individually using + : --json-arg '{"key4": ["value3", "value4", "value5"]}' --json-arg.key4+ value3 --json-arg.key4+='value4,value5'
+override-pooler-config: null
+  # Initialize non-default pooling config or override default pooling config for the pooling model. e.g. {"pooling_type": "mean", "normalize": false} .
+logits-processor-pattern: null
+  # Optional regex pattern specifying valid logits processor qualified names that can be passed with the logits_processors extra completion argument. Defaults to None , which allows no processors.
+generation-config: auto
+  # The folder path to the generation config. Defaults to "auto" , the generation config will be loaded from model path. If set to "vllm" , no generation config is loaded, vLLM defaults will be used. If set to a folder path, the generation config will be loaded from the specified folder path. If max_new_tokens is specified in generation config, then it sets a server-wide limit on the number of output tokens for all requests.
+override-generation-config: {}
+  # Overrides or sets generation config. e.g. {"temperature": 0.5} . If used with --generation-config auto , the override parameters will be merged with the default config from the model. If used with --generation-config vllm , only the override parameters are used. Should either be a valid JSON string or JSON keys passed individually. For example, the following sets of arguments are equivalent: --json-arg '{"key1": "value1", "key2": {"key3": "value2"}}' --json-arg.key1 value1 --json-arg.key2.key3 value2 Additionally, list elements can be passed individually using + : --json-arg '{"key4": ["value3", "value4", "value5"]}' --json-arg.key4+ value3 --json-arg.key4+='value4,value5'
+enable-sleep-mode: false  # Enable sleep mode for the engine (only cuda platform is supported).
+model-impl: auto
+  # Possible choices: auto , vllm , transformers Which implementation of the model to use: "auto" will try to use the vLLM implementation, if it exists, and fall back to the Transformers implementation if no vLLM implementation is available. "vllm" will use the vLLM model implementation. "transformers" will use the Transformers model implementation.
+override-attention-dtype: null  # Override dtype for attention
+
+# LoadConfig
+load-format: auto
+  # Possible choices: auto , pt , safetensors , npcache , dummy , tensorizer , sharded_state , gguf , bitsandbytes , mistral , runai_streamer , runai_streamer_sharded , fastsafetensors The format of the model weights to load: "auto" will try to load the weights in the safetensors format and fall back to the pytorch bin format if safetensors format is not available. "pt" will load the weights in the pytorch bin format. "safetensors" will load the weights in the safetensors format. "npcache" will load the weights in pytorch format and store a numpy cache to speed up the loading. "dummy" will initialize the weights with random values, which is mainly for profiling. "tensorizer" will use CoreWeave's tensorizer library for fast weight loading. See the Tensorize vLLM Model script in the Examples section for more information. "runai_streamer" will load the Safetensors weights using Run:ai Model Streamer. "bitsandbytes" will load the weights using bitsandbytes quantization. "sharded_state" will load weights from pre-sharded checkpoint files, supporting efficient loading of tensor-parallel models. "gguf" will load weights from GGUF format files (details specified in https://github.com/ggml-org/ggml/blob/master/docs/gguf.md). "mistral" will load weights from consolidated safetensors files used by Mistral models.
+download-dir: null
+  # Directory to download and load the weights, default to the default cache directory of Hugging Face.
+model-loader-extra-config: {}
+  # Extra config for model loader. This will be passed to the model loader corresponding to the chosen load_format.
+ignore-patterns: null
+  # The list of patterns to ignore when loading the model. Default to "original/* / " to avoid repeated loading of llama's checkpoints.
+use-tqdm-on-load: true  # Whether to enable tqdm for showing progress bar when loading model weights.
+pt-load-map-location: cpu
+  # pt_load_map_location: the map location for loading pytorch checkpoint, to support loading checkpoints can only be loaded on certain devices like "cuda", this is equivalent to {"": "cuda"}. Another supported format is mapping from different devices like from GPU 1 to GPU 0: {"cuda:1": "cuda:0"}. Note that when passed from command line, the strings in dictionary needs to be double quoted for json parsing. For more details, see original doc for map_location in https://pytorch.org/docs/stable/generated/torch.load.html
+
+# DecodingConfig
+guided-decoding-backend: auto
+  # Possible choices: auto , guidance , lm-format-enforcer , outlines , xgrammar Which engine will be used for guided decoding (JSON schema / regex etc) by default. With "auto", we will make opinionated choices based on request contents and what the backend libraries currently support, so the behavior is subject to change in each release.
+guided-decoding-disable-fallback: false  # If True , vLLM will not fallback to a different backend on error.
+guided-decoding-disable-any-whitespace: false
+  # If True , the model will not generate any whitespace during guided decoding. This is only supported for xgrammar and guidance backends.
+guided-decoding-disable-additional-properties: false
+  # If True , the guidance backend will not use additionalProperties in the JSON schema. This is only supported for the guidance backend and is used to better align its behaviour with outlines and xgrammar .
+reasoning-parser: null
+  # Possible choices: deepseek_r1 , granite , hunyuan_a13b , qwen3 Select the reasoning parser depending on the model that you're using. This is used to parse the reasoning content into OpenAI API format.
+
+# ParallelConfig
+distributed-executor-backend: null
+  # Possible choices: external_launcher , mp , ray , uni , None Backend to use for distributed model workers, either "ray" or "mp" (multiprocessing). If the product of pipeline_parallel_size and tensor_parallel_size is less than or equal to the number of GPUs available, "mp" will be used to keep processing on a single host. Otherwise, this will default to "ray" if Ray is installed and fail otherwise. Note that tpu only support Ray for distributed inference.
+pipeline-parallel-size: 1  # Number of pipeline parallel groups.
+tensor-parallel-size: 1  # Number of tensor parallel groups.
+data-parallel-size: 1
+  # Number of data parallel groups. MoE layers will be sharded according to the product of the tensor parallel size and data parallel size.
+data-parallel-rank: null
+  # Data parallel rank of this instance. When set, enables external load balancer mode.
+data-parallel-size-local: null  # Number of data parallel replicas to run on this node.
+data-parallel-address: null  # Address of data parallel cluster head-node.
+data-parallel-rpc-port: null  # Port for data parallel RPC communication.
+data-parallel-backend: mp  # Backend for data parallel, either "mp" or "ray".
+enable-expert-parallel: false  # Use expert parallelism instead of tensor parallelism for MoE layers.
+enable-eplb: false  # Enable expert parallelism load balancing for MoE layers.
+num-redundant-experts: 0  # Number of redundant experts to use for expert parallelism.
+eplb-window-size: 1000  # Window size for expert load recording.
+eplb-step-interval: 3000
+  # Interval for rearranging experts in expert parallelism. Note that if this is greater than the EPLB window size, only the metrics of the last eplb_window_size steps will be used for rearranging experts.
+eplb-log-balancedness: false
+  # Log the balancedness each step of expert parallelism. This is turned off by default since it will cause communication overhead.
+max-parallel-loading-workers: null
+  # Maximum number of parallel loading workers when loading model sequentially in multiple batches. To avoid RAM OOM when using tensor parallel and large models.
+ray-workers-use-nsight: false
+  # Whether to profile Ray workers with nsight, see https://docs.ray.io/en/latest/ray-observability/user-guides/profiling.html#profiling-nsight-profiler.
+disable-custom-all-reduce: false  # Disable the custom all-reduce kernel and fall back to NCCL.
+worker-cls: auto
+  # The full name of the worker class to use. If "auto", the worker class will be determined based on the platform.
+worker-extension-cls: null
+  # The full name of the worker extension class to use. The worker extension class is dynamically inherited by the worker class. This is used to inject new attributes and methods to the worker class for use in collective_rpc calls.
+enable-multimodal-encoder-data-parallel: false
+  # Use data parallelism instead of tensor parallelism for vision encoder. Only support LLama4 for now
+
+# CacheConfig
+block-size: null
+  # Possible choices: 1 , 8 , 16 , 32 , 64 , 128 Size of a contiguous cache block in number of tokens. This is ignored on neuron devices and set to --max-model-len . On CUDA devices, only block sizes up to 32 are supported. On HPU devices, block size defaults to 128. This config has no static default. If left unspecified by the user, it will be set in Platform.check_and_update_config() based on the current platform.
+gpu-memory-utilization: 0.9
+  # The fraction of GPU memory to be used for the model executor, which can range from 0 to 1. For example, a value of 0.5 would imply 50%% GPU memory utilization. If unspecified, will use the default value of 0.9. This is a per-instance limit, and only applies to the current vLLM instance. It does not matter if you have another vLLM instance running on the same GPU. For example, if you have two vLLM instances running on the same GPU, you can set the GPU memory utilization to 0.5 for each instance.
+swap-space: 4  # Size of the CPU swap space per GPU (in GiB).
+kv-cache-dtype: auto
+  # Possible choices: auto , fp8 , fp8_e4m3 , fp8_e5m2 , fp8_inc Data type for kv cache storage. If "auto", will use model data type. CUDA 11.8+ supports fp8 (=fp8_e4m3) and fp8_e5m2. ROCm (AMD GPU) supports fp8 (=fp8_e4m3). Intel Gaudi (HPU) supports fp8 (using fp8_inc).
+num-gpu-blocks-override: null
+  # Number of GPU blocks to use. This overrides the profiled num_gpu_blocks if specified. Does nothing if None . Used for testing preemption.
+enable-prefix-caching: null
+  # Whether to enable prefix caching. Disabled by default for V0. Enabled by default for V1.
+prefix-caching-hash-algo: builtin
+  # Possible choices: builtin , sha256 , sha256_cbor_64bit Set the hash algorithm for prefix caching: "builtin" is Python's built-in hash. "sha256" is collision resistant but with certain overheads. This option uses Pickle for object serialization before hashing. "sha256_cbor_64bit" provides a reproducible, cross-language compatible hash. It serializes objects using canonical CBOR and hashes them with SHA-256. The resulting hash consists of the lower 64 bits of the SHA-256 digest.
+cpu-offload-gb: 0
+  # The space in GiB to offload to CPU, per GPU. Default is 0, which means no offloading. Intuitively, this argument can be seen as a virtual way to increase the GPU memory size. For example, if you have one 24 GB GPU and set this to 10, virtually you can think of it as a 34 GB GPU. Then you can load a 13B model with BF16 weight, which requires at least 26GB GPU memory. Note that this requires fast CPU-GPU interconnect, as part of the model is loaded from CPU memory to GPU memory on the fly in each model forward pass.
+calculate-kv-scales: false
+  # This enables dynamic calculation of k_scale and v_scale when kv_cache_dtype is fp8. If False , the scales will be loaded from the model checkpoint if available. Otherwise, the scales will default to 1.0.
+
+# MultiModalConfig
+limit-mm-per-prompt: {}
+  # The maximum number of input items allowed per prompt for each modality. Defaults to 1 (V0) or 999 (V1) for each modality. For example, to allow up to 16 images and 2 videos per prompt: {"images": 16, "videos": 2} Should either be a valid JSON string or JSON keys passed individually. For example, the following sets of arguments are equivalent: --json-arg '{"key1": "value1", "key2": {"key3": "value2"}}' --json-arg.key1 value1 --json-arg.key2.key3 value2 Additionally, list elements can be passed individually using + : --json-arg '{"key4": ["value3", "value4", "value5"]}' --json-arg.key4+ value3 --json-arg.key4+='value4,value5'
+media-io-kwargs: {}
+  # Additional args passed to process media inputs, keyed by modalities. For example, to set num_frames for video, set --media-io-kwargs '{"video": {"num_frames": 40} }' Should either be a valid JSON string or JSON keys passed individually. For example, the following sets of arguments are equivalent: --json-arg '{"key1": "value1", "key2": {"key3": "value2"}}' --json-arg.key1 value1 --json-arg.key2.key3 value2 Additionally, list elements can be passed individually using + : --json-arg '{"key4": ["value3", "value4", "value5"]}' --json-arg.key4+ value3 --json-arg.key4+='value4,value5'
+mm-processor-kwargs: null
+  # Overrides for the multi-modal processor obtained from transformers.AutoProcessor.from_pretrained . The available overrides depend on the model that is being run. For example, for Phi-3-Vision: {"num_crops": 4} . Should either be a valid JSON string or JSON keys passed individually. For example, the following sets of arguments are equivalent: --json-arg '{"key1": "value1", "key2": {"key3": "value2"}}' --json-arg.key1 value1 --json-arg.key2.key3 value2 Additionally, list elements can be passed individually using + : --json-arg '{"key4": ["value3", "value4", "value5"]}' --json-arg.key4+ value3 --json-arg.key4+='value4,value5'
+disable-mm-preprocessor-cache: false  # If True , disable caching of the processed multi-modal inputs.
+interleave-mm-strings: false  # Enable fully interleaved support for multimodal prompts.
+
+# LoRAConfig
+enable-lora: null  # If True, enable handling of LoRA adapters.
+enable-lora-bias: false  # Enable bias for LoRA adapters.
+max-loras: 1  # Max number of LoRAs in a single batch.
+max-lora-rank: 16  # Max LoRA rank.
+lora-extra-vocab-size: 256
+  # Maximum size of extra vocabulary that can be present in a LoRA adapter (added to the base model vocabulary).
+lora-dtype: auto
+  # Possible choices: auto , bfloat16 , float16 Data type for LoRA. If auto, will default to base model dtype.
+long-lora-scaling-factors: null
+  # Specify multiple scaling factors (which can be different from base model scaling factor - see eg. Long LoRA) to allow for multiple LoRA adapters trained with those scaling factors to be used at the same time. If not specified, only adapters trained with the base model scaling factor are allowed.
+max-cpu-loras: null  # Maximum number of LoRAs to store in CPU memory. Must be >= than max_loras .
+fully-sharded-loras: false
+  # By default, only half of the LoRA computation is sharded with tensor parallelism. Enabling this will use the fully sharded layers. At high sequence length, max rank or tensor parallel size, this is likely faster.
+default-mm-loras: null
+  # Dictionary mapping specific modalities to LoRA model paths; this field is only applicable to multimodal models and should be leveraged when a model always expects a LoRA to be active when a given modality is present. Note that currently, if a request provides multiple additional modalities, each of which have their own LoRA, we do NOT apply default_mm_loras because we currently only support one lora adapter per prompt. When run in offline mode, the lora IDs for n modalities will be automatically assigned to 1-n with the names of the modalities in alphabetic order. Should either be a valid JSON string or JSON keys passed individually. For example, the following sets of arguments are equivalent: --json-arg '{"key1": "value1", "key2": {"key3": "value2"}}' --json-arg.key1 value1 --json-arg.key2.key3 value2 Additionally, list elements can be passed individually using + : --json-arg '{"key4": ["value3", "value4", "value5"]}' --json-arg.key4+ value3 --json-arg.key4+='value4,value5'
+
+# PromptAdapterConfig
+enable-prompt-adapter: null  # If True, enable handling of PromptAdapters.
+max-prompt-adapters: 1  # Max number of PromptAdapters in a batch.
+max-prompt-adapter-token: 0  # Max number of PromptAdapters tokens.
+
+# DeviceConfig
+device: auto
+  # Possible choices: auto , cpu , cuda , neuron , tpu , xpu , None Device type for vLLM execution. This parameter is deprecated and will be removed in a future release. It will now be set automatically based on the current platform.
+
+# SpeculativeConfig
+speculative-config: null  # The configurations for speculative decoding. Should be a JSON string.
+
+# ObservabilityConfig
+show-hidden-metrics-for-version: null
+  # Enable deprecated Prometheus metrics that have been hidden since the specified version. For example, if a previously deprecated metric has been hidden since the v0.7.0 release, you use --show-hidden-metrics-for-version=0.7 as a temporary escape hatch while you migrate to new metrics. The metric is likely to be removed completely in an upcoming release.
+otlp-traces-endpoint: null  # Target URL to which OpenTelemetry traces will be sent.
+collect-detailed-traces: null
+  # Possible choices: all , model , worker , None , model,worker , model,all , worker,model , worker,all , all,model , all,worker It makes sense to set this only if --otlp-traces-endpoint is set. If set, it will collect detailed traces for the specified modules. This involves use of possibly costly and or blocking operations and hence might have a performance impact. Note that collecting detailed timing information for each request can be expensive.
+
+# SchedulerConfig
+max-num-batched-tokens: null
+  # Maximum number of tokens to be processed in a single iteration. This config has no static default. If left unspecified by the user, it will be set in EngineArgs.create_engine_config based on the usage context.
+max-num-seqs: null
+  # Maximum number of sequences to be processed in a single iteration. This config has no static default. If left unspecified by the user, it will be set in EngineArgs.create_engine_config based on the usage context.
+max-num-partial-prefills: 1
+  # For chunked prefill, the maximum number of sequences that can be partially prefilled concurrently.
+max-long-partial-prefills: 1
+  # For chunked prefill, the maximum number of prompts longer than long_prefill_token_threshold that will be prefilled concurrently. Setting this less than max_num_partial_prefills will allow shorter prompts to jump the queue in front of longer prompts in some cases, improving latency.
+cuda-graph-sizes: []
+  # Cuda graph capture sizes 1. if none provided, then default set to [min(max_num_seqs * 2, 512)] 2. if one value is provided, then the capture list would follow the pattern: [1, 2, 4] + [i for i in range(8, cuda_graph_sizes + 1, 8)] 3. more than one value (e.g. 1 2 128) is provided, then the capture list will follow the provided list.
+long-prefill-token-threshold: 0
+  # For chunked prefill, a request is considered long if the prompt is longer than this number of tokens.
+num-lookahead-slots: 0
+  # The number of slots to allocate per sequence per step, beyond the known token ids. This is used in speculative decoding to store KV activations of tokens which may or may not be accepted. NOTE: This will be replaced by speculative config in the future; it is present to enable correctness tests until then.
+scheduler-delay-factor: 0.0
+  # Apply a delay (of delay factor multiplied by previous prompt latency) before scheduling next prompt.
+preemption-mode: null
+  # Possible choices: recompute , swap , None Whether to perform preemption by swapping or recomputation. If not specified, we determine the mode as follows: We use recomputation by default since it incurs lower overhead than swapping. However, when the sequence group has multiple sequences (e.g., beam search), recomputation is not currently supported. In such a case, we use swapping instead.
+num-scheduler-steps: 1  # Maximum number of forward steps per scheduler call.
+multi-step-stream-outputs: true  # If False, then multi-step will stream outputs at the end of all steps
+scheduling-policy: fcfs
+  # Possible choices: fcfs , priority The scheduling policy to use: "fcfs" means first come first served, i.e. requests are handled in order of arrival. "priority" means requests are handled based on given priority (lower value means earlier handling) and time of arrival deciding any ties).
+enable-chunked-prefill: null
+  # If True, prefill requests can be chunked based on the remaining max_num_batched_tokens.
+disable-chunked-mm-input: false
+  # If set to true and chunked prefill is enabled, we do not want to partially schedule a multimodal item. Only used in V1 This ensures that if a request has a mixed prompt (like text tokens TTTT followed by image tokens IIIIIIIIII) where only some image tokens can be scheduled (like TTTTIIIII, leaving IIIII), it will be scheduled as TTTT in one step and IIIIIIIIII in the next.
+scheduler-cls: vllm.core.scheduler.Scheduler
+  # The scheduler class to use. "vllm.core.scheduler.Scheduler" is the default scheduler. Can be a class directly or the path to a class of form "mod.custom_class".
+disable-hybrid-kv-cache-manager: false
+  # If set to True, KV cache manager will allocate the same size of KV cache for all attention layers even if there are multiple type of attention layers like full attention and sliding window attention.
+async-scheduling: false
+  # EXPERIMENTAL: If set to True, perform async scheduling. This may help reduce the CPU overheads, leading to better latency and throughput. However, async scheduling is currently not supported with some features such as structured outputs, speculative decoding, and pipeline parallelism.
+
+# VllmConfig
+kv-transfer-config: null
+  # The configurations for distributed KV cache transfer. Should either be a valid JSON string or JSON keys passed individually. For example, the following sets of arguments are equivalent: --json-arg '{"key1": "value1", "key2": {"key3": "value2"}}' --json-arg.key1 value1 --json-arg.key2.key3 value2 Additionally, list elements can be passed individually using + : --json-arg '{"key4": ["value3", "value4", "value5"]}' --json-arg.key4+ value3 --json-arg.key4+='value4,value5'
+kv-events-config: null
+  # The configurations for event publishing. Should either be a valid JSON string or JSON keys passed individually. For example, the following sets of arguments are equivalent: --json-arg '{"key1": "value1", "key2": {"key3": "value2"}}' --json-arg.key1 value1 --json-arg.key2.key3 value2 Additionally, list elements can be passed individually using + : --json-arg '{"key4": ["value3", "value4", "value5"]}' --json-arg.key4+ value3 --json-arg.key4+='value4,value5'
+compilation-config: '{"level":0,"debug_dump_path":"","cache_dir":"","backend":"","custom_ops":[],"splitting_ops":[],"use_inductor":true,"compile_sizes":null,"inductor_compile_config":{"enable_auto_functionalized_v2":false},"inductor_passes":{},"use_cudagraph":true,"cudagraph_num_of_warmups":0,"cudagraph_capture_sizes":null,"cudagraph_copy_inputs":false,"full_cuda_graph":false,"max_capture_size":null,"local_cache_dir":null}'
+  # torch.compile and cudagraph capture configuration for the model. As a shorthand, -O<n> can be used to directly specify the compilation level n : -O3 is equivalent to -O.level=3 (same as -O='{"level":3}' ). Currently, -O and -O= are supported as well but this will likely be removed in favor of clearer -O syntax in the future. NOTE: level 0 is the default level without any optimization. level 1 and 2 are for internal testing only. level 3 is the recommended level for production, also default in V1. You can specify the full compilation config like so: {"level": 3, "cudagraph_capture_sizes": [1, 2, 4, 8]} Should either be a valid JSON string or JSON keys passed individually. For example, the following sets of arguments are equivalent: --json-arg '{"key1": "value1", "key2": {"key3": "value2"}}' --json-arg.key1 value1 --json-arg.key2.key3 value2 Additionally, list elements can be passed individually using + : --json-arg '{"key4": ["value3", "value4", "value5"]}' --json-arg.key4+ value3 --json-arg.key4+='value4,value5'
+additional-config: {}
+  # Additional config for specified platform. Different platforms may support different configs. Make sure the configs are valid for the platform you are using. Contents must be hashable.
