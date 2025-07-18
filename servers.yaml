@@ -17,3 +17,8 @@ llama3.2v:
   base_url: http://10.0.0.211:8002/v1
   api_key: smgen
   model: meta-llama/Llama-3.2-11B-Vision-Instruct   # https://github.com/vllm-project/vllm/issues/8879#issuecomment-2378458094
+
+glm4.1v-thinking:
+  base_url: http://10.0.0.211:8008/v1
+  api_key: smgen
+  model: THUDM/GLM-4.1V-9B-Thinking
