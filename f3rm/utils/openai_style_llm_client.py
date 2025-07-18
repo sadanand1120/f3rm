@@ -5,6 +5,7 @@ Requires: pip install openai
 """
 import os
 import openai
+import json
 
 
 def chat_completion(model, messages, base_url=None, api_key=None, **kwargs):
@@ -43,29 +44,25 @@ def chat_completion(model, messages, base_url=None, api_key=None, **kwargs):
 
 
 if __name__ == "__main__":
+    # Load server configurations from servers.json
+    servers_json_path = "servers.json"
+    with open(servers_json_path, 'r') as f:
+        servers = json.load(f)
+    # Available options: openai-gpt4o, internvl3, llama3.1, llama3.2V
+    SELECT = "openai-gpt4o"  # Change this to switch server
+    selected_server = servers[SELECT]
+
     messages = [
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": "Hey buddy! How you doin?"},
     ]
-
-    # Openai servers
+    print(f"--- {SELECT} ---")
     try:
         response = chat_completion(
-            model="gpt-4o",
+            model=selected_server["model"],
             messages=messages,
-            temperature=0.7,
-        )
-        print(response.choices[0].message.content)
-    except Exception as e:
-        print(f"Error: {e}")
-
-    # custom vllm server
-    try:
-        response = chat_completion(
-            model="meta-llama/Llama-3.1-8B-Instruct",
-            messages=messages,
-            base_url="http://10.0.0.212:8001/v1",  # use diff ports for serving models, to avoid bugs
-            api_key="smgen",
+            base_url=selected_server["base_url"],
+            api_key=selected_server["api_key"],
             temperature=0.7,
         )
         print(response.choices[0].message.content)

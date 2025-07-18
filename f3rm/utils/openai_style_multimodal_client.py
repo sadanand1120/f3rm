@@ -17,6 +17,7 @@ from io import BytesIO
 import openai
 from PIL import Image
 import requests
+import json
 
 
 def image_url_payload(url: str) -> Dict[str, Any]:
@@ -78,21 +79,11 @@ def chat_completion_multimodal(
 
 
 if __name__ == "__main__":
-    # Server configurations
-    servers = {
-        "openai": {
-            "base_url": None,  # Uses default OpenAI endpoint
-            "api_key": None,   # Uses OPENAI_API_KEY env var
-            "model": "gpt-4o",
-        },
-        "custom": {
-            "base_url": "http://10.0.0.212:8004/v1",
-            "api_key": "smgen",
-            "model": "OpenGVLab/InternVL3-38B",
-        }
-    }
-
-    SELECT = "custom"
+    # Load server configurations from servers.json
+    servers_json_path = "servers.json"
+    with open(servers_json_path, 'r') as f:
+        servers = json.load(f)
+    SELECT = "internvl3"
     selected_server = servers[SELECT]
 
     # Text only
@@ -163,7 +154,8 @@ if __name__ == "__main__":
         try:
             messages_img_file = [
                 {"role": "user", "content": [
-                    {"type": "text", "text": "What's in this image? Point out any axes if you see them and point out what's their direction they are pointing to wrt to the object. Remember the convention of axes colors. Is the x-axes aligned PERFECTLY wrt to the front direction (if any) semantically of the object? If not, what corrective rotation is needed to align -- ie, rotate about which axis?"},
+                    {"type": "text",
+                        "text": "What's in this image? Point out any axes if you see them and point out what's their direction they are pointing to wrt to the object. Remember the convention of axes colors. Is the x-axes aligned PERFECTLY wrt to the front direction (if any) semantically of the object? If not, what corrective rotation is needed to align -- ie, rotate about which axis?"},
                     image_file_payload(local_path),
                 ]}
             ]
