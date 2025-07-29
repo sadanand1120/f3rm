@@ -852,13 +852,13 @@ def main():
                         help="Tool mode: 'align' for alignment, 'filter' for bounding box filtering")
 
     # Alignment mode arguments
-    parser.add_argument("--rotation-step", type=float, default=10.0,
+    parser.add_argument("--rotation-step", type=float, default=5.0,
                         help="Rotation step size in degrees (default: 10.0, align mode)")
-    parser.add_argument("--translation-step", type=float, default=0.1,
+    parser.add_argument("--translation-step", type=float, default=0.05,
                         help="Translation step size in units (default: 0.1, align mode)")
 
     # Filter mode arguments
-    parser.add_argument("--filter-step", type=float, default=0.05,
+    parser.add_argument("--filter-step", type=float, default=0.01,
                         help="Filter adjustment step size in units (default: 0.05, filter mode)")
 
     args = parser.parse_args()

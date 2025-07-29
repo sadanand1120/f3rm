@@ -85,7 +85,7 @@ class InteractiveAxesAdder:
     """Interactive tool for adding custom axes at multiple locations."""
 
     def __init__(self, data: FeaturePointcloudData, rotation_step: float = 10.0,
-                 translation_step: float = 0.1, scale_step: float = 0.1):
+                 translation_step: float = 0.1, scale_step: float = 0.1, transparency: float = 1.0):
         self.data = data
         self.vis = None
 
@@ -93,6 +93,7 @@ class InteractiveAxesAdder:
         self.rotation_step = rotation_step  # degrees
         self.translation_step = translation_step  # units
         self.scale_step = scale_step  # units
+        self.transparency = transparency  # RGB pointcloud transparency
 
         # Current axes being positioned
         self.current_transform = np.eye(4)
@@ -107,6 +108,9 @@ class InteractiveAxesAdder:
         self.reference_geoms = []
         self.current_axis_geom = None
         self.saved_axes_geoms = []
+
+        # Load existing axes if available
+        self.load_existing_axes()
 
     def create_reference_geometries(self) -> list:
         """Create coordinate frame, bounding box, and grid."""
@@ -180,7 +184,7 @@ class InteractiveAxesAdder:
         console.print("[green]Current axes reset to identity")
 
     def apply_rotation(self, axis: str, direction: int = 1):
-        """Apply rotation around specified axis.
+        """Apply rotation around specified axis in the current axis's own frame.
 
         Args:
             axis: 'x', 'y', or 'z'
@@ -211,11 +215,23 @@ class InteractiveAxesAdder:
             return
 
         # Create 4x4 transformation matrix
-        transform = np.eye(4)
-        transform[:3, :3] = rot_matrix
+        local_rot = np.eye(4)
+        local_rot[:3, :3] = rot_matrix
 
-        # Apply to current transform
-        self.current_transform = transform @ self.current_transform
+        # Apply rotation in the current axis's own frame
+        # This means: translate to origin, rotate, translate back
+        current_position = self.current_transform[:3, 3]
+
+        # Translate to origin
+        to_origin = np.eye(4)
+        to_origin[:3, 3] = -current_position
+
+        # Translate back to original position
+        to_position = np.eye(4)
+        to_position[:3, 3] = current_position
+
+        # Apply the sequence: translate to origin -> rotate -> translate back
+        self.current_transform = to_position @ local_rot @ to_origin @ self.current_transform
         self.update_visualization()
 
     def apply_translation(self, dx_direction: int, dy_direction: int, dz_direction: int):
@@ -266,13 +282,45 @@ class InteractiveAxesAdder:
         saved_geom = new_axis.create_geometry()
         self.saved_axes_geoms.append(saved_geom)
 
-        # Reset for next axis
+        # Start next axis at the position and scale of the current one (keep position and scale, reset orientation)
+        current_position = self.current_transform[:3, 3]
         self.current_transform = np.eye(4)
-        self.current_scale = 0.2
+        self.current_transform[:3, 3] = current_position  # Keep the position
+        # Keep the current scale (don't reset to 0.2)
         self.next_axis_id += 1
 
         console.print(f"[green]Added axis {new_axis.axis_id} at position {new_axis.transform[:3, 3]}")
         self.update_visualization()
+
+    def load_existing_axes(self):
+        """Load existing axes from JSON file if available."""
+        axes_path = self.data.data_dir / "custom_axes.json"
+        if axes_path.exists():
+            try:
+                with open(axes_path, 'r') as f:
+                    axes_data = json.load(f)
+
+                loaded_axes = [CustomAxis.from_dict(axis_dict) for axis_dict in axes_data['axes']]
+                self.saved_axes = loaded_axes
+                self.next_axis_id = len(loaded_axes)
+
+                # Create geometries for loaded axes
+                for axis in loaded_axes:
+                    axis_geom = axis.create_geometry()
+                    self.saved_axes_geoms.append(axis_geom)
+
+                console.print(f"[green]Loaded {len(loaded_axes)} existing axes from {axes_path}")
+
+                # Start new axis at the position of the last loaded axis if any exist
+                if loaded_axes:
+                    last_axis = loaded_axes[-1]
+                    self.current_transform = last_axis.transform.copy()
+                    self.current_scale = last_axis.scale
+                    console.print(f"[cyan]Starting new axis at position of last loaded axis")
+
+            except Exception as e:
+                console.print(f"[yellow]Warning: Could not load existing axes: {e}")
+                console.print("[yellow]Starting with empty axes list")
 
     def save_axes_to_file(self):
         """Save all axes to JSON file."""
@@ -306,8 +354,13 @@ class InteractiveAxesAdder:
         console.print("\n[bold yellow]Goal: Add custom coordinate axes at multiple locations")
         console.print("[bold yellow]Note: Camera view is preserved during transforms")
 
-        # Load RGB pointcloud
+        # Load RGB pointcloud and apply transparency
         self.original_pcd = self.data.rgb_pointcloud
+        if self.transparency < 1.0:
+            # Apply transparency by modifying colors
+            colors = np.asarray(self.original_pcd.colors)
+            colors = colors * self.transparency
+            self.original_pcd.colors = o3d.utility.Vector3dVector(colors)
 
         # Create reference geometries
         self.reference_geoms = self.create_reference_geometries()
@@ -393,7 +446,7 @@ def load_custom_axes(data_dir: Path) -> List[CustomAxis]:
 
 
 def add_custom_axes(data_dir: Path, rotation_step: float = 10.0,
-                    translation_step: float = 0.1, scale_step: float = 0.1) -> None:
+                    translation_step: float = 0.1, scale_step: float = 0.1, transparency: float = 1.0) -> None:
     """
     Main function to add custom axes.
 
@@ -402,10 +455,11 @@ def add_custom_axes(data_dir: Path, rotation_step: float = 10.0,
         rotation_step: Rotation step size in degrees (default: 10.0)
         translation_step: Translation step size in units (default: 0.1)
         scale_step: Scale step size in units (default: 0.1)
+        transparency: Transparency of RGB pointcloud (0.0=transparent, 1.0=opaque, default: 1.0)
     """
     console.print(f"[bold blue]F3RM Custom Axes Addition Tool")
     console.print(f"[bold blue]Data directory: {data_dir}")
-    console.print(f"[bold blue]Rotation step: {rotation_step}° | Translation step: {translation_step} | Scale step: {scale_step}")
+    console.print(f"[bold blue]Rotation step: {rotation_step}° | Translation step: {translation_step} | Scale step: {scale_step} | Transparency: {transparency}")
 
     # Load pointcloud data
     try:
@@ -416,19 +470,21 @@ def add_custom_axes(data_dir: Path, rotation_step: float = 10.0,
         return
 
     # Start axes addition tool
-    axes_adder = InteractiveAxesAdder(data, rotation_step, translation_step, scale_step)
+    axes_adder = InteractiveAxesAdder(data, rotation_step, translation_step, scale_step, transparency)
     axes_adder.start_adding_axes()
 
 
-def visualize_with_axes(data_dir: Path) -> None:
+def visualize_with_axes(data_dir: Path, transparency: float = 1.0) -> None:
     """
     Main function to visualize RGB pointcloud with custom axes.
 
     Args:
         data_dir: Directory containing exported pointcloud data
+        transparency: Transparency of RGB pointcloud (0.0=transparent, 1.0=opaque, default: 1.0)
     """
     console.print(f"[bold blue]F3RM RGB Pointcloud with Custom Axes Visualizer")
     console.print(f"[bold blue]Data directory: {data_dir}")
+    console.print(f"[bold blue]Transparency: {transparency}")
 
     # Load pointcloud data
     try:
@@ -446,8 +502,13 @@ def visualize_with_axes(data_dir: Path) -> None:
     console.print("[bold green]Visualizing RGB pointcloud with custom axes...")
     console.print(data.get_info())
 
-    # Get RGB pointcloud
+    # Get RGB pointcloud and apply transparency
     pcd = data.rgb_pointcloud
+    if transparency < 1.0:
+        # Apply transparency by modifying colors
+        colors = np.asarray(pcd.colors)
+        colors = colors * transparency
+        pcd.colors = o3d.utility.Vector3dVector(colors)
     console.print(f"[green]Loaded pointcloud with {len(np.asarray(pcd.points))} points")
 
     # Create reference geometries
@@ -494,12 +555,14 @@ def main():
                         help="Tool mode: 'add' for interactive axes placement, 'visualize' for viewing with axes")
 
     # Add mode arguments
-    parser.add_argument("--rotation-step", type=float, default=10.0,
+    parser.add_argument("--rotation-step", type=float, default=2.0,
                         help="Rotation step size in degrees (default: 10.0, add mode)")
-    parser.add_argument("--translation-step", type=float, default=0.1,
+    parser.add_argument("--translation-step", type=float, default=0.02,
                         help="Translation step size in units (default: 0.1, add mode)")
-    parser.add_argument("--scale-step", type=float, default=0.1,
+    parser.add_argument("--scale-step", type=float, default=0.02,
                         help="Scale step size in units (default: 0.1, add mode)")
+    parser.add_argument("--transparency", type=float, default=0.5,
+                        help="Transparency of RGB pointcloud (0.0=transparent, 1.0=opaque, default: 1.0)")
 
     args = parser.parse_args()
 
@@ -526,9 +589,9 @@ def main():
 
     try:
         if args.mode == "add":
-            add_custom_axes(args.data_dir, args.rotation_step, args.translation_step, args.scale_step)
+            add_custom_axes(args.data_dir, args.rotation_step, args.translation_step, args.scale_step, args.transparency)
         elif args.mode == "visualize":
-            visualize_with_axes(args.data_dir)
+            visualize_with_axes(args.data_dir, args.transparency)
     except Exception as e:
         console.print(f"[bold red]Error: {e}")
         raise
