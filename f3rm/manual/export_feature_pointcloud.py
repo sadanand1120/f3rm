@@ -2,8 +2,8 @@
 """
 F3RM Feature Pointcloud Exporter
 
-This script exports pointclouds with RGB, features, and feature_PCA data from F3RM models.
-It samples points from the NeRF and extracts features and colors, saving them to optimized formats.
+This script exports pointclouds with RGB, features, feature_PCA, and pred_normals data from F3RM models.
+It samples points from the NeRF and extracts features, colors, and predicted normals, saving them to optimized formats.
 
 Usage:
     python f3rm/manual/export_feature_pointcloud.py --config path/to/config.yml --output-dir path/to/output/ --num-points 50000000
@@ -32,7 +32,7 @@ def sample_feature_pointcloud(
     num_points: int,
     bbox_min: Optional[Tuple[float, float, float]] = None,
     bbox_max: Optional[Tuple[float, float, float]] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Sample a pointcloud with RGB, features, and consistent PCA features.
 
@@ -45,7 +45,7 @@ def sample_feature_pointcloud(
         bbox_max: Optional maximum bounding box coordinates (x, y, z)
 
     Returns:
-        Tuple of (points, rgb, features, feature_pca) tensors
+        Tuple of (points, rgb, features, feature_pca, pred_normals) tensors
     """
     device = pipeline.device
 
@@ -57,6 +57,7 @@ def sample_feature_pointcloud(
     points_list = []
     rgbs_list = []
     features_list = []
+    pred_normals_list = []
 
     # Initialize PCA for consistent feature_pca across chunks
     pca_proj = None
@@ -87,6 +88,11 @@ def sample_feature_pointcloud(
                 features = outputs["feature"]
                 depth = outputs["depth"]
 
+                # Get pred_normals if available
+                pred_normals = None
+                if "pred_normals" in outputs:
+                    pred_normals = outputs["pred_normals"]
+
                 # Convert depth to world coordinates
                 nerf_points = ray_bundle.origins + ray_bundle.directions * depth
 
@@ -101,11 +107,13 @@ def sample_feature_pointcloud(
                         dim=-1
                     )
 
-                    # Filter points, RGB, and features
+                    # Filter points, RGB, features, and pred_normals
                     if within_bbox.any():
                         nerf_points = nerf_points[within_bbox]
                         rgb = rgb[within_bbox]
                         features = features[within_bbox]
+                        if pred_normals is not None:
+                            pred_normals = pred_normals[within_bbox]
                     else:
                         # No points within bbox, skip this batch
                         continue
@@ -113,6 +121,8 @@ def sample_feature_pointcloud(
                 points_list.append(nerf_points)
                 rgbs_list.append(rgb)
                 features_list.append(features)
+                if pred_normals is not None:
+                    pred_normals_list.append(pred_normals)
 
                 collected_points += len(nerf_points)
                 progress.update(task, completed=min(collected_points, num_points))
@@ -135,14 +145,21 @@ def sample_feature_pointcloud(
     points_cpu = []
     rgbs_cpu = []
     features_cpu = []
+    pred_normals_cpu = []
 
     for points_chunk, rgbs_chunk, features_chunk in zip(points_list, rgbs_list, features_list):
         points_cpu.append(points_chunk.cpu())
         rgbs_cpu.append(rgbs_chunk.cpu())
         features_cpu.append(features_chunk.cpu())
 
+    # Handle pred_normals if available
+    has_pred_normals = len(pred_normals_list) > 0
+    if has_pred_normals:
+        for pred_normals_chunk in pred_normals_list:
+            pred_normals_cpu.append(pred_normals_chunk.cpu())
+
     # Clear GPU lists to free memory
-    del points_list, rgbs_list, features_list
+    del points_list, rgbs_list, features_list, pred_normals_list
     torch.cuda.empty_cache()
 
     # Concatenate on CPU
@@ -150,8 +167,13 @@ def sample_feature_pointcloud(
     rgbs = torch.cat(rgbs_cpu, dim=0)
     features = torch.cat(features_cpu, dim=0)
 
+    # Handle pred_normals concatenation
+    pred_normals = None
+    if has_pred_normals:
+        pred_normals = torch.cat(pred_normals_cpu, dim=0)
+
     # Clear CPU lists to free memory
-    del points_cpu, rgbs_cpu, features_cpu
+    del points_cpu, rgbs_cpu, features_cpu, pred_normals_cpu
 
     # Subsample to exactly num_points if we have more
     if len(points) > num_points:
@@ -160,6 +182,8 @@ def sample_feature_pointcloud(
         points = points[indices]
         rgbs = rgbs[indices]
         features = features[indices]
+        if pred_normals is not None:
+            pred_normals = pred_normals[indices]
 
     console.print(f"[bold green]Collected {len(points):,} points")
 
@@ -167,12 +191,14 @@ def sample_feature_pointcloud(
     points = points.to(device)
     rgbs = rgbs.to(device)
     features = features.to(device)
+    if pred_normals is not None:
+        pred_normals = pred_normals.to(device)
 
     # Apply consistent PCA to all features
     console.print("[bold green]Computing PCA projection for features...")
     feature_pca, pca_proj, pca_min, pca_max = apply_pca_colormap_return_proj(features, pca_proj, pca_min, pca_max)
 
-    return points, rgbs, features, feature_pca, pca_proj, pca_min, pca_max
+    return points, rgbs, features, feature_pca, pred_normals, pca_proj, pca_min, pca_max
 
 
 def save_pointcloud_data(
@@ -181,6 +207,7 @@ def save_pointcloud_data(
     rgbs: torch.Tensor,
     features: torch.Tensor,
     feature_pca: torch.Tensor,
+    pred_normals: Optional[torch.Tensor],
     pca_proj: torch.Tensor,
     pca_min: torch.Tensor,
     pca_max: torch.Tensor,
@@ -208,6 +235,11 @@ def save_pointcloud_data(
     features_np = features.cpu().numpy()
     feature_pca_np = feature_pca.cpu().numpy().astype(np.float32)
 
+    # Handle pred_normals
+    pred_normals_np = None
+    if pred_normals is not None:
+        pred_normals_np = pred_normals.cpu().numpy().astype(np.float32)
+
     console.print(f"[bold green]Saving pointcloud data to {output_dir}")
 
     # 1. Save RGB pointcloud (standard PLY format)
@@ -228,7 +260,19 @@ def save_pointcloud_data(
     o3d.io.write_point_cloud(str(pca_path), pca_pcd)
     console.print(f"[green]✓ Saved feature_PCA pointcloud: {pca_path}")
 
-    # 3. Save features with compression options
+    # 3. Save pred_normals pointcloud (PLY format) if available
+    if pred_normals_np is not None:
+        normals_pcd = o3d.geometry.PointCloud()
+        normals_pcd.points = o3d.utility.Vector3dVector(points_np)
+        normals_pcd.colors = o3d.utility.Vector3dVector(pred_normals_np)
+
+        normals_path = output_dir / "pointcloud_pred_normals.ply"
+        o3d.io.write_point_cloud(str(normals_path), normals_pcd)
+        console.print(f"[green]✓ Saved pred_normals pointcloud: {normals_path}")
+    else:
+        console.print(f"[yellow]No pred_normals available - model may not have predict_normals enabled")
+
+    # 4. Save features with compression options
     if compress_features:
         # Use float16 for features to save space (reduces size by ~50%)
         features_compressed = features_np.astype(np.float16)
@@ -242,12 +286,12 @@ def save_pointcloud_data(
         np.save(features_path, features_np.astype(np.float32))
         console.print(f"[green]✓ Saved full precision features: {features_path}")
 
-    # 4. Save points separately for easy loading
+    # 5. Save points separately for easy loading
     points_path = output_dir / "points.npy"
     np.save(points_path, points_np)
     console.print(f"[green]✓ Saved points: {points_path}")
 
-    # 5. Save PCA transformation parameters for consistent visualization
+    # 6. Save PCA transformation parameters for consistent visualization
     pca_data = {
         'projection_matrix': pca_proj.cpu().numpy(),
         'min_values': pca_min.cpu().numpy(),
@@ -261,7 +305,7 @@ def save_pointcloud_data(
         pickle.dump(pca_data, f)
     console.print(f"[green]✓ Saved PCA parameters: {pca_path}")
 
-    # 6. Save metadata
+    # 7. Save metadata
     metadata = {
         'num_points': len(points),
         'feature_dim': features.shape[-1],
@@ -272,10 +316,12 @@ def save_pointcloud_data(
         'files': {
             'rgb_pointcloud': 'pointcloud_rgb.ply',
             'pca_pointcloud': 'pointcloud_feature_pca.ply',
+            'pred_normals_pointcloud': 'pointcloud_pred_normals.ply' if pred_normals_np is not None else None,
             'features': 'features_float16.npy' if compress_features else 'features_float32.npy',
             'points': 'points.npy',
             'pca_params': 'pca_params.pkl'
-        }
+        },
+        'has_pred_normals': pred_normals_np is not None
     }
 
     metadata_path = output_dir / "metadata.json"
@@ -285,10 +331,11 @@ def save_pointcloud_data(
     console.print(f"[green]✓ Saved metadata: {metadata_path}")
 
     # Print summary
-    total_size = sum((output_dir / f).stat().st_size for f in metadata['files'].values()) / 1e6
+    total_size = sum((output_dir / f).stat().st_size for f in metadata['files'].values() if f is not None) / 1e6
     console.print(f"\n[bold green]Export Summary:")
     console.print(f"  Points: {len(points):,}")
     console.print(f"  Feature dimension: {features.shape[-1]}")
+    console.print(f"  Pred normals: {'Yes' if pred_normals_np is not None else 'No'}")
     console.print(f"  Total size: {total_size:.1f}MB")
     console.print(f"  Files saved in: {output_dir}")
 
@@ -323,7 +370,7 @@ def export_feature_pointcloud(
     console.print(f"[bold green]Loaded checkpoint from step {step}")
 
     # Sample pointcloud with features
-    points, rgbs, features, feature_pca, pca_proj, pca_min, pca_max = sample_feature_pointcloud(
+    points, rgbs, features, feature_pca, pred_normals, pca_proj, pca_min, pca_max = sample_feature_pointcloud(
         pipeline=pipeline,
         num_points=num_points,
         bbox_min=bbox_min,
@@ -337,6 +384,7 @@ def export_feature_pointcloud(
         rgbs=rgbs,
         features=features,
         feature_pca=feature_pca,
+        pred_normals=pred_normals,
         pca_proj=pca_proj,
         pca_min=pca_min,
         pca_max=pca_max,

@@ -10,6 +10,7 @@ This script provides visualization of F3RM pointclouds with:
 Usage:
     python f3rm/manual/visualize_feature_pointcloud.py --data-dir path/to/exported/pointcloud/ --mode rgb
     python f3rm/manual/visualize_feature_pointcloud.py --data-dir path/to/exported/pointcloud/ --mode pca
+    python f3rm/manual/visualize_feature_pointcloud.py --data-dir path/to/exported/pointcloud/ --mode pred_normals
     python f3rm/manual/visualize_feature_pointcloud.py --data-dir path/to/exported/pointcloud/ --mode semantic --query "chair"
 """
 
@@ -100,14 +101,34 @@ class FeaturePointcloudData:
             self._pca_pcd = o3d.io.read_point_cloud(str(pca_path))
         return self._pca_pcd
 
+    @property
+    def pred_normals_pointcloud(self) -> Optional[o3d.geometry.PointCloud]:
+        """Load pred_normals pointcloud if not already loaded."""
+        if not hasattr(self, '_pred_normals_pcd'):
+            self._pred_normals_pcd = None
+
+        if self._pred_normals_pcd is None:
+            normals_file = self.metadata['files'].get('pred_normals_pointcloud')
+            if normals_file is not None:
+                normals_path = self.data_dir / normals_file
+                if normals_path.exists():
+                    self._pred_normals_pcd = o3d.io.read_point_cloud(str(normals_path))
+                else:
+                    self._pred_normals_pcd = None
+            else:
+                self._pred_normals_pcd = None
+        return self._pred_normals_pcd
+
     def get_info(self) -> str:
         """Get formatted info about the pointcloud."""
+        has_pred_normals = self.metadata.get('has_pred_normals', False)
         return f"""
 F3RM Feature Pointcloud Info:
   Points: {self.metadata['num_points']:,}
   Feature dimension: {self.metadata['feature_dim']}
   Bounding box: {self.metadata['bbox_min']} to {self.metadata['bbox_max']}
   Compressed features: {self.metadata['compressed_features']}
+  Pred normals: {'Yes' if has_pred_normals else 'No'}
   Data directory: {self.data_dir}
 """
 
@@ -567,6 +588,70 @@ def visualize_pca(
     )
 
 
+def visualize_pred_normals(
+    data: FeaturePointcloudData,
+    show_guides: bool = True,
+    bbox_filter_min: Optional[List[float]] = None,
+    bbox_filter_max: Optional[List[float]] = None,
+    semantic_filter_query: Optional[str] = None,
+    semantic_filter_mode: Optional[str] = None,
+    semantic_threshold: float = 0.502,
+    semantic_softmax_temp: float = 1.0,
+    semantic_negatives: Optional[List[str]] = None
+):
+    """Visualize pred_normals pointcloud with optional filtering."""
+    console.print("[bold green]Visualizing pred_normals pointcloud...")
+    console.print(data.get_info())
+
+    # Check if pred_normals are available
+    normals_pcd = data.pred_normals_pointcloud
+    if normals_pcd is None:
+        console.print("[red]No pred_normals pointcloud found. Make sure the model has predict_normals enabled.")
+        return
+
+    points = np.asarray(normals_pcd.points)
+    colors = np.asarray(normals_pcd.colors)
+
+    console.print(f"[green]Loaded pred_normals pointcloud with {len(points)} points")
+
+    # Apply filters if requested
+    points, colors = apply_filters(
+        data, points, colors, bbox_filter_min, bbox_filter_max,
+        semantic_filter_query, semantic_filter_mode, semantic_threshold,
+        semantic_softmax_temp, semantic_negatives
+    )
+
+    # Create filtered pointcloud
+    filtered_pcd = o3d.geometry.PointCloud()
+    filtered_pcd.points = o3d.utility.Vector3dVector(points)
+    filtered_pcd.colors = o3d.utility.Vector3dVector(colors)
+
+    # Start with filtered pointcloud
+    all_geometries = [filtered_pcd]
+
+    # Add reference geometries if requested
+    if show_guides:
+        filter_bbox_min = np.array(bbox_filter_min) if bbox_filter_min is not None else None
+        filter_bbox_max = np.array(bbox_filter_max) if bbox_filter_max is not None else None
+        reference_geoms = create_reference_geometries(data, filter_bbox_min, filter_bbox_max)
+        all_geometries.extend(reference_geoms)
+
+        guide_msg = "[dim]Reference guides: Red=X, Green=Y, Blue=Z axes; Gray=original bounds; Light gray=grid"
+        if filter_bbox_min is not None and filter_bbox_max is not None:
+            guide_msg += "; Orange=filter bounds"
+        console.print(guide_msg)
+
+    # Simple visualization
+    o3d.visualization.draw_geometries(
+        all_geometries,
+        window_name="F3RM Pred Normals Pointcloud",
+        width=1200,
+        height=800,
+        left=50,
+        top=50
+    )
+
+
 def visualize_semantic(
     data: FeaturePointcloudData,
     query: str,
@@ -713,7 +798,7 @@ def visualize_semantic(
 def main():
     parser = argparse.ArgumentParser(description="Visualize F3RM feature pointclouds")
     parser.add_argument("--data-dir", type=Path, required=True, help="Directory containing exported pointcloud data")
-    parser.add_argument("--mode", choices=["rgb", "pca", "semantic"], default="rgb", help="Visualization mode")
+    parser.add_argument("--mode", choices=["rgb", "pca", "pred_normals", "semantic"], default="rgb", help="Visualization mode")
     parser.add_argument("--query", type=str, help="Semantic query (required for semantic mode)")
     parser.add_argument("--negative-queries", nargs="*", help="Negative queries for semantic mode (default: ['object'])")
     parser.add_argument("--threshold", type=float, default=0.502, help="Similarity threshold for semantic mode (default: 0.502 like opt.py)")
@@ -799,6 +884,18 @@ def main():
             )
         elif args.mode == "pca":
             visualize_pca(
+                data,
+                show_guides,
+                args.bbox_filter_min,
+                args.bbox_filter_max,
+                args.semantic_filter_query,
+                args.semantic_filter_mode,
+                args.threshold,
+                args.softmax_temp,
+                args.semantic_negatives
+            )
+        elif args.mode == "pred_normals":
+            visualize_pred_normals(
                 data,
                 show_guides,
                 args.bbox_filter_min,

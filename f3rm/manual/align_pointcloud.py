@@ -387,7 +387,17 @@ class InteractiveAlignmentTool:
         o3d.io.write_point_cloud(str(data_dir / "pointcloud_feature_pca.ply"), pca_pcd)
         console.print("[green]✓ Updated PCA pointcloud")
 
-        # 3. Transform points array
+        # 3. Transform and save pred_normals pointcloud if it exists
+        normals_path = data_dir / "pointcloud_pred_normals.ply"
+        if normals_path.exists():
+            normals_pcd = o3d.io.read_point_cloud(str(normals_path))
+            normals_pcd.transform(self.transform)
+            o3d.io.write_point_cloud(str(normals_path), normals_pcd)
+            console.print("[green]✓ Updated pred_normals pointcloud")
+        else:
+            console.print("[dim]No pred_normals pointcloud found to transform")
+
+        # 4. Transform points array
         points = np.load(data_dir / "points.npy")
 
         # Apply transform to points (homogeneous coordinates)
@@ -397,7 +407,7 @@ class InteractiveAlignmentTool:
         np.save(data_dir / "points.npy", points_transformed.astype(np.float32))
         console.print("[green]✓ Updated points array")
 
-        # 4. Update metadata with transform and new bounding box
+        # 5. Update metadata with transform and new bounding box
         metadata_path = data_dir / "metadata.json"
         with open(metadata_path, 'r') as f:
             metadata = json.load(f)
@@ -416,7 +426,7 @@ class InteractiveAlignmentTool:
             json.dump(metadata, f, indent=2)
         console.print("[green]✓ Updated metadata with transform and new bounding box")
 
-        # 5. Note: Features don't need transformation as they're view-invariant
+        # 6. Note: Features don't need transformation as they're view-invariant
         console.print("[dim]Note: Feature vectors unchanged (view-invariant)")
 
 
@@ -712,19 +722,35 @@ class InteractiveFilterTool:
         o3d.io.write_point_cloud(str(data_dir / "pointcloud_feature_pca.ply"), filtered_pca_pcd)
         console.print("[green]✓ Updated PCA pointcloud")
 
-        # 3. Filter and save points array
+        # 3. Filter and save pred_normals pointcloud if it exists
+        normals_path = data_dir / "pointcloud_pred_normals.ply"
+        if normals_path.exists():
+            normals_pcd = o3d.io.read_point_cloud(str(normals_path))
+            normals_points = np.asarray(normals_pcd.points)
+            normals_colors = np.asarray(normals_pcd.colors)
+
+            filtered_normals_pcd = o3d.geometry.PointCloud()
+            filtered_normals_pcd.points = o3d.utility.Vector3dVector(normals_points[within_bounds])
+            filtered_normals_pcd.colors = o3d.utility.Vector3dVector(normals_colors[within_bounds])
+
+            o3d.io.write_point_cloud(str(normals_path), filtered_normals_pcd)
+            console.print("[green]✓ Updated pred_normals pointcloud")
+        else:
+            console.print("[dim]No pred_normals pointcloud found to filter")
+
+        # 4. Filter and save points array
         filtered_points = points[within_bounds]
         np.save(data_dir / "points.npy", filtered_points.astype(np.float32))
         console.print("[green]✓ Updated points array")
 
-        # 4. Filter and save features array
+        # 5. Filter and save features array
         features_file = self.data.metadata['files']['features']
         features = np.load(data_dir / features_file)
         filtered_features = features[within_bounds]
         np.save(data_dir / features_file, filtered_features)
         console.print("[green]✓ Updated features array")
 
-        # 5. Update metadata with new counts and bounding box
+        # 6. Update metadata with new counts and bounding box
         metadata_path = data_dir / "metadata.json"
         with open(metadata_path, 'r') as f:
             metadata = json.load(f)
