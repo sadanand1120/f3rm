@@ -17,15 +17,23 @@ Tools supporting the execution of COLMAP and preparation of COLMAP-based dataset
 """
 
 import json
-from pathlib import Path
-from typing import Any, Dict, Literal, Optional
 import os
+import re
+import subprocess
+import threading
+import time
+from pathlib import Path
+from typing import Any, Dict, Literal, Optional, List
+
 import appdirs
 import cv2
 import numpy as np
 import requests
 import torch
-from rich.progress import track
+from rich.progress import track, Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
+from rich.console import Console
+from rich.live import Live
+from rich.panel import Panel
 
 # TODO(1480) use pycolmap instead of colmap_parsing_utils
 # import pycolmap
@@ -107,13 +115,6 @@ def run_colmap(
         matching_method: Matching method to use.
         colmap_cmd: Path to the COLMAP executable.
     """
-
-    # mycustom code: sadanand
-    #gpus = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-    #gpu_list = [g for g in gpus.split(",") if g.strip()]
-    #use_gpu = bool(gpu_list)
-    #gpu_index = gpus if use_gpu else ""
-
     colmap_version = get_colmap_version(colmap_cmd)
 
     colmap_database_path = colmap_dir / "database.db"
@@ -131,9 +132,9 @@ def run_colmap(
     if camera_mask_path is not None:
         feature_extractor_cmd.append(f"--ImageReader.camera_mask_path {camera_mask_path}")
     feature_extractor_cmd = " ".join(feature_extractor_cmd)
+
     with status(msg="[bold yellow]Running COLMAP feature extractor...", spinner="moon", verbose=verbose):
         run_command(feature_extractor_cmd, verbose=verbose)
-
     CONSOLE.log("[bold green]:tada: Done extracting COLMAP features.")
 
     # Feature matching
@@ -146,6 +147,7 @@ def run_colmap(
         vocab_tree_filename = get_vocab_tree()
         feature_matcher_cmd.append(f'--VocabTreeMatching.vocab_tree_path "{vocab_tree_filename}"')
     feature_matcher_cmd = " ".join(feature_matcher_cmd)
+
     with status(msg="[bold yellow]Running COLMAP feature matcher...", spinner="runner", verbose=verbose):
         run_command(feature_matcher_cmd, verbose=verbose)
     CONSOLE.log("[bold green]:tada: Done matching COLMAP features.")
@@ -153,32 +155,34 @@ def run_colmap(
     # Bundle adjustment
     sparse_dir = colmap_dir / "sparse"
     sparse_dir.mkdir(parents=True, exist_ok=True)
+
+    # Use external mapper.ini file
+    mapper_ini = Path("/robodata/smodak/repos/f3rm/colmap_mapper.ini")
+
+    # Use project file for mapper
     mapper_cmd = [
         f"{colmap_cmd} mapper",
         f"--database_path {colmap_dir / 'database.db'}",
         f"--image_path {image_dir}",
         f"--output_path {sparse_dir}",
-        f"--Mapper.ba_use_gpu {int(gpu)}",
+        f"--project_path {mapper_ini}",
     ]
-    if colmap_version >= 3.7:
-        mapper_cmd.append("--Mapper.ba_global_function_tolerance 1e-6")
 
     mapper_cmd = " ".join(mapper_cmd)
 
-    with status(
-        msg="[bold yellow]Running COLMAP bundle adjustment... (This may take a while)",
-        spinner="circle",
-        verbose=verbose,
-    ):
+    with status(msg="[bold yellow]Running COLMAP bundle adjustment... (This may take a while)", spinner="circle", verbose=verbose):
         run_command(mapper_cmd, verbose=verbose)
     CONSOLE.log("[bold green]:tada: Done COLMAP bundle adjustment.")
-    with status(msg="[bold yellow]Refine intrinsics...", spinner="dqpb", verbose=verbose):
+
+    # Bundle adjuster with external project file
+    with status(msg="[bold yellow]Refining intrinsics...", spinner="dqpb", verbose=verbose):
+        bundle_adjuster_project_file = Path("/robodata/smodak/repos/f3rm/bundle_adjuster.ini")
+
         bundle_adjuster_cmd = [
             f"{colmap_cmd} bundle_adjuster",
             f"--input_path {sparse_dir}/0",
             f"--output_path {sparse_dir}/0",
-            "--BundleAdjustment.refine_principal_point 1",
-            f"--BundleAdjustment.use_gpu {int(gpu)}",
+            f"--project_path {bundle_adjuster_project_file}",
         ]
         run_command(" ".join(bundle_adjuster_cmd), verbose=verbose)
     CONSOLE.log("[bold green]:tada: Done refining intrinsics.")

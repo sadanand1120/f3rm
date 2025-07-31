@@ -22,3 +22,7 @@ glm4.1v-thinking:
   base_url: http://10.0.0.211:8008/v1
   api_key: smgen
   model: THUDM/GLM-4.1V-9B-Thinking
+
+dany2:
+  base_url: "http://10.0.0.211:8069"
+  api_key: "smdepth"
