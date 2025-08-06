@@ -1,10 +1,8 @@
 conda create -n f3rm python=3.10 -y
 conda activate f3rm
 conda install libffi==3.3 -y
-pip3 install torch torchvision torchaudio xformers --index-url https://download.pytorch.org/whl/cu124 && pip3 install ninja git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch && pip3 install numpy==1.26.4
+pip3 install torch torchvision torchaudio xformers --index-url https://download.pytorch.org/whl/cu128 && pip3 install ninja git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch && pip3 install numpy==1.26.4
 cd /robodata/smodak/repos/f3rm
-pip install -e .
-cd /robodata/smodak/repos/RoboPoint
 pip install -e .
 cd /robodata/smodak/repos/f3rm/Hierarchical-Localization
 pip install -e .

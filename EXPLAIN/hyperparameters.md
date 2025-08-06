@@ -483,6 +483,87 @@ camera_optimizer=CameraOptimizerConfig(
 )
 ```
 
+**Detailed Configuration Options**:
+```python
+@dataclass
+class CameraOptimizerConfig(InstantiateConfig):
+    mode: Literal["off", "SO3xR3", "SE3"] = "off"
+    """Pose optimization strategy. SO3xR3 recommended for noisy poses."""
+    
+    position_noise_std: float = 0.0
+    """Noise to add to initial positions (useful for debugging)."""
+    
+    orientation_noise_std: float = 0.0
+    """Noise to add to initial orientations (useful for debugging)."""
+    
+    optimizer: OptimizerConfig = field(default_factory=lambda: AdamOptimizerConfig(lr=6e-4, eps=1e-15))
+    """ADAM parameters for camera optimization."""
+    
+    scheduler: SchedulerConfig = field(default_factory=lambda: ExponentialDecaySchedulerConfig(max_steps=10000))
+    """Learning rate scheduler for camera optimizer."""
+```
+
+**Implementation Details**:
+- **Learnable Parameters**: 6 parameters per camera (3 rotation + 3 translation)
+- **Initialization**: All pose adjustments start at zero (identity transformation)
+- **Optimization**: Adam optimizer with learning rate 6e-4
+- **Memory Overhead**: Minimal (~6 parameters per camera)
+- **Integration**: Applied during ray generation in `Cameras.generate_rays()`
+
+**Mathematical Foundation**:
+```python
+# For SO3xR3 mode:
+pose_adjustment ∈ R^(num_cameras × 6)  # [ω_x, ω_y, ω_z, t_x, t_y, t_z]
+T_adjustment = exp_map_SO3xR3(pose_adjustment)  # Lie group exponential mapping
+T_final = T_original @ T_adjustment  # Apply adjustment to original pose
+```
+
+**When to Use**:
+- **mode="off"**: When camera poses are accurate (e.g., COLMAP reconstruction)
+- **mode="SO3xR3"**: When poses have noise (e.g., Record3D, handheld capture)
+- **mode="SE3"**: Alternative to SO3xR3 for joint pose optimization
+
+**Performance Impact**:
+- **Training Speed**: Minimal overhead (~1-2% slower)
+- **Memory Usage**: Negligible additional memory
+- **Quality Improvement**: Significant for noisy poses, minimal for accurate poses
+
+**Accessing Optimized Camera Poses**:
+```python
+# Optimized poses are computed on-the-fly, not stored separately
+# Here's how to access them:
+
+# Method 1: Direct access via camera optimizer parameters
+camera_optimizer = pipeline.datamanager.train_camera_optimizer
+pose_adjustments = camera_optimizer.pose_adjustment  # [num_cameras, 6]
+
+# Get adjustment for specific camera
+camera_idx = len(pipeline.datamanager.train_dataset.cameras) - 1
+camera_pose_adjustment = pose_adjustments[camera_idx:camera_idx+1]
+
+# Convert to transformation matrix
+from nerfstudio.cameras.lie_groups import exp_map_SO3xR3
+camera_opt_to_camera = exp_map_SO3xR3(camera_pose_adjustment)[0]
+
+# Get original and optimized poses
+original_c2w_34 = pipeline.datamanager.train_dataset.cameras[-1].camera_to_worlds.cpu().numpy()
+original_c2w = np.vstack([original_c2w_34, np.array([[0, 0, 0, 1]])])
+optimized_c2w = original_c2w @ camera_opt_to_camera
+
+# Method 2: Access through ray generator
+ray_generator = pipeline.datamanager.train_ray_generator
+camera_idx = torch.tensor([len(pipeline.datamanager.train_dataset.cameras) - 1])
+camera_opt_to_camera = ray_generator.pose_optimizer(camera_idx)
+```
+
+**Key Implementation Details**:
+- **No separate storage**: Optimized poses computed on-the-fly during ray generation
+- **Formula**: `optimized_pose = original_pose @ camera_optimizer_adjustment`
+- **6D representation**: `[ω_x, ω_y, ω_z, t_x, t_y, t_z]` for smooth optimization
+- **Lie group properties**: Exponential mapping preserves group structure
+- **Implicit supervision**: Photometric loss drives pose refinement
+```
+
 ### 16. Feature Field Positional Encoding via `FeatureFieldModelConfig`
 ```python
 # From f3rm/model.py

@@ -2,7 +2,7 @@
 """
 Standalone Feature Extraction Script
 
-This script extracts features (CLIP, DINO, ROBOPOINT, or DINOCLIP) for a dataset
+This script extracts features (CLIP or DINO) for a dataset
 and caches them in shards at the exact same location and format as expected by
 the training pipeline. This allows pre-processing features independently of training.
 
@@ -12,7 +12,7 @@ Usage:
         --feature-type CLIP \
         --shard-size 64
 
-Supported feature types: CLIP, DINO, ROBOPOINTproj, ROBOPOINTnoproj, DINOCLIP
+Supported feature types: CLIP, DINO
 """
 
 import argparse
@@ -29,7 +29,6 @@ from tqdm.auto import tqdm
 
 from f3rm.features.clip_extract import CLIPArgs, extract_clip_features
 from f3rm.features.dino_extract import DINOArgs, extract_dino_features
-from f3rm.features.robopoint_extract import ROBOPOINTArgs, extract_robopoint_proj_features, extract_robopoint_noproj_features
 
 
 class LazyFeatures:
@@ -73,15 +72,11 @@ class LazyFeatures:
 FEAT_TYPE_TO_EXTRACT_FN = {
     "CLIP": extract_clip_features,
     "DINO": extract_dino_features,
-    "ROBOPOINTproj": extract_robopoint_proj_features,
-    "ROBOPOINTnoproj": extract_robopoint_noproj_features,
 }
 
 FEAT_TYPE_TO_ARGS = {
     "CLIP": CLIPArgs,
     "DINO": DINOArgs,
-    "ROBOPOINTproj": ROBOPOINTArgs,
-    "ROBOPOINTnoproj": ROBOPOINTArgs,
 }
 
 
@@ -217,84 +212,43 @@ def get_image_filenames_from_dataparser(data_dir: Path) -> List[str]:
 def extract_features_for_dataset(
     image_fnames: List[str],
     data_dir: Path,
-    feature_type: Literal["CLIP", "DINO", "ROBOPOINTproj", "ROBOPOINTnoproj", "DINOCLIP"],
+    feature_type: Literal["CLIP", "DINO"],
     device: torch.device,
     shard_size: int = 64,
     enable_cache: bool = True,
     force: bool = False,
-) -> Union[torch.Tensor, Dict[str, torch.Tensor], LazyFeatures, Dict[str, LazyFeatures]]:
+) -> Union[torch.Tensor, LazyFeatures]:
     """
     Extract features for a dataset (same logic as FeatureDataManager.extract_features_sharded).
 
     Returns:
-        - For single feature types: LazyFeatures or torch.Tensor
-        - For DINOCLIP: Dict with keys "dino" and "clip"
+        - LazyFeatures or torch.Tensor
     """
-    if feature_type == "DINOCLIP":
-        # Handle DINOCLIP: extract both DINO and CLIP
-        out: Dict[str, LazyFeatures] = {}
-        for sub_type in ("DINO", "CLIP"):
-            fn, args = FEAT_TYPE_TO_EXTRACT_FN[sub_type], FEAT_TYPE_TO_ARGS[sub_type]
+    fn, args = FEAT_TYPE_TO_EXTRACT_FN[feature_type], FEAT_TYPE_TO_ARGS[feature_type]
 
-            CONSOLE.print(f"[DEBUG] {sub_type}: enable_cache={enable_cache}, checking for cached features...")
-            feats = (
-                feature_loader(image_fnames, args, data_dir, sub_type, device)
-                if enable_cache
-                else None
-            )
+    CONSOLE.print(f"[DEBUG] {feature_type}: enable_cache={enable_cache}, checking for cached features...")
+    feats = (
+        feature_loader(image_fnames, args, data_dir, feature_type, device)
+        if enable_cache and not force
+        else None
+    )
 
-            if feats is None:
-                CONSOLE.print(f"[DEBUG] {sub_type}: CACHE MISS → extracting features")
-                CONSOLE.print(f"{sub_type}: cache miss → extracting…")
-                if enable_cache and not force:
-                    feature_saver(image_fnames, fn, args, data_dir, sub_type, device, shard_size)
-                    feats = feature_loader(image_fnames, args, data_dir, sub_type, device)
-                else:
-                    # fall-back: immediate extraction, still lazy in one shard
-                    tmp = fn(image_fnames, device).cpu().numpy()
-                    np.save(data_dir / f"tmp_{sub_type.lower()}.npy", tmp, allow_pickle=False)
-                    del tmp
-                    feats = LazyFeatures([data_dir / f"tmp_{sub_type.lower()}.npy"], device)
-            else:
-                CONSOLE.print(f"[DEBUG] {sub_type}: CACHE HIT → reusing cached features")
-
-            out[sub_type.lower()] = feats
-        return {"dino": out["dino"], "clip": out["clip"]}
-
-    else:
-        # Handle single feature type
-        if feature_type not in FEAT_TYPE_TO_EXTRACT_FN:
-            raise ValueError(f"Unknown feature type: {feature_type}")
-
-        fn, args = FEAT_TYPE_TO_EXTRACT_FN[feature_type], FEAT_TYPE_TO_ARGS[feature_type]
-
-        CONSOLE.print(f"[DEBUG] {feature_type}: enable_cache={enable_cache}, checking for cached features...")
-        feats = (
-            feature_loader(image_fnames, args, data_dir, feature_type, device)
-            if enable_cache
-            else None
-        )
-
-        if feats is None:
-            CONSOLE.print(f"[DEBUG] {feature_type}: CACHE MISS → extracting features")
-            CONSOLE.print("Cache miss → extracting…")
-            if enable_cache and not force:
-                feature_saver(image_fnames, fn, args, data_dir, feature_type, device, shard_size)
-                feats = feature_loader(image_fnames, args, data_dir, feature_type, device)
-            else:
-                tmp = fn(image_fnames, device).cpu().numpy()
-                np.save(data_dir / "tmp.npy", tmp, allow_pickle=False)
-                del tmp
-                feats = LazyFeatures([data_dir / "tmp.npy"], device)
-        else:
-            CONSOLE.print(f"[DEBUG] {feature_type}: CACHE HIT → reusing cached features")
-
+    if feats is not None:
+        CONSOLE.print(f"[{feature_type}] Using cached features")
         return feats
+
+    CONSOLE.print(f"[{feature_type}] Extracting features...")
+    feats = fn(image_fnames, device)
+
+    if enable_cache:
+        feature_saver(feats, image_fnames, args, data_dir, feature_type)
+
+    return feats
 
 
 def extract_features_standalone(
     data_dir: Path,
-    feature_type: Literal["CLIP", "DINO", "ROBOPOINTproj", "ROBOPOINTnoproj", "DINOCLIP"],
+    feature_type: Literal["CLIP", "DINO"],
     shard_size: int = 64,
     device: str = "auto",
     force: bool = False,
@@ -344,7 +298,7 @@ def main():
 
     parser.add_argument(
         "--feature-type",
-        choices=["CLIP", "DINO", "ROBOPOINTproj", "ROBOPOINTnoproj", "DINOCLIP"],
+        choices=["CLIP", "DINO"],
         default="CLIP",
         help="Feature type to extract"
     )

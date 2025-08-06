@@ -22,17 +22,21 @@ F3RM extends the Nerfacto model from Nerfstudio to enable distillation of 2D fou
 
 ### Pipeline Overview
 ```
-Camera Parameters → Ray Generation → Proposal Sampling → Field Evaluation → Volume Rendering → Loss Computation
-     (Pre)              (Pre)            (Pre)            (Model_Fwd)        (Post)           (Post)
+Camera Parameters → Camera Pose Refinement → Ray Generation → Proposal Sampling → Field Evaluation → Volume Rendering → Loss Computation
+     (Pre)              (Pre)                   (Pre)            (Pre)            (Model_Fwd)        (Post)           (Post)
 ```
 
 ### Stage-by-Stage Analysis
 
 #### **Pre-Processing Stage** (Shared across all heads)
 ```python
-# 1. Camera Ray Generation (Shared)
+# 1. Camera Pose Refinement (Shared)
+# Location: CameraOptimizer.forward() → RayGenerator.forward()
+camera_opt_to_camera = self.pose_optimizer(camera_indices)  # Learnable pose adjustments
+
+# 2. Camera Ray Generation (Shared)
 # Location: VanillaDataManager.next_train() / next_eval()
-ray_bundle = cameras.generate_rays(camera_indices, coords)  # [N_rays, 3]
+ray_bundle = cameras.generate_rays(camera_indices, coords, camera_opt_to_camera)  # [N_rays, 3]
 
 # 2. Proposal Sampling (Shared)  
 # Location: ProposalNetworkSampler.generate_ray_samples()
@@ -103,7 +107,7 @@ batch["feature"] = self._gather_feats(self.features, camera_idx, y_idx, x_idx)
 outputs["feature_pca"], viewer_utils.pca_proj, *_ = apply_pca_colormap_return_proj(...)
 
 # Language similarity computation (CLIP only)
-if self.kwargs["metadata"]["feature_type"] in ["CLIP", "DINOCLIP"]:
+if self.kwargs["metadata"]["feature_type"] in ["CLIP", "DINO"]:
     clip_features = outputs["feature"] / outputs["feature"].norm(dim=-1, keepdim=True)
     sims = clip_features @ viewer_utils.pos_embed.T
     outputs["similarity"] = sims
@@ -263,7 +267,7 @@ The system is implemented in PyTorch using:
 
 - **Memory Usage**: ~12GB GPU memory with default settings (`eval_num_rays_per_chunk=1<<14`)
 - **Training Speed**: ~30K training iterations in 2-3 hours on RTX 3090
-- **Feature Types**: CLIP (512D), DINO (768D), ROBOPOINT (custom dimensions)
+- **Feature Types**: CLIP (512D), DINO (768D)
 - **Quality**: Photorealistic RGB + semantic understanding for language queries
 
 The system achieves high-quality 3D scene understanding by combining traditional NeRF photometric supervision with semantic feature distillation from 2D foundation models, enabling both visual reconstruction and language-guided scene understanding. 

@@ -2,7 +2,79 @@
 
 ## Overview
 
-F3RM consists of multiple neural networks working in parallel: RGB/density fields, feature fields, proposal networks, and auxiliary heads. All networks use modern hash grid encodings and MLP architectures optimized for speed and quality via the `NerfactoField` (`/opt/miniconda3/envs/f3rm/lib/python3.9/site-packages/nerfstudio/fields/nerfacto_field.py`) and `FeatureField` (`f3rm/feature_field.py`).
+F3RM consists of multiple neural networks working in parallel: RGB/density fields, feature fields, proposal networks, and auxiliary heads. All networks use modern hash grid encodings and MLP architectures optimized for speed and quality via the `NerfactoField` (`/opt/miniconda3/envs/f3rm/lib/python3.10/site-packages/nerfstudio/fields/nerfacto_field.py`) and `FeatureField` (`f3rm/feature_field.py`).
+
+## Architecture Definitions
+
+### NerfactoField Architecture
+**Location**: `/opt/miniconda3/envs/f3rm/lib/python3.10/site-packages/nerfstudio/fields/nerfacto_field.py:73-99`
+
+```python
+class NerfactoField(Field):
+    def __init__(self, aabb, num_images, num_layers=2, hidden_dim=64, geo_feat_dim=15,
+                 num_levels=16, base_res=16, max_res=2048, log2_hashmap_size=19,
+                 num_layers_color=3, features_per_level=2, hidden_dim_color=64,
+                 appearance_embedding_dim=32, use_pred_normals=False, ...):
+        
+        # Core components
+        self.mlp_base_grid = HashEncoding(num_levels=16, min_res=16, max_res=2048, 
+                                         log2_hashmap_size=19, features_per_level=2)
+        self.mlp_base_mlp = MLP(in_dim=32, num_layers=2, layer_width=64, out_dim=16)
+        self.mlp_head = MLP(in_dim=72, num_layers=3, layer_width=64, out_dim=3)
+        
+        # Encodings
+        self.direction_encoding = SHEncoding(levels=4)  # 25 dims
+        self.position_encoding = NeRFEncoding(num_frequencies=2)  # 12 dims (optional)
+        
+        # Embeddings
+        self.embedding_appearance = Embedding(num_images, 32)
+        
+        # Optional heads
+        if use_pred_normals:
+            self.mlp_pred_normals = MLP(in_dim=27, num_layers=3, layer_width=64, out_dim=64)
+```
+
+### F3RM FeatureField Architecture  
+**Location**: `f3rm/model.py:30-48` (config) + `f3rm/feature_field.py:17-75` (implementation)
+
+```python
+class FeatureFieldModelConfig(NerfactoModelConfig):
+    # Feature field parameters
+    feat_loss_weight: float = 1e-3
+    feat_use_pe: bool = True
+    feat_pe_n_freq: int = 6
+    feat_num_levels: int = 12
+    feat_log2_hashmap_size: int = 19
+    feat_start_res: int = 16
+    feat_max_res: int = 128
+    feat_features_per_level: int = 8
+    feat_hidden_dim: int = 64
+    feat_num_layers: int = 2
+
+class FeatureField(Field):
+    def __init__(self, feature_dim, spatial_distortion, use_pe=True, pe_n_freq=6,
+                 num_levels=12, log2_hashmap_size=19, start_res=16, max_res=128,
+                 features_per_level=8, hidden_dim=64, num_layers=2):
+        
+        # TCNN network with composite encoding
+        self.field = tcnn.NetworkWithInputEncoding(
+            n_input_dims=3,
+            n_output_dims=feature_dim,  # 768 for CLIP
+            encoding_config={
+                "otype": "Composite",
+                "nested": [
+                    {"otype": "HashGrid", "n_levels": 12, "n_features_per_level": 8, 
+                     "log2_hashmap_size": 19, "base_resolution": 16, "max_resolution": 128},
+                    {"otype": "Frequency", "n_frequencies": 6, "n_dims_to_encode": 3}  # if use_pe
+                ]
+            },
+            network_config={
+                "otype": "FullyFusedMLP",
+                "n_neurons": 64,
+                "n_hidden_layers": 2
+            }
+        )
+```
 
 ## Core Architecture Components
 

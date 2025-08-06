@@ -32,10 +32,10 @@ F3RM (Feature Field for 3D Reconstruction and Manipulation) is a modified Nerfac
 - **[Ground Truth Normals Output](ground_truth_normals_output.md)** - `Field.get_normals()` computes surface normals `f_gt_normals: ∇σ(x,y,z) → (n_x,n_y,n_z)`
 
 ### Technical Deep Dives
-- **[Ray Pipeline](ray_pipeline.md)** - Complete pre/model_fwd/post stage analysis via `FeatureFieldModel.get_outputs()`
+- **[Ray Pipeline](ray_pipeline.md)** - Complete pre/model_fwd/post stage analysis via `FeatureFieldModel.get_outputs()` including **camera pose refinement** via `CameraOptimizer` with detailed coverage of **6D exponential coordinates**, **accessing optimized poses**, and **implicit supervision**
 - **[Model Architecture](model_architecture.md)** - Neural network architecture details via `FeatureFieldModelConfig` and `NerfactoModelConfig`
 - **[Combined Losses](losses_combined.md)** - Training objectives via `FeatureFieldModel.get_loss_dict()` in `f3rm/model.py`
-- **[Hyperparameters](hyperparameters.md)** - Configuration and tuning via `F3RMTrainerConfig` in `f3rm/trainer.py`
+- **[Hyperparameters](hyperparameters.md)** - Configuration and tuning via `F3RMTrainerConfig` in `f3rm/trainer.py` including **camera optimization** configuration and **pose access methods**
 
 ## Multi-Head Architecture
 
@@ -105,7 +105,7 @@ wᵢ = αᵢ Πⱼ₌₁ᶦ⁻¹ (1-αⱼ)
 ### Architecture Details
 - **Hash Grid Encoding**: Multi-resolution spatial encoding for RGB (`NerfactoModelConfig`) and Features (`FeatureFieldModelConfig`)
 - **Volume Rendering**: Discretized integration via `ray_samples.get_weights()`
-- **Feature Types**: CLIP (768D), DINO (384D), DINOCLIP (dual), ROBOPOINT (custom) via `FeatureDataManagerConfig`
+- **Feature Types**: CLIP (768D), DINO (384D) via `FeatureDataManagerConfig`
 
 ### Configuration Files
 - **Main Config**: `f3rm/f3rm_config.py` - Overall training configuration
@@ -134,8 +134,6 @@ wᵢ = αᵢ Πⱼ₌₁ᶦ⁻¹ (1-αⱼ)
 ### Feature Dimensions
 - **CLIP ViT-L-14-336**: 768-dimensional features
 - **DINO ViT-S**: 384-dimensional features  
-- **DINOCLIP**: Dual features (768D + 384D)
-- **ROBOPOINT**: Custom dimensions for robotics
 
 ### Quality Metrics
 - **RGB Quality**: PSNR 25-30 dB, SSIM >0.9, LPIPS <0.1

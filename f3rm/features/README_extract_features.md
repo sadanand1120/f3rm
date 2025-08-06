@@ -38,11 +38,6 @@ python f3rm/features/extract_features_standalone.py \
     --feature-type DINO \
     --shard-size 32
 
-# Extract both DINO and CLIP for DINOCLIP training
-python f3rm/features/extract_features_standalone.py \
-    --data datasets/f3rm/custom/scene001 \
-    --feature-type DINOCLIP
-
 # Force re-extraction even if cache exists
 python f3rm/features/extract_features_standalone.py \
     --data datasets/f3rm/custom/scene001 \
@@ -53,7 +48,7 @@ python f3rm/features/extract_features_standalone.py \
 ## Arguments
 
 - `--data`: Path to the dataset directory (must contain `transforms.json`)
-- `--feature-type`: Feature type to extract (`CLIP`, `DINO`, `ROBOPOINTproj`, `ROBOPOINTnoproj`, `DINOCLIP`)
+- `--feature-type`: Feature type to extract (`CLIP`, `DINO`)
 - `--shard-size`: Number of images per shard (default: 64)
 - `--device`: Device to use (`auto`, `cuda`, `cpu`, `cuda:0`, etc.)
 - `--force`: Force re-extraction even if cache exists
