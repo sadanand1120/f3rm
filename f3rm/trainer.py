@@ -95,6 +95,12 @@ class F3RMTrainer(Trainer):
         # Call parent setup
         super().setup(test_mode)
 
+        # Pass trainer context to model and datamanager for custom use
+        if hasattr(self.pipeline, 'model'):
+            self.pipeline.model._trainer = self
+        if hasattr(self.pipeline, 'datamanager'):
+            self.pipeline.datamanager._trainer = self
+
         # Additional validation after setup
         if self.config.enable_comprehensive_seeding and self.config.print_seed_info:
             CONSOLE.print("[bold blue]🔍 Post-setup seeding validation:")
@@ -109,3 +115,7 @@ class F3RMTrainer(Trainer):
 
         # Call parent train method
         super().train()
+
+    def train_iteration(self, step: int) -> None:
+        """Override training iteration for possible custom use."""
+        return super().train_iteration(step)

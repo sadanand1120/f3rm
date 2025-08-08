@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from functools import cached_property
-from typing import Dict, List, Optional, Type
+from typing import Dict, List, Optional, Type, Tuple
 
 import open_clip
 import torch
@@ -14,6 +14,8 @@ from nerfstudio.model_components.losses import (
 )
 from nerfstudio.models.nerfacto import NerfactoModel, NerfactoModelConfig
 from nerfstudio.utils.rich_utils import CONSOLE
+from rich.progress import Progress, BarColumn, MofNCompleteColumn, TimeElapsedColumn, TextColumn
+import time
 from nerfstudio.viewer.server.viewer_elements import (
     ViewerButton,
     ViewerNumber,
@@ -46,6 +48,11 @@ class FeatureFieldModelConfig(NerfactoModelConfig):
     # Feature Field MLP Head
     feat_hidden_dim: int = 64
     feat_num_layers: int = 2
+    # Centroid regression
+    centroid_loss_weight: float = 0.5
+    """Weight for centroid regression loss."""
+    do_sam2_after_steps: int = 5000
+    """Start centroid regression after this many training steps (cold-start)."""
 
 
 @dataclass
@@ -127,9 +134,11 @@ class FeatureFieldModel(NerfactoModel):
 
         feat_type = self.kwargs["metadata"]["feature_type"]
         feature_dim = self.kwargs["metadata"]["feature_dim"]
+        self._do_sam2 = self.kwargs["metadata"].get("do_sam2", False)
         if feature_dim <= 0:
             raise ValueError("Feature dimensionality must be positive.")
 
+        # Always create centroid head if SAM2 is configured (even during cold-start)
         self.feature_field = FeatureField(
             feature_dim=feature_dim,
             spatial_distortion=self.field.spatial_distortion,
@@ -142,10 +151,40 @@ class FeatureFieldModel(NerfactoModel):
             features_per_level=self.config.feat_features_per_level,
             hidden_dim=self.config.feat_hidden_dim,
             num_layers=self.config.feat_num_layers,
+            enable_centroid=self._do_sam2,  # Create head if configured, regardless of step
         )
 
         self.renderer_feature = FeatureRenderer()
+
+        # Centroid cache (per-batch of images). Keys: (image_name, instance_id) -> centroid (3,)
+        self._centroid_cache: Dict[Tuple[str, int], torch.Tensor] = {}
+        self._cached_images: set[str] = set()
+        self._index_maps_built: bool = False
+        self._train_name_to_idx: Dict[str, int] = {}
+        self._eval_name_to_idx: Dict[str, int] = {}
+        self._centroid_started: bool = False  # Track if we've announced centroid start
+        self._current_step: int = 0  # Track training step ourselves
+
+        # Announce cold-start configuration
+        if self._do_sam2:
+            CONSOLE.print(f"[SAM2] Centroid regression configured with cold-start: will begin at step {self.config.do_sam2_after_steps}")
+
         self.setup_gui()
+
+    @property
+    def enable_centroid(self) -> bool:
+        """Dynamic property that enables centroid regression after cold-start period."""
+        if not self._do_sam2:
+            return False
+
+        should_enable = self._current_step >= self.config.do_sam2_after_steps
+
+        # One-time announcement when centroid regression starts
+        if should_enable and not self._centroid_started:
+            CONSOLE.print(f"[SAM2] Starting centroid regression at step {self._current_step} (cold-start period complete)")
+            self._centroid_started = True
+
+        return should_enable
 
     def setup_gui(self):
         viewer_utils.device = self.kwargs["device"]
@@ -172,6 +211,180 @@ class FeatureFieldModel(NerfactoModel):
             cb_hook=lambda elem: viewer_utils.update_softmax_temp(elem.value),
         )
 
+    def _compute_centroid_targets(self, outputs: Dict, batch: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute centroid-offset targets using cached per-image centroids under no_grad.
+
+        The cache is refreshed once whenever the set of image_names in the batch changes.
+        Returns (targets, mask). All computations here are detached to avoid gradient circularity.
+        """
+        if not ("depth" in outputs and "ray_origins" in outputs and "ray_directions" in outputs
+                and "image_name" in batch and "sam2_mask" in batch):
+            # Skip this step if inputs aren't ready (timing issue during cold-start activation)
+            n = len(batch.get("image_name", []))
+            return torch.zeros((n, 3), device=self.device), torch.zeros(n, dtype=torch.bool, device=self.device)
+
+        with torch.no_grad():
+            # Refresh cache if needed for current batch images
+            self._maybe_refresh_centroid_cache(batch)
+
+            depths = outputs["depth"].squeeze(-1)
+            ray_origins = outputs["ray_origins"]
+            ray_directions = outputs["ray_directions"]
+            image_names = batch["image_name"]
+            sam2_masks = batch["sam2_mask"]
+
+            # Compute 3D positions once
+            positions = ray_origins + depths.unsqueeze(-1) * ray_directions  # (N,3)
+            n = positions.shape[0]
+
+            targets = torch.zeros((n, 3), device=self.device)
+            mask = torch.zeros(n, dtype=torch.bool, device=self.device)
+
+            for i in range(n):
+                instance_id = int(sam2_masks[i].item()) if torch.is_tensor(sam2_masks) else int(sam2_masks[i])
+                if instance_id <= 0:
+                    continue
+                key = (image_names[i], instance_id)
+                centroid = self._centroid_cache.get(key)
+                if centroid is None:
+                    continue
+                targets[i] = centroid - positions[i]
+                mask[i] = True
+
+        return targets, mask
+
+    def _build_index_maps_if_needed(self) -> None:
+        if getattr(self, '_index_maps_built', False):
+            return
+        dm = getattr(getattr(self, "_trainer", None), "pipeline", None)
+        if dm is None:
+            return
+        dm = dm.datamanager
+        train_files = [str(p) for p in dm.train_dataset.image_filenames]
+        eval_files = [str(p) for p in dm.eval_dataset.image_filenames]
+        self._train_name_to_idx = {fn: i for i, fn in enumerate(train_files)}
+        self._eval_name_to_idx = {fn: i for i, fn in enumerate(eval_files)}
+        self._index_maps_built = True
+
+    def _lookup_image_indices(self, image_name: str) -> Tuple[str, int, int]:
+        """Return (split, local_idx, global_idx) for a given image name."""
+        dm = getattr(getattr(self, "_trainer", None), "pipeline", None)
+        if dm is None:
+            raise RuntimeError("Trainer/datamanager not available")
+        dm = dm.datamanager
+        self._build_index_maps_if_needed()
+
+        if image_name in self._train_name_to_idx:
+            li = self._train_name_to_idx[image_name]
+            return ("train", int(li), int(li))
+        if image_name in self._eval_name_to_idx:
+            li = self._eval_name_to_idx[image_name]
+            gi = li + len(dm.train_dataset)
+            return ("eval", int(li), int(gi))
+
+        raise KeyError(f"Image name not found in datasets: {image_name}")
+
+    def _maybe_refresh_centroid_cache(self, batch: Dict) -> None:
+        if not self.enable_centroid:
+            return
+        image_names: List[str] = batch.get("image_name", [])
+        if not image_names:
+            return
+        current = set(image_names)
+        if current == self._cached_images:
+            return
+
+        # New batch encountered: recompute cache for these images
+        self._centroid_cache.clear()
+        self._cached_images = current
+        if not hasattr(self, "_trainer"):
+            return
+        self._build_index_maps_if_needed()
+        num_images = len(current)
+        CONSOLE.print(f"[SAM2] Recomputing per-image centroids for {num_images} images")
+        with Progress(
+            TextColumn("[bold cyan]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            transient=True,
+        ) as progress:
+            task = progress.add_task("Computing centroids", total=num_images)
+            start_all = time.perf_counter()
+            for name in current:
+                self._compute_and_store_image_centroids(name)
+                progress.update(task, advance=1)
+            CONSOLE.print(f"[SAM2] Centroid cache refresh complete in {time.perf_counter()-start_all:.2f}s")
+
+    @torch.no_grad()
+    def _compute_and_store_image_centroids(self, image_name: str) -> None:
+        dm = getattr(getattr(self, "_trainer", None), "pipeline", None)
+        if dm is None:
+            return
+        dm = dm.datamanager
+        split, local_idx, global_idx = self._lookup_image_indices(image_name)
+
+        cameras = dm.train_dataset.cameras if split == "train" else dm.eval_dataset.cameras
+        cameras = cameras.to(self.device)
+
+        # Full-image rays and depth render
+        rb = cameras.generate_rays(camera_indices=int(local_idx)).to(self.device)
+        # Use base implementation to avoid viewer PCA and extra work
+        outputs = super().get_outputs_for_camera_ray_bundle(rb)
+        depth = outputs.get("depth", None)
+        if depth is None:
+            return
+        depth = depth.squeeze(-1)  # (H,W)
+
+        origins = rb.origins.squeeze(0)  # (H,W,3)
+        directions = rb.directions.squeeze(0)  # (H,W,3)
+        positions = origins + directions * depth.unsqueeze(-1)  # (H,W,3)
+
+        # Load SAM2 mask for this image (global index over train+eval)
+        sam2 = getattr(dm, "sam2_masks", None)
+        if sam2 is None:
+            return
+
+        # LazyFeatures expects (image_idx, y, x) triple, but we need full image
+        # Access the underlying shard data directly
+        sid, shard_local_idx = sam2._loc(int(global_idx))
+        shard = sam2._get_shard(sid)
+        mask = shard[shard_local_idx]  # (H, W, 1) numpy array
+
+        if isinstance(mask, torch.Tensor):
+            mask = mask.to(self.device)
+        else:
+            mask = torch.as_tensor(mask, device=self.device)
+
+        # Ensure mask is (H,W)
+        if mask.dim() == 3 and mask.shape[-1] == 1:
+            mask = mask[..., 0]
+        elif mask.dim() == 3 and mask.shape[0] == 1:
+            mask = mask[0]
+
+        # Resize mask to match depth resolution if needed (nearest)
+        H_img, W_img = depth.shape[-2], depth.shape[-1]
+        if mask.shape != depth.shape:
+            mask_ = mask.unsqueeze(0).unsqueeze(0).float()
+            mask = F.interpolate(mask_, size=(H_img, W_img), mode="nearest").squeeze().long()
+        else:
+            mask = mask.long()
+
+        # Compute per-instance centroids
+        pos_flat = positions.view(-1, 3)
+        ids_flat = mask.view(-1)
+        unique_ids = torch.unique(ids_flat)
+        cached = 0
+        for iid in unique_ids.tolist():
+            if iid <= 0:
+                continue
+            sel = ids_flat == iid
+            if not torch.any(sel):
+                continue
+            centroid = pos_flat[sel].mean(dim=0)
+            self._centroid_cache[(image_name, int(iid))] = centroid.detach()
+            cached += 1
+
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
         param_groups = super().get_param_groups()
         param_groups["feature_field"] = list(self.feature_field.parameters())
@@ -195,17 +408,28 @@ class FeatureFieldModel(NerfactoModel):
         expected_depth = self.renderer_expected_depth(weights=weights, ray_samples=ray_samples)
         accumulation = self.renderer_accumulation(weights=weights)
 
-        # Feature outputs
-        ff_outputs = self.feature_field(ray_samples)
+        _, density_embedding = self.field.get_density(ray_samples)
+        ff_outputs = self.feature_field(ray_samples, density_embedding=density_embedding)
         features = self.renderer_feature(features=ff_outputs[FeatureFieldHeadNames.FEATURE], weights=weights)
 
-        outputs = {
+        outputs: Dict[str, torch.Tensor] = {
             "rgb": rgb,
             "accumulation": accumulation,
             "depth": depth,
             "expected_depth": expected_depth,
             "feature": features,
         }
+
+        # Expose per-ray positions ingredients for centroid supervision if enabled
+        if self.enable_centroid:
+            # Use the input ray bundle per-ray origins and directions
+            outputs["ray_origins"] = ray_bundle.origins.view(-1, 3)
+            outputs["ray_directions"] = ray_bundle.directions.view(-1, 3)
+
+        # Add centroid outputs if enabled
+        if self.enable_centroid:
+            centroids = self.renderer_feature(features=ff_outputs[FeatureFieldHeadNames.CENTROID], weights=weights)
+            outputs["centroid"] = centroids
 
         if self.config.predict_normals:
             normals = self.renderer_normals(normals=field_outputs[FieldHeadNames.NORMALS], weights=weights)
@@ -237,12 +461,45 @@ class FeatureFieldModel(NerfactoModel):
         metrics_dict = super().get_metrics_dict(outputs, batch)
         target_feats = batch["feature"].to(self.device)
         metrics_dict["feature_error"] = F.mse_loss(outputs["feature"], target_feats)
+
+        # Add centroid metrics with on-the-fly batch centroids
+        if self.enable_centroid:
+            centroid_targets, centroid_mask = self._compute_centroid_targets(outputs, batch)
+
+            if centroid_mask.any():
+                pred_centroids = outputs["centroid"][centroid_mask]
+                target_centroids = centroid_targets[centroid_mask]
+                metrics_dict["centroid_error"] = F.mse_loss(pred_centroids, target_centroids)
+                metrics_dict["num_centroid_targets"] = centroid_mask.sum().float()
+            else:
+                metrics_dict["centroid_error"] = torch.tensor(0.0, device=self.device)
+                metrics_dict["num_centroid_targets"] = torch.tensor(0.0, device=self.device)
+
         return metrics_dict
 
     def get_loss_dict(self, outputs, batch, metrics_dict=None):
+        # Increment our step counter during training
+        if self.training:
+            self._current_step += 1
+
         loss_dict = super().get_loss_dict(outputs, batch, metrics_dict)
         target_feats = batch["feature"].to(self.device)
         loss_dict["feature_loss"] = self.config.feat_loss_weight * F.mse_loss(outputs["feature"], target_feats)
+
+        # Handle centroid loss with on-the-fly batch centroids
+        if self.enable_centroid:
+            centroid_targets, centroid_mask = self._compute_centroid_targets(outputs, batch)
+
+            # Compute loss only on valid centroid targets
+            if centroid_mask.any():
+                pred_centroids = outputs["centroid"][centroid_mask]
+                target_centroids = centroid_targets[centroid_mask]
+                loss_dict["centroid_loss"] = self.config.centroid_loss_weight * F.smooth_l1_loss(
+                    pred_centroids, target_centroids
+                )
+            else:
+                loss_dict["centroid_loss"] = torch.tensor(0.0, device=self.device)
+
         return loss_dict
 
     def get_outputs_for_camera_ray_bundle(self, camera_ray_bundle: RayBundle) -> Dict[str, torch.Tensor]:

@@ -2,7 +2,7 @@
 """
 Standalone Feature Extraction Script
 
-This script extracts features (CLIP or DINO) for a dataset
+This script extracts features (CLIP, DINO, or SAM2) for a dataset
 and caches them in shards at the exact same location and format as expected by
 the training pipeline. This allows pre-processing features independently of training.
 
@@ -12,7 +12,7 @@ Usage:
         --feature-type CLIP \
         --shard-size 64
 
-Supported feature types: CLIP, DINO
+Supported feature types: CLIP, DINO, SAM2
 """
 
 import argparse
@@ -29,6 +29,7 @@ from tqdm.auto import tqdm
 
 from f3rm.features.clip_extract import CLIPArgs, extract_clip_features
 from f3rm.features.dino_extract import DINOArgs, extract_dino_features
+from f3rm.features.sam2_extract import SAM2Args, extract_sam2_masks
 
 
 class LazyFeatures:
@@ -72,11 +73,13 @@ class LazyFeatures:
 FEAT_TYPE_TO_EXTRACT_FN = {
     "CLIP": extract_clip_features,
     "DINO": extract_dino_features,
+    "SAM2": extract_sam2_masks,
 }
 
 FEAT_TYPE_TO_ARGS = {
     "CLIP": CLIPArgs,
     "DINO": DINOArgs,
+    "SAM2": SAM2Args,
 }
 
 
@@ -88,7 +91,7 @@ def get_cache_paths(data_dir: Path, feature_type: str) -> Tuple[Path, Path]:
 
 def feature_saver(
     image_fnames: List[str],
-    extract_fn: Callable[[List[str], torch.device], torch.Tensor],
+    extract_fn: Callable,
     extract_args,
     data_dir: Path,
     feature_type: str,
@@ -106,8 +109,15 @@ def feature_saver(
 
     for i in tqdm(range(n_shards), desc=f"{feature_type}: extract→save"):
         s, e = i * shard_sz, min((i + 1) * shard_sz, n_imgs)
-        feats = extract_fn(image_fnames[s:e], device).cpu()
-        np.save(root / f"chunk_{i:04d}.npy", feats.numpy(), allow_pickle=False)
+
+        if feature_type == "SAM2":
+            # SAM2 returns numpy arrays directly
+            feats = extract_fn(image_fnames[s:e], verbose=False)
+        else:
+            # CLIP/DINO return torch tensors
+            feats = extract_fn(image_fnames[s:e], device).cpu().numpy()
+
+        np.save(root / f"chunk_{i:04d}.npy", feats, allow_pickle=False)
         del feats
         torch.cuda.empty_cache()
 
@@ -212,7 +222,7 @@ def get_image_filenames_from_dataparser(data_dir: Path) -> List[str]:
 def extract_features_for_dataset(
     image_fnames: List[str],
     data_dir: Path,
-    feature_type: Literal["CLIP", "DINO"],
+    feature_type: Literal["CLIP", "DINO", "SAM2"],
     device: torch.device,
     shard_size: int = 64,
     enable_cache: bool = True,
@@ -229,26 +239,30 @@ def extract_features_for_dataset(
     CONSOLE.print(f"[DEBUG] {feature_type}: enable_cache={enable_cache}, checking for cached features...")
     feats = (
         feature_loader(image_fnames, args, data_dir, feature_type, device)
-        if enable_cache and not force
+        if enable_cache
         else None
     )
 
-    if feats is not None:
-        CONSOLE.print(f"[{feature_type}] Using cached features")
-        return feats
-
-    CONSOLE.print(f"[{feature_type}] Extracting features...")
-    feats = fn(image_fnames, device)
-
-    if enable_cache:
-        feature_saver(feats, image_fnames, args, data_dir, feature_type)
+    if feats is None:
+        CONSOLE.print(f"[DEBUG] {feature_type}: CACHE MISS → extracting features")
+        CONSOLE.print("Cache miss → extracting…")
+        if enable_cache and not force:
+            feature_saver(image_fnames, fn, args, data_dir, feature_type, device, shard_size)
+            feats = feature_loader(image_fnames, args, data_dir, feature_type, device)
+        else:
+            tmp = fn(image_fnames, device).cpu().numpy()
+            np.save(data_dir / "tmp.npy", tmp, allow_pickle=False)
+            del tmp
+            feats = LazyFeatures([data_dir / "tmp.npy"], device)
+    else:
+        CONSOLE.print(f"[DEBUG] {feature_type}: CACHE HIT → reusing cached features")
 
     return feats
 
 
 def extract_features_standalone(
     data_dir: Path,
-    feature_type: Literal["CLIP", "DINO"],
+    feature_type: Literal["CLIP", "DINO", "SAM2"],
     shard_size: int = 64,
     device: str = "auto",
     force: bool = False,
@@ -298,7 +312,7 @@ def main():
 
     parser.add_argument(
         "--feature-type",
-        choices=["CLIP", "DINO"],
+        choices=["CLIP", "DINO", "SAM2"],
         default="CLIP",
         help="Feature type to extract"
     )

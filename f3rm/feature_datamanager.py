@@ -5,8 +5,10 @@ from typing import Dict, Literal, Tuple, Type, Union, Optional, List
 import numpy as np
 from pathlib import Path
 import torch
+import torch.nn.functional as F
 from jaxtyping import Float
 from nerfstudio.cameras.rays import RayBundle
+from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.data.datamanagers.base_datamanager import (
     VanillaDataManager,
     VanillaDataManagerConfig,
@@ -40,6 +42,8 @@ class FeatureDataManagerConfig(VanillaDataManagerConfig):
     """Feature type to extract."""
     enable_cache: bool = True
     """Whether to cache extracted features."""
+    do_sam2: bool = False
+    """Enable SAM2-based centroid regression."""
 
 
 class FeatureDataManager(VanillaDataManager):
@@ -58,6 +62,7 @@ class FeatureDataManager(VanillaDataManager):
         feat_dim = (self.features.C if isinstance(self.features, LazyFeatures) else self.features.shape[-1])
         self.train_dataset.metadata["feature_type"] = self.config.feature_type
         self.train_dataset.metadata["feature_dim"] = feat_dim
+        self.train_dataset.metadata["do_sam2"] = self.config.do_sam2
 
         # Determine scaling factors for nearest neighbor interpolation
         feat_h, feat_w = (features.H, features.W) if isinstance(features, LazyFeatures) else features.shape[1:3]
@@ -71,6 +76,10 @@ class FeatureDataManager(VanillaDataManager):
         # assert np.isclose(
         #    self.scale_h, self.scale_w, atol=1.5e-3
         # ), f"Scales must be similar, got h={self.scale_h} and w={self.scale_w}"
+
+        # SAM2 mask setup
+        if self.config.do_sam2:
+            self._setup_sam2_masks()
 
         # Garbage collect
         torch.cuda.empty_cache()
@@ -90,6 +99,24 @@ class FeatureDataManager(VanillaDataManager):
             enable_cache=self.config.enable_cache,
             force=False,  # don't force re-extraction during training
         )
+
+    def _setup_sam2_masks(self):
+        """Setup SAM2 mask loading."""
+        CONSOLE.print("Setting up SAM2 masks...")
+
+        # Load SAM2 instance masks
+        image_fnames = self.train_dataset.image_filenames + self.eval_dataset.image_filenames
+        self.sam2_masks = extract_features_for_dataset(
+            image_fnames=image_fnames,
+            data_dir=self.config.dataparser.data,
+            feature_type="SAM2",
+            device=self.device,
+            shard_size=64,
+            enable_cache=self.config.enable_cache,
+            force=False,
+        )
+
+        CONSOLE.print(f"SAM2 masks loaded: {type(self.sam2_masks)}")
 
     # Nearest-neighbor sampling helpers
     def _gather_feats(self, feats, camera_idx, y_idx, x_idx):
@@ -113,6 +140,17 @@ class FeatureDataManager(VanillaDataManager):
         batch["image"] = _async_to_cuda(batch["image"], self.device)
         camera_idx, y_idx, x_idx = self._index_triplet(batch, self.scale_h, self.scale_w)
         batch["feature"] = self._gather_feats(self.features, camera_idx, y_idx, x_idx)
+
+        # Add image names to batch for centroid caching by image name
+        batch["image_name"] = [
+            str(self.train_dataset.image_filenames[int(idx)])
+            for idx in camera_idx
+        ]
+
+        # Add SAM2 masks if enabled
+        if self.config.do_sam2:
+            batch["sam2_mask"] = self._gather_feats(self.sam2_masks, camera_idx, y_idx, x_idx)
+
         if step % 100 == 0:
             torch.cuda.empty_cache()
         return ray_bundle, batch
@@ -123,4 +161,15 @@ class FeatureDataManager(VanillaDataManager):
         camera_idx, y_idx, x_idx = self._index_triplet(batch, self.scale_h, self.scale_w)
         camera_idx_global = camera_idx + self.eval_offset
         batch["feature"] = self._gather_feats(self.features, camera_idx_global, y_idx, x_idx)
+
+        # Add image names to batch for centroid caching by image name
+        batch["image_name"] = [
+            str(self.eval_dataset.image_filenames[int(idx)])
+            for idx in camera_idx
+        ]
+
+        # Add SAM2 masks if enabled
+        if self.config.do_sam2:
+            batch["sam2_mask"] = self._gather_feats(self.sam2_masks, camera_idx_global, y_idx, x_idx)
+
         return ray_bundle, batch
