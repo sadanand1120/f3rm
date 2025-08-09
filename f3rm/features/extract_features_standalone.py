@@ -2,7 +2,7 @@
 """
 Standalone Feature Extraction Script
 
-This script extracts features (CLIP or DINO) for a dataset
+This script extracts features (CLIP, DINO, or SAM2) for a dataset
 and caches them in shards at the exact same location and format as expected by
 the training pipeline. This allows pre-processing features independently of training.
 
@@ -12,7 +12,7 @@ Usage:
         --feature-type CLIP \
         --shard-size 64
 
-Supported feature types: CLIP, DINO
+Supported feature types: CLIP, DINO, SAM2
 """
 
 import argparse
@@ -29,6 +29,7 @@ from tqdm.auto import tqdm
 
 from f3rm.features.clip_extract import CLIPArgs, extract_clip_features
 from f3rm.features.dino_extract import DINOArgs, extract_dino_features
+from f3rm.features.sam2_extract import SAM2Args, extract_sam2_features
 
 
 class LazyFeatures:
@@ -72,11 +73,13 @@ class LazyFeatures:
 FEAT_TYPE_TO_EXTRACT_FN = {
     "CLIP": extract_clip_features,
     "DINO": extract_dino_features,
+    "SAM2": extract_sam2_features,
 }
 
 FEAT_TYPE_TO_ARGS = {
     "CLIP": CLIPArgs,
     "DINO": DINOArgs,
+    "SAM2": SAM2Args,
 }
 
 
@@ -212,7 +215,7 @@ def get_image_filenames_from_dataparser(data_dir: Path) -> List[str]:
 def extract_features_for_dataset(
     image_fnames: List[str],
     data_dir: Path,
-    feature_type: Literal["CLIP", "DINO"],
+    feature_type: Literal["CLIP", "DINO", "SAM2"],
     device: torch.device,
     shard_size: int = 64,
     enable_cache: bool = True,
@@ -238,17 +241,27 @@ def extract_features_for_dataset(
         return feats
 
     CONSOLE.print(f"[{feature_type}] Extracting features...")
-    feats = fn(image_fnames, device)
 
     if enable_cache:
-        feature_saver(feats, image_fnames, args, data_dir, feature_type)
-
-    return feats
+        feature_saver(
+            image_fnames=image_fnames,
+            extract_fn=fn,
+            extract_args=args,
+            data_dir=data_dir,
+            feature_type=feature_type,
+            device=device,
+            shard_sz=shard_size,
+        )
+        loaded = feature_loader(image_fnames, args, data_dir, feature_type, device)
+        return loaded if loaded is not None else torch.empty(0)
+    else:
+        feats = fn(image_fnames, device)
+        return feats
 
 
 def extract_features_standalone(
     data_dir: Path,
-    feature_type: Literal["CLIP", "DINO"],
+    feature_type: Literal["CLIP", "DINO", "SAM2"],
     shard_size: int = 64,
     device: str = "auto",
     force: bool = False,
@@ -298,7 +311,7 @@ def main():
 
     parser.add_argument(
         "--feature-type",
-        choices=["CLIP", "DINO"],
+        choices=["CLIP", "DINO", "SAM2"],
         default="CLIP",
         help="Feature type to extract"
     )
