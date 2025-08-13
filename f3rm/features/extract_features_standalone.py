@@ -16,10 +16,11 @@ Supported feature types: CLIP, DINO, SAM2
 """
 
 import argparse
+import asyncio
 import gc
 import math
 from pathlib import Path
-from typing import Dict, List, Literal, Union, Optional, Callable, Tuple
+from typing import Dict, List, Literal, Union, Optional, Tuple, Callable, Any
 
 import torch
 import numpy as np
@@ -27,9 +28,10 @@ from nerfstudio.data.dataparsers.nerfstudio_dataparser import NerfstudioDataPars
 from nerfstudio.utils.rich_utils import CONSOLE
 from tqdm.auto import tqdm
 
-from f3rm.features.clip_extract import CLIPArgs, extract_clip_features
-from f3rm.features.dino_extract import DINOArgs, extract_dino_features
-from f3rm.features.sam2_extract import SAM2Args, extract_sam2_features
+from f3rm.features.clip_extract import CLIPArgs, make_clip_extractor
+from f3rm.features.dino_extract import DINOArgs, make_dino_extractor
+from f3rm.features.sam2_extract import SAM2Args, make_sam2_extractor, unpack_auto_masks
+from f3rm.features.utils import run_async_in_any_context
 
 
 class LazyFeatures:
@@ -69,17 +71,54 @@ class LazyFeatures:
         return torch.from_numpy(feat)
 
 
-# Map feature types to extract functions and args
-FEAT_TYPE_TO_EXTRACT_FN = {
-    "CLIP": extract_clip_features,
-    "DINO": extract_dino_features,
-    "SAM2": extract_sam2_features,
-}
+class SAM2LazyAutoMasks:
+    """Sharded loader for SAM2 auto-masks stored as object arrays (lazy, random access).
+
+    - Mirrors the interface of `LazyFeatures` for consistency (takes `device`, though unused here)
+    - Each shard: np.array(list_of_images, dtype=object), saved with allow_pickle=True
+    - Each element: List[Dict] of auto masks for an image, segmentations may be packbits-encoded
+    - Provides O(1) random access and on-demand shard loading; decodes packbits on access
+    """
+
+    def __init__(self, shard_paths: List[Path], device: torch.device):
+        self.paths = shard_paths
+        self.device = device
+        self._loaded = [None] * len(shard_paths)
+        self.lengths: List[int] = []
+        for p in shard_paths:
+            arr = np.load(p, allow_pickle=True)
+            self.lengths.append(int(arr.shape[0]))
+        self.cum = np.cumsum([0] + self.lengths)
+
+    def _loc(self, idx_img: int) -> Tuple[int, int]:
+        sid = int(np.searchsorted(self.cum, idx_img, side="right") - 1)
+        return sid, idx_img - self.cum[sid]
+
+    def _get_shard(self, sid: int):
+        if self._loaded[sid] is None:
+            self._loaded[sid] = np.load(self.paths[sid], allow_pickle=True)
+        return self._loaded[sid]
+
+    def __len__(self) -> int:
+        return int(self.cum[-1])
+
+    def __getitem__(self, idx_img: int) -> List[dict]:
+        sid, loc = self._loc(int(idx_img))
+        entry = self._get_shard(sid)[loc]
+        # Decode packbits if present
+        return unpack_auto_masks(entry)
+
 
 FEAT_TYPE_TO_ARGS = {
     "CLIP": CLIPArgs,
     "DINO": DINOArgs,
     "SAM2": SAM2Args,
+}
+
+FEAT_TYPE_TO_MAKE_EXTRACTOR: Dict[str, Callable[[torch.device, bool], Any]] = {
+    "CLIP": make_clip_extractor,
+    "DINO": make_dino_extractor,
+    "SAM2": make_sam2_extractor,
 }
 
 
@@ -89,37 +128,37 @@ def get_cache_paths(data_dir: Path, feature_type: str) -> Tuple[Path, Path]:
     return root, root / "meta.pt"
 
 
-def feature_saver(
+async def _save_shards_generic(
     image_fnames: List[str],
-    extract_fn: Callable[[List[str], torch.device], torch.Tensor],
-    extract_args,
     data_dir: Path,
     feature_type: str,
+    extractor_factory: Callable[[torch.device, bool], Any],
+    args_cls: Any,
     device: torch.device,
-    shard_sz: int = 64,
-) -> None:
-    """Extract features and save them as shards."""
+    shard_sz: int,
+):
     root, meta = get_cache_paths(data_dir, feature_type)
     root.mkdir(parents=True, exist_ok=True)
-
     n_imgs = len(image_fnames)
     n_shards = math.ceil(n_imgs / shard_sz)
-
-    CONSOLE.print(f"Extracting {feature_type} features for {n_imgs} images in {n_shards} shards...")
-
-    for i in tqdm(range(n_shards), desc=f"{feature_type}: extract→save"):
+    extractor = extractor_factory(device, verbose=True)
+    for i in tqdm(range(n_shards), desc=f"{feature_type}: shards", position=0):
         s, e = i * shard_sz, min((i + 1) * shard_sz, n_imgs)
-        feats = extract_fn(image_fnames[s:e], device).cpu()
-        np.save(root / f"chunk_{i:04d}.npy", feats.numpy(), allow_pickle=False)
-        del feats
+        batch_paths = image_fnames[s:e]
+        data = await extractor.extract_batch_async(batch_paths)
+        if feature_type in ("CLIP", "DINO"):
+            np.save(root / f"chunk_{i:04d}.npy", data.cpu().numpy(), allow_pickle=False)
+        elif feature_type == "SAM2":
+            # List[List[dict]] per shard → consistent 1D array with object dtype
+            np.save(root / f"chunk_{i:04d}.npy", np.array(data, dtype=object), allow_pickle=True)
+        del data
         torch.cuda.empty_cache()
-
-    # Save metadata
-    torch.save({"args": extract_args.id_dict(), "image_fnames": image_fnames}, meta)
+        gc.collect()
+    torch.save({"args": args_cls.id_dict(), "image_fnames": image_fnames}, meta)
     CONSOLE.print(f"Saved {feature_type} shards → {root}")
 
 
-def feature_loader(image_fnames: List[str], extract_args, data_dir: Path, feature_type: str, device: torch.device) -> Optional[LazyFeatures]:
+def feature_loader(image_fnames: List[str], extract_args, data_dir: Path, feature_type: str, device: torch.device):
     """Load cached features if they exist and match the expected configuration."""
     root, meta = get_cache_paths(data_dir, feature_type)
 
@@ -185,6 +224,10 @@ def feature_loader(image_fnames: List[str], extract_args, data_dir: Path, featur
         CONSOLE.print(f"[DEBUG] {feature_type}: CACHE MISS - No shard files found")
         return None
 
+    if feature_type == "SAM2":
+        CONSOLE.print(f"[DEBUG] {feature_type}: CACHE HIT - Using SAM2 lazy cache with {len(shard_paths)} shards")
+        return SAM2LazyAutoMasks(shard_paths, device)
+
     CONSOLE.print(f"[DEBUG] {feature_type}: CACHE HIT - Using mmap cache with {len(shard_paths)} shards")
     return LazyFeatures(shard_paths, device)
 
@@ -227,7 +270,7 @@ def extract_features_for_dataset(
     Returns:
         - LazyFeatures or torch.Tensor
     """
-    fn, args = FEAT_TYPE_TO_EXTRACT_FN[feature_type], FEAT_TYPE_TO_ARGS[feature_type]
+    args = FEAT_TYPE_TO_ARGS[feature_type]
 
     CONSOLE.print(f"[DEBUG] {feature_type}: enable_cache={enable_cache}, checking for cached features...")
     feats = (
@@ -242,21 +285,21 @@ def extract_features_for_dataset(
 
     CONSOLE.print(f"[{feature_type}] Extracting features...")
 
-    if enable_cache:
-        feature_saver(
+    async def _run():
+        await _save_shards_generic(
             image_fnames=image_fnames,
-            extract_fn=fn,
-            extract_args=args,
             data_dir=data_dir,
             feature_type=feature_type,
+            extractor_factory=FEAT_TYPE_TO_MAKE_EXTRACTOR[feature_type],
+            args_cls=args,
             device=device,
             shard_sz=shard_size,
         )
-        loaded = feature_loader(image_fnames, args, data_dir, feature_type, device)
-        return loaded if loaded is not None else torch.empty(0)
-    else:
-        feats = fn(image_fnames, device)
-        return feats
+
+    run_async_in_any_context(_run)
+
+    loaded = feature_loader(image_fnames, args, data_dir, feature_type, device)
+    return loaded if loaded is not None else torch.empty(0)
 
 
 def extract_features_standalone(
@@ -316,10 +359,11 @@ def main():
         help="Feature type to extract"
     )
 
+    # needed to decrease from 64 to 16 (can even do 8 if needed) for reasonable train speed with 2048 load_size for features
     parser.add_argument(
         "--shard-size",
         type=int,
-        default=64,
+        default=16,
         help="Number of images per shard"
     )
 

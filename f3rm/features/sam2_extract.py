@@ -1,40 +1,30 @@
 import gc
 import asyncio
-import inspect
-import os
 import glob
 from typing import List, Optional
 
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
-import yaml
-import aiohttp
 import torch
 import matplotlib.pyplot as plt
 
-from sam2.server.client.sam2_client import (
-    encode_image,
-    decode_auto_masks,
-    auto_masks_to_instance_mask,
-    _prevent_oom_downscale_img,
-    make_viz_mask_and_cmap,
-    generate_sam2_auto_masks,
-)
+from sam2.features.client.sam2_client import SAM2FeaturesUnified
+from sam2.features.utils import SAM2utils, AsyncMultiWrapper
+from f3rm.features.utils import resolve_devices_and_workers, run_async_in_any_context
 
 
 class SAM2Args:
-    points_per_side: int = 36
+    points_per_side: int = 64
     points_per_batch: int = 128
     pred_iou_thresh: float = 0.8
     stability_score_thresh: float = 0.9
     min_mask_region_area: int = 0
-    batch_size: int = 2  # Number of concurrent requests to server
-    server_config_path: str = "/robodata/smodak/repos/orienter/clients/servers.yaml"
-    server_name: str = "sam2"
-    preset: Optional[str] = "coarse"  # e.g., "coarse", "fine_grained"
-    assign_by: str = "area"
-    start_from: str = "low"
+    preset: Optional[str] = "coarse"
+    load_size: int = 2048
+    model_cfg: str = "/robodata/smodak/repos/sam2/sam2/configs/sam2.1/sam2.1_hiera_l.yaml"
+    checkpoint_path: str = "/robodata/smodak/repos/sam2/checkpoints/sam2.1_hiera_large.pt"
+    batch_size_per_gpu: int = 4
 
     @classmethod
     def id_dict(cls):
@@ -45,118 +35,116 @@ class SAM2Args:
             "pred_iou_thresh": cls.pred_iou_thresh,
             "stability_score_thresh": cls.stability_score_thresh,
             "min_mask_region_area": cls.min_mask_region_area,
-            "batch_size": cls.batch_size,
-            "server_config_path": cls.server_config_path,
-            "server_name": cls.server_name,
             "preset": cls.preset,
-            "assign_by": cls.assign_by,
-            "start_from": cls.start_from,
+            "load_size": cls.load_size,
+            "model_cfg": cls.model_cfg,
+            "checkpoint_path": cls.checkpoint_path,
         }
 
 
-async def process_single_image_async(image_path: str, selected_server: dict, session: aiohttp.ClientSession) -> np.ndarray:
-    """Process a single image asynchronously."""
-    # Load and preprocess image
+async def process_single_image_async(image_path: str, sam2: AsyncMultiWrapper) -> List[dict]:
     pil_img = Image.open(image_path).convert("RGB")
     original_width, original_height = pil_img.width, pil_img.height
-    downscaled_img = _prevent_oom_downscale_img(pil_img, target=2048)
+    downscaled_img = SAM2utils.prevent_oom_resizing(pil_img, target=SAM2Args.load_size)
 
-    # Prepare payload
-    payload = {'image': encode_image(downscaled_img)}
-    # Include only supported, non-None args by inspecting client function signature
-    sig = inspect.signature(generate_sam2_auto_masks)
-    allowed = set(sig.parameters.keys()) - {"image", "image_url", "base_url", "api_key"}
-    for key, value in SAM2Args.id_dict().items():
-        if key in allowed and value is not None:
-            payload[key] = value
-
-    # Prepare headers
-    headers = {'Content-Type': 'application/json'}
-    if selected_server.get("api_key"):
-        headers['Authorization'] = f'Bearer {selected_server["api_key"]}'
-
-    # Make async request with retry (errors still propagate after final attempt)
-    max_retries = 100
-    retry_delay_s = 10
-    result = None
-    retry_bar = None
-    for attempt in range(max_retries):
-        try:
-            async with session.post(f"{selected_server['base_url']}/auto_mask", json=payload, headers=headers) as response:
-                response.raise_for_status()
-                result = await response.json()
-                break
-        except Exception as e:
-            # Lazy-create a temporary retry bar that doesn't interfere with the main bar
-            if retry_bar is None:
-                retry_bar = tqdm(total=max_retries, desc="SAM2 retry", position=2, leave=False, colour="red")
-                retry_bar.set_postfix_str(os.path.basename(image_path))
-            retry_bar.update(1)
-            if attempt == max_retries - 1:
-                raise
-            await asyncio.sleep(retry_delay_s)
-    if retry_bar is not None:
-        retry_bar.close()
-
-    # Decode masks
-    auto_masks = decode_auto_masks(result['masks'])
-
-    # Convert to instance mask using shared utility and our thresholds
-    instance_mask = auto_masks_to_instance_mask(
-        auto_masks,
-        min_iou=float(SAM2Args.pred_iou_thresh),
-        min_area=float(SAM2Args.min_mask_region_area),
-        assign_by=SAM2Args.assign_by,
-        start_from=SAM2Args.start_from,
+    auto_masks = await sam2.auto_mask_async(
+        image=downscaled_img,
+        model_cfg=SAM2Args.model_cfg,
+        checkpoint_path=SAM2Args.checkpoint_path,
+        preset=SAM2Args.preset,
+        points_per_side=SAM2Args.points_per_side,
+        points_per_batch=SAM2Args.points_per_batch,
+        pred_iou_thresh=SAM2Args.pred_iou_thresh,
+        stability_score_thresh=SAM2Args.stability_score_thresh,
+        min_mask_region_area=SAM2Args.min_mask_region_area,
+        output_mode="binary_mask",
     )
-
-    # Upscale back to original size
+    # Upscale to original size if needed using utility
     if (downscaled_img.width, downscaled_img.height) != (original_width, original_height):
-        # Convert numpy array to PIL Image for resizing
-        pil_mask = Image.fromarray(instance_mask.astype(np.uint8))
-        upscaled_mask = pil_mask.resize((original_width, original_height), Image.NEAREST)
-        instance_mask = np.array(upscaled_mask)
+        target = max(original_width, original_height)
+        auto_masks = SAM2utils.resize_auto_masks(auto_masks, target=target)
 
-    del auto_masks
-    return instance_mask
+    return auto_masks
 
 
-async def extract_sam2_masks_async(image_paths: List[str], verbose=False) -> np.ndarray:
-    # Load server config
-    with open(SAM2Args.server_config_path, "r") as f:
-        servers = yaml.safe_load(f)
-    selected_server = servers[SAM2Args.server_name]
-    if verbose:
-        print(f"Loaded SAM2 server config from {SAM2Args.server_config_path}")
-    timeout = aiohttp.ClientTimeout(total=1e4, connect=1e4)
-    connector = aiohttp.TCPConnector(limit=100, limit_per_host=10, enable_cleanup_closed=True, force_close=True)
-    instance_masks = []
-    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-        for i in tqdm(range(0, len(image_paths), SAM2Args.batch_size), desc="Processing & extracting SAM2 masks", position=1, leave=verbose):
-            batch_paths = image_paths[i:i + SAM2Args.batch_size]
-            tasks = [process_single_image_async(path, selected_server, session) for path in batch_paths]
-            batch_results = await asyncio.gather(*tasks, return_exceptions=False)
-            instance_masks.extend(batch_results)
+def pack_auto_masks(auto_masks: List[dict]) -> List[dict]:
+    optimized: List[dict] = []
+    for m in auto_masks:
+        seg = m.get("segmentation", None)
+        if isinstance(seg, np.ndarray):
+            h, w = seg.shape
+            packed = np.packbits(seg.astype(np.uint8).reshape(-1))
+            m = m.copy()
+            m["segmentation"] = {
+                "format": "packbits",
+                "shape": (h, w),
+                "data": packed.tobytes(),
+            }
+        optimized.append(m)
+    return optimized
+
+
+def unpack_auto_masks(auto_masks: List[dict]) -> List[dict]:
+    decoded: List[dict] = []
+    for m in auto_masks:
+        seg = m.get("segmentation")
+        if isinstance(seg, dict) and seg.get("format") == "packbits":
+            h, w = seg["shape"]
+            packed = np.frombuffer(seg["data"], dtype=np.uint8)
+            flat = np.unpackbits(packed)[: h * w]
+            seg_arr = flat.reshape(h, w).astype(bool)
+            md = m.copy()
+            md["segmentation"] = seg_arr
+            decoded.append(md)
+        else:
+            decoded.append(m)
+    return decoded
+
+
+class SAM2Extractor:
+    def __init__(self, device: torch.device, verbose: bool = False) -> None:
+        devices_param, num_workers = resolve_devices_and_workers(device, SAM2Args.batch_size_per_gpu)
+        if verbose:
+            print("Initializing SAM2 client")
+        self.client = AsyncMultiWrapper(SAM2FeaturesUnified, num_objects=num_workers, devices=devices_param)
+        self.num_workers = num_workers
+        # Sequential warm-up to avoid TorchScript race in torchvision Resize when constructing generators in parallel
+        if verbose:
+            print("Warming up SAM2 workers...")
+        tiny = Image.new("RGB", (8, 8), color=0)
+        for _ in range(self.num_workers):
+            _ = self.client.auto_mask(
+                image=tiny,
+                model_cfg=SAM2Args.model_cfg,
+                checkpoint_path=SAM2Args.checkpoint_path,
+                preset=SAM2Args.preset,
+                points_per_side=4,
+                points_per_batch=8,
+                pred_iou_thresh=SAM2Args.pred_iou_thresh,
+                stability_score_thresh=SAM2Args.stability_score_thresh,
+                min_mask_region_area=0,
+                output_mode="binary_mask",
+            )
+
+    async def extract_batch_async(self, image_paths: List[str]):
+        results: List[dict] = []
+        for i in tqdm(range(0, len(image_paths), self.num_workers), desc="Processing & extracting SAM2 auto-masks", leave=False):
+            batch_paths = image_paths[i:i + self.num_workers]
+            tasks = [process_single_image_async(path, self.client) for path in batch_paths]
+            batch_results = await AsyncMultiWrapper.async_run_tasks(tasks, desc="SAM2 auto_mask", leave=False)
+            # pack for storage efficiency
+            results.extend([pack_auto_masks(m) for m in batch_results])
             gc.collect()
-
-    instance_masks = np.array(instance_masks)
-    instance_masks = instance_masks[..., np.newaxis]
-    if verbose:
-        print(f"Extracted SAM2 instance masks of shape {instance_masks.shape}")
-    return instance_masks
+        return results
 
 
-def extract_sam2_masks(image_paths: List[str], verbose=False) -> np.ndarray:
-    """Synchronous wrapper for async extraction."""
-    return asyncio.run(extract_sam2_masks_async(image_paths, verbose))
+def make_sam2_extractor(device: torch.device, verbose: bool = False) -> "SAM2Extractor":
+    return SAM2Extractor(device=device, verbose=verbose)
 
 
-def extract_sam2_features(image_paths: List[str], device: torch.device, verbose: bool = False) -> torch.Tensor:
-    """Adapter to match CLIP/DINO extractor signature. Returns a torch.Tensor of shape (B, H, W, 1) with integer instance ids."""
-    masks = extract_sam2_masks(image_paths, verbose=verbose)
-    if masks.dtype != np.int32:
-        masks = masks.astype(np.int32, copy=False)
-    return torch.from_numpy(masks)
+def extract_sam2_features(image_paths: List[str], device: torch.device, verbose: bool = False):
+    extractor = make_sam2_extractor(device, verbose=verbose)
+    return run_async_in_any_context(lambda: extractor.extract_batch_async(image_paths))
 
 
 if __name__ == "__main__":
@@ -165,28 +153,25 @@ if __name__ == "__main__":
     image_paths = sorted(glob.glob(f"{image_dir}/*.jpg") + glob.glob(f"{image_dir}/*.png"))
     image_paths = image_paths[:10]
     print(f"Found {len(image_paths)} images in {image_dir}")
-    print("Async extraction:")
-    instance_masks = extract_sam2_masks(image_paths, verbose=True)
-    print(f"Instance mask shape: {instance_masks.shape}")
-
-    # Visualize in subsets of 4 with 2x2 grid
-    for i in range(0, len(instance_masks), 4):
-        subset_masks = instance_masks[i:i + 4]
-        subset_paths = image_paths[i:i + 4]
-        fig, axes = plt.subplots(2, 2, figsize=(12, 12))
-        axes = axes.flatten()
-        for j, (mask, img_path) in enumerate(zip(subset_masks, subset_paths)):
-            if j >= 4:  # Safety check
-                break
-            # Remove channel dimension for visualization (mask is now 4D: batch, H, W, 1)
-            mask_2d = mask.squeeze()
-            viz_mask, cmap, norm = make_viz_mask_and_cmap(mask_2d.astype(np.int32))
-            axes[j].imshow(viz_mask, cmap=cmap, norm=norm, interpolation='nearest')
-            axes[j].axis('off')
-            num_instances = int(mask_2d.max())
-            axes[j].set_title(f"{img_path.split('/')[-1]}\nInstances: {num_instances}")
-        # Hide unused subplots
-        for j in range(len(subset_masks), 4):
-            axes[j].axis('off')
-        plt.tight_layout()
-        plt.show()
+    print("Extraction:")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    auto_masks_per_image = extract_sam2_features(image_paths, device=device, verbose=True)
+    print(f"Extracted auto-masks for {len(auto_masks_per_image)} images. Visualizing instance conversion for first few...")
+    vis_count = min(4, len(auto_masks_per_image))
+    fig, axes = plt.subplots(1, vis_count, figsize=(4 * vis_count, 4))
+    if vis_count == 1:
+        axes = [axes]
+    for ax, auto_masks in zip(axes, auto_masks_per_image[:vis_count]):
+        decoded = unpack_auto_masks(auto_masks)
+        inst_mask, _ = SAM2utils.auto_masks_to_instance_mask(
+            decoded,
+            min_iou=float(SAM2Args.pred_iou_thresh),
+            min_area=float(SAM2Args.min_mask_region_area),
+            assign_by="area",
+            start_from="low",
+        )
+        viz_mask, cmap, norm = SAM2utils.make_viz_mask_and_cmap(inst_mask)
+        ax.imshow(viz_mask, cmap=cmap, norm=norm, interpolation='nearest')
+        ax.axis('off')
+    plt.tight_layout()
+    plt.show()

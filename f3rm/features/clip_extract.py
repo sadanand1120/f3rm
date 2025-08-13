@@ -1,106 +1,116 @@
 import gc
-from typing import List
+import asyncio
+import glob
+from typing import List, Optional
 
 import torch
-from einops import rearrange
-from PIL import Image
-from torchvision.transforms import CenterCrop, Compose
 from tqdm import tqdm
-from torch import nn
-import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from PIL import Image
 
-import open_clip
+from sam2.features.client.clip_client import CLIPFeaturesUnified
+from sam2.features.utils import AsyncMultiWrapper, apply_pca_colormap
+from f3rm.features.utils import resolve_devices_and_workers, run_async_in_any_context
 
 
 class CLIPArgs:
     model_name: str = "ViT-L-14-336-quickgelu"   # open_clip.list_pretrained() lists all available models
     model_pretrained: str = "openai"
-    load_size: int = 1024
+    load_size: int = 2048
     skip_center_crop: bool = True
-    batch_size: int = 16
+    batch_size_per_gpu: int = 8
+    agg_scales: List[float] = [0.25, 0.5, 1.0, 1.5]
+    agg_weights: Optional[List[float]] = [1, 2, 5.5, 2]
 
     @classmethod
     def id_dict(cls):
-        """Return dict that identifies the CLIP model parameters."""
         return {
             "model_name": cls.model_name,
             "model_pretrained": cls.model_pretrained,
             "load_size": cls.load_size,
             "skip_center_crop": cls.skip_center_crop,
+            "agg_scales": cls.agg_scales,
+            "agg_weights": cls.agg_weights,
         }
 
-@torch.inference_mode()
-def get_patch_encodings(model, image_batch):
-    from f3rm.features.utils import interpolate_positional_embedding
 
-    _, _, w, h = image_batch.shape
-    x = model.visual.conv1(image_batch)  # shape = [*, width, grid, grid]
-    x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
-    x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
-    x = torch.cat([model.visual.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
-    x = x + interpolate_positional_embedding(model.visual.positional_embedding, x, patch_size=model.visual.patch_size[0], w=w, h=h)
-    x = model.visual.ln_pre(x)
-    *layers, last_resblock = model.visual.transformer.resblocks
-    penultimate = nn.Sequential(*layers)
-    x = penultimate(x)
-    v_in_proj_weight = last_resblock.attn.in_proj_weight[-last_resblock.attn.embed_dim:]
-    v_in_proj_bias = last_resblock.attn.in_proj_bias[-last_resblock.attn.embed_dim:]
-    v_in = F.linear(last_resblock.ln_1(x), v_in_proj_weight, v_in_proj_bias)
-    x = F.linear(v_in, last_resblock.attn.out_proj.weight, last_resblock.attn.out_proj.bias)
-    x = x[:, 1:, :]   # Extract the patch tokens, not the class token
-    x = model.visual.ln_post(x)
-    if model.visual.proj is not None:
-        x = x @ model.visual.proj
-    return x
+class CLIPExtractor:
+    def __init__(self, device: torch.device, verbose: bool = False) -> None:
+        devices_param, num_workers = resolve_devices_and_workers(device, CLIPArgs.batch_size_per_gpu)
+        if verbose:
+            print("Initializing CLIP client")
+        self.client = AsyncMultiWrapper(CLIPFeaturesUnified, num_objects=num_workers, devices=devices_param)
+        self.num_workers = num_workers
+        if verbose:
+            print("Warming up CLIP workers...")
+        tiny = Image.new("RGB", (8, 8), color=0)
+        for _ in range(self.num_workers):
+            _ = self.client.extract_features_agg(
+                image=tiny,
+                model_name=CLIPArgs.model_name,
+                model_pretrained=CLIPArgs.model_pretrained,
+                agg_scales=[1.0],
+                agg_weights=None,
+                ret_pca=False,
+                ret_patches=True,
+                load_size=32,
+                center_crop=False,
+                interpolation_mode="bilinear",
+                tensor_format="HWC",
+                padding_mode="constant",
+                return_meta=False,
+            )
+
+    async def extract_batch_async(self, image_paths: List[str]) -> torch.Tensor:
+        batches = []
+        for i in tqdm(range(0, len(image_paths), self.num_workers), desc="Extracting CLIP features", leave=False):
+            chunk = image_paths[i:i + self.num_workers]
+            tasks = [
+                self.client.extract_features_agg_async(
+                    image=path,
+                    model_name=CLIPArgs.model_name,
+                    model_pretrained=CLIPArgs.model_pretrained,
+                    agg_scales=CLIPArgs.agg_scales,
+                    agg_weights=CLIPArgs.agg_weights,
+                    ret_pca=False,
+                    ret_patches=True,
+                    load_size=CLIPArgs.load_size,
+                    center_crop=not CLIPArgs.skip_center_crop,
+                    interpolation_mode="bilinear",
+                    tensor_format="HWC",
+                    padding_mode="constant",
+                )
+                for path in chunk
+            ]
+            results = await AsyncMultiWrapper.async_run_tasks(tasks, desc="CLIP tasks", leave=False)
+            batch_tensor = torch.stack([r.cpu() for r in results], dim=0)
+            batches.append(batch_tensor)
+            gc.collect()
+        return torch.cat(batches, dim=0) if batches else torch.empty(0)
 
 
-@torch.no_grad()
+def make_clip_extractor(device: torch.device, verbose: bool = False) -> CLIPExtractor:
+    return CLIPExtractor(device=device, verbose=verbose)
+
+
 def extract_clip_features(image_paths: List[str], device: torch.device, verbose=False) -> torch.Tensor:
-    from f3rm.features.utils import get_preprocess
+    extractor = make_clip_extractor(device, verbose=verbose)
+    return run_async_in_any_context(lambda: extractor.extract_batch_async(image_paths))
 
-    model, _, _ = open_clip.create_model_and_transforms(CLIPArgs.model_name, pretrained=CLIPArgs.model_pretrained, device=device)
-    model.eval()
-    preprocess = get_preprocess(resize=CLIPArgs.load_size, do_center_crop=not CLIPArgs.skip_center_crop)
-    if verbose:
-        print(f"Loaded CLIP model {CLIPArgs.model_name}")
 
-    embeddings = []
-    h_in = w_in = None
-    for i in tqdm(range(0, len(image_paths), CLIPArgs.batch_size),
-                desc="Preprocessing & extracting CLIP features", leave=verbose):
-        batch_paths = image_paths[i : i + CLIPArgs.batch_size]
-        # open & preprocess each image in the batch
-        batch_tensors = [preprocess(Image.open(p)) for p in batch_paths]
-        if h_in is None:
-            _, h_in, w_in = batch_tensors[0].shape
-        batch = torch.stack(batch_tensors).to(device)
-        # get embeddings, move to CPU, and store
-        embeddings.append(get_patch_encodings(model, batch).cpu())
-        del batch
-        torch.cuda.empty_cache()
-
-    embeddings = torch.cat(embeddings, dim=0)
-    if verbose:
-        print(f"Processed {len(image_paths)} images into {embeddings.shape}")
-
-    # Reshape embeddings from flattened patches to patch height and width
-    if CLIPArgs.model_name.startswith("ViT"):
-        h_out = h_in // model.visual.patch_size[0]
-        w_out = w_in // model.visual.patch_size[0]
-    elif CLIPArgs.model_name.startswith("RN"):
-        h_out = max(h_in / w_in, 1.0) * model.visual.attnpool.spacial_dim
-        w_out = max(w_in / h_in, 1.0) * model.visual.attnpool.spacial_dim
-        h_out, w_out = int(h_out), int(w_out)
-    else:
-        raise ValueError(f"Unknown CLIP model name: {CLIPArgs.model_name}")
-    embeddings = rearrange(embeddings, "b (h w) c -> b h w c", h=h_out, w=w_out)
-    if verbose:
-        print(f"Extracted CLIP embeddings of shape {embeddings.shape}")
-
-    # Delete and clear memory to be safe
-    del model
-    del preprocess
-    torch.cuda.empty_cache()
-    gc.collect()
-
-    return embeddings
+if __name__ == "__main__":
+    image_dir = "datasets/f3rm/panda/scene_001/images"
+    image_paths = sorted(glob.glob(f"{image_dir}/*.jpg") + glob.glob(f"{image_dir}/*.png"))
+    image_paths = image_paths[:4]
+    print(f"Found {len(image_paths)} images in {image_dir}")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    feats = extract_clip_features(image_paths, device=device, verbose=True)
+    print(f"CLIP features shape: {feats.shape}")
+    if feats.numel() > 0:
+        pca_img = apply_pca_colormap(feats[0], niter=5, q_min=0.01, q_max=0.99)
+        plt.figure(figsize=(6, 6))
+        plt.imshow(pca_img.cpu().numpy())
+        plt.title("CLIP PCA Visualization (first image)")
+        plt.axis("off")
+        plt.tight_layout()
+        plt.show()

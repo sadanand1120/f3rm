@@ -68,6 +68,7 @@ class FeatureDataManager(VanillaDataManager):
         im_h, im_w = im_h.pop(), im_w.pop()
         self.scale_h = feat_h / im_h
         self.scale_w = feat_w / im_w
+        CONSOLE.print(f"Feat h: {feat_h}, Feat w: {feat_w}, Feat c: {feat_dim}, Im h: {im_h}, Im w: {im_w}, Scale h: {self.scale_h}, Scale w: {self.scale_w}")
         # assert np.isclose(
         #    self.scale_h, self.scale_w, atol=1.5e-3
         # ), f"Scales must be similar, got h={self.scale_h} and w={self.scale_w}"
