@@ -3,13 +3,15 @@ from nerfstudio.configs.base_config import ViewerConfig
 from nerfstudio.data.dataparsers.nerfstudio_dataparser import NerfstudioDataParserConfig
 from nerfstudio.engine.optimizers import AdamOptimizerConfig
 from nerfstudio.engine.schedulers import ExponentialDecaySchedulerConfig
-from nerfstudio.pipelines.base_pipeline import VanillaPipelineConfig
 from nerfstudio.plugins.types import MethodSpecification
 
 from f3rm.feature_datamanager import FeatureDataManagerConfig
 from f3rm.model import FeatureFieldModelConfig
 from f3rm.trainer import F3RMTrainerConfig
+from f3rm.pipeline import FeaturePipelineConfig
 
+# TODO: Look at https://docs.nerf.studio/nerfology/methods/nerfacto.html, try bigger model for better scenes!
+# TODO: (maybe) replace the f3rm utils's pca with ur optimized sam2 pca
 f3rm_method = MethodSpecification(
     config=F3RMTrainerConfig(
         method_name="f3rm",
@@ -23,7 +25,7 @@ f3rm_method = MethodSpecification(
         seed_warn_only=False,  # Set to True if you encounter issues with deterministic algorithms
         seed_cublas_workspace=True,
         print_seed_info=True,
-        pipeline=VanillaPipelineConfig(
+        pipeline=FeaturePipelineConfig(
             datamanager=FeatureDataManagerConfig(
                 feature_type="CLIP",
                 dataparser=NerfstudioDataParserConfig(train_split_fraction=0.95),
@@ -37,7 +39,17 @@ f3rm_method = MethodSpecification(
             # To support more GPUs, we reduce the num rays per chunk. The default was 1 << 15 which uses ~16GB of GPU
             # memory when training and using viewer. 1 << 14 uses ~12GB of GPU memory in comparison. The decrease in
             # rendering speed is not too important.
-            model=FeatureFieldModelConfig(eval_num_rays_per_chunk=1 << 14, predict_normals=True),
+            model=FeatureFieldModelConfig(
+                eval_num_rays_per_chunk=1 << 14,
+                predict_normals=True,
+                feat_condition_on_density=False,  # degraded performance
+                feat_condition_density_grad_to_nerf=False,   # degraded performance
+            ),
+            # Train-depth cache control
+            train_depth_cache_enable=True,
+            steps_per_train_cache_update=0,
+            train_cache_cold_start_skip_steps=0,
+            steps_per_train_image_viz=500,
         ),
         optimizers={
             "proposal_networks": {

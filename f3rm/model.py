@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from collections import defaultdict
 from functools import cached_property
 from typing import Dict, List, Optional, Type
 
@@ -34,6 +35,10 @@ class FeatureFieldModelConfig(NerfactoModelConfig):
     _target: Type = field(default_factory=lambda: FeatureFieldModel)
     # Weighing for the feature loss
     feat_loss_weight: float = 1e-3
+    # Condition Feature Field on NeRF density embedding (geo features)
+    feat_condition_on_density: bool = True
+    # Allow gradients from feature field to flow back into NeRF via density embedding
+    feat_condition_density_grad_to_nerf: bool = False
     # Feature Field Positional Encoding
     feat_use_pe: bool = True
     feat_pe_n_freq: int = 6
@@ -121,11 +126,15 @@ class FeatureFieldModel(NerfactoModel):
 
     feature_field: FeatureField
     renderer_feature: FeatureRenderer
+    _train_depth_cache_enabled: bool = False
+
+    # Default no-op cache accessor; pipeline overrides this with a real function
+    def _get_train_depth_cache(self):
+        return {}
 
     def populate_modules(self):
         super().populate_modules()
 
-        feat_type = self.kwargs["metadata"]["feature_type"]
         feature_dim = self.kwargs["metadata"]["feature_dim"]
         if feature_dim <= 0:
             raise ValueError("Feature dimensionality must be positive.")
@@ -133,6 +142,8 @@ class FeatureFieldModel(NerfactoModel):
         self.feature_field = FeatureField(
             feature_dim=feature_dim,
             spatial_distortion=self.field.spatial_distortion,
+            cond_on_density=self.config.feat_condition_on_density,
+            density_embedding_dim=getattr(self.field, "geo_feat_dim", 15),
             use_pe=self.config.feat_use_pe,
             pe_n_freq=self.config.feat_pe_n_freq,
             num_levels=self.config.feat_num_levels,
@@ -177,8 +188,8 @@ class FeatureFieldModel(NerfactoModel):
         param_groups["feature_field"] = list(self.feature_field.parameters())
         return param_groups
 
-    def get_outputs(self, ray_bundle: RayBundle):
-        """Modified from nerfacto.get_outputs to include feature field outputs."""
+    def _get_outputs_internal(self, ray_bundle: RayBundle, render_features: bool):
+        """Core rendering that can optionally skip feature-field computation."""
         ray_samples: RaySamples
         ray_samples, weights_list, ray_samples_list = self.proposal_sampler(ray_bundle, density_fns=self.density_fns)
         field_outputs = self.field.forward(ray_samples, compute_normals=self.config.predict_normals)
@@ -195,17 +206,24 @@ class FeatureFieldModel(NerfactoModel):
         expected_depth = self.renderer_expected_depth(weights=weights, ray_samples=ray_samples)
         accumulation = self.renderer_accumulation(weights=weights)
 
-        # Feature outputs
-        ff_outputs = self.feature_field(ray_samples)
-        features = self.renderer_feature(features=ff_outputs[FeatureFieldHeadNames.FEATURE], weights=weights)
+        # Feature outputs (optionally conditioned on density embedding from NeRF)
+        if render_features:
+            density_embedding = None
+            if self.config.feat_condition_on_density:
+                _, density_embedding = self.field.get_density(ray_samples)
+                if not self.config.feat_condition_density_grad_to_nerf:
+                    density_embedding = density_embedding.detach()
+            ff_outputs = self.feature_field(ray_samples, density_embedding=density_embedding)
+            features = self.renderer_feature(features=ff_outputs[FeatureFieldHeadNames.FEATURE], weights=weights)
 
         outputs = {
             "rgb": rgb,
             "accumulation": accumulation,
             "depth": depth,
             "expected_depth": expected_depth,
-            "feature": features,
         }
+        if render_features:
+            outputs["feature"] = features
 
         if self.config.predict_normals:
             normals = self.renderer_normals(normals=field_outputs[FieldHeadNames.NORMALS], weights=weights)
@@ -233,6 +251,10 @@ class FeatureFieldModel(NerfactoModel):
 
         return outputs
 
+    def get_outputs(self, ray_bundle: RayBundle):
+        """Modified from nerfacto.get_outputs to include feature field outputs."""
+        return self._get_outputs_internal(ray_bundle, render_features=True)
+
     def get_metrics_dict(self, outputs, batch):
         metrics_dict = super().get_metrics_dict(outputs, batch)
         target_feats = batch["feature"].to(self.device)
@@ -243,10 +265,53 @@ class FeatureFieldModel(NerfactoModel):
         loss_dict = super().get_loss_dict(outputs, batch, metrics_dict)
         target_feats = batch["feature"].to(self.device)
         loss_dict["feature_loss"] = self.config.feat_loss_weight * F.mse_loss(outputs["feature"], target_feats)
+        # Dummy check: only during training, assert cached depth exists and is HxWx1
+        if self.training and self._train_depth_cache_enabled:
+            full_cache = self._get_train_depth_cache()  # type: ignore[attr-defined]
+            cam_idx = int(torch.mode(batch["indices"][:, 0].to(self.device)).values.item())
+            assert cam_idx in full_cache, f"train depth cache missing camera {cam_idx}"
+            depth_img = full_cache[cam_idx]
+            assert depth_img.ndim == 3 and depth_img.shape[-1] == 1, "cached depth must be HxWx1"
+            # Also verify cache covers all cameras present in this batch
+            unique_cams = torch.unique(batch["indices"][:, 0]).tolist()
+            missing = [int(ci) for ci in unique_cams if int(ci) not in full_cache]
+            assert not missing, f"train depth cache missing cameras {missing}; expected all of {list(map(int, unique_cams))}"
         return loss_dict
 
-    def get_outputs_for_camera_ray_bundle(self, camera_ray_bundle: RayBundle) -> Dict[str, torch.Tensor]:
-        outputs = super().get_outputs_for_camera_ray_bundle(camera_ray_bundle)
+    def get_outputs_for_camera_ray_bundle(self, camera_ray_bundle: RayBundle, render_features: bool = True) -> Dict[str, torch.Tensor]:
+        """Full-image render with optional feature computation.
+
+        render_features=False will skip feature-field computation for speed (used by cache renders).
+        """
+        with torch.no_grad():
+            num_rays_per_chunk = self.config.eval_num_rays_per_chunk
+            image_height, image_width = camera_ray_bundle.origins.shape[:2]
+            num_rays = len(camera_ray_bundle)
+            outputs_lists = defaultdict(list)
+            for i in range(0, num_rays, num_rays_per_chunk):
+                start_idx = i
+                end_idx = i + num_rays_per_chunk
+                ray_bundle = camera_ray_bundle.get_row_major_sliced_ray_bundle(start_idx, end_idx)
+                if self.collider is not None:
+                    ray_bundle = self.collider(ray_bundle)
+                outputs_chunk = self._get_outputs_internal(ray_bundle, render_features=render_features)
+                for output_name, output in outputs_chunk.items():
+                    if not torch.is_tensor(output):
+                        continue
+                    if output_name.startswith("feature"):
+                        outputs_lists[output_name].append(output.cpu())
+                    else:
+                        outputs_lists[output_name].append(output)
+                    del output
+                if (i // num_rays_per_chunk) % 20 == 0:
+                    torch.cuda.empty_cache()
+            outputs: Dict[str, torch.Tensor] = {}
+            for output_name, outputs_list in outputs_lists.items():
+                outputs[output_name] = torch.cat(outputs_list).view(image_height, image_width, -1)
+
+        # If requested depth-only render, exit early
+        if not render_features:
+            return outputs
 
         # Compute PCA of features separately, so we can reuse the same projection matrix
         outputs["feature_pca"], viewer_utils.pca_proj, *_ = apply_pca_colormap_return_proj(
@@ -258,7 +323,7 @@ class FeatureFieldModel(NerfactoModel):
             return outputs
 
         # Normalize CLIP features rendered by feature field
-        clip_features = outputs["feature"]   # is on cpu() because of your base_model.py modification to nerfstudio code
+        clip_features = outputs["feature"]   # is on cpu()
         clip_features = clip_features.to(viewer_utils.device)
         clip_features /= clip_features.norm(dim=-1, keepdim=True)
 
@@ -286,3 +351,9 @@ class FeatureFieldModel(NerfactoModel):
         sims, _ = probs.min(dim=-1, keepdim=True)
         outputs["similarity"] = sims
         return outputs
+
+    def get_image_metrics_and_images(self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]):
+        metrics_dict, images_dict = super().get_image_metrics_and_images(outputs, batch)
+        if "feature_pca" in outputs:
+            images_dict["feature_pca"] = outputs["feature_pca"]
+        return metrics_dict, images_dict
