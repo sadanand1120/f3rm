@@ -12,6 +12,7 @@ from f3rm.pipeline import FeaturePipelineConfig
 
 # TODO: Look at https://docs.nerf.studio/nerfology/methods/nerfacto.html, try bigger model for better scenes!
 # TODO: (maybe) replace the f3rm utils's pca with ur optimized sam2 pca
+# TODO: optimize code by calling super().bla at places (e.g. super().get_train_loss_dict() in pipeline.py)
 f3rm_method = MethodSpecification(
     config=F3RMTrainerConfig(
         method_name="f3rm",

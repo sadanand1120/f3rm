@@ -1,6 +1,9 @@
 import gc
 import asyncio
 import glob
+import math
+import shutil
+from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
@@ -11,7 +14,7 @@ import matplotlib.pyplot as plt
 
 from sam2.features.client.sam2_client import SAM2FeaturesUnified
 from sam2.features.utils import SAM2utils, AsyncMultiWrapper
-from f3rm.features.utils import resolve_devices_and_workers, run_async_in_any_context
+from f3rm.features.utils import resolve_devices_and_workers, run_async_in_any_context, SAM2LazyAutoMasks, pack_auto_masks, pack_batch_auto_masks
 
 
 class SAM2Args:
@@ -67,40 +70,6 @@ async def process_single_image_async(image_path: str, sam2: AsyncMultiWrapper) -
     return auto_masks
 
 
-def pack_auto_masks(auto_masks: List[dict]) -> List[dict]:
-    optimized: List[dict] = []
-    for m in auto_masks:
-        seg = m.get("segmentation", None)
-        if isinstance(seg, np.ndarray):
-            h, w = seg.shape
-            packed = np.packbits(seg.astype(np.uint8).reshape(-1))
-            m = m.copy()
-            m["segmentation"] = {
-                "format": "packbits",
-                "shape": (h, w),
-                "data": packed.tobytes(),
-            }
-        optimized.append(m)
-    return optimized
-
-
-def unpack_auto_masks(auto_masks: List[dict]) -> List[dict]:
-    decoded: List[dict] = []
-    for m in auto_masks:
-        seg = m.get("segmentation")
-        if isinstance(seg, dict) and seg.get("format") == "packbits":
-            h, w = seg["shape"]
-            packed = np.frombuffer(seg["data"], dtype=np.uint8)
-            flat = np.unpackbits(packed)[: h * w]
-            seg_arr = flat.reshape(h, w).astype(bool)
-            md = m.copy()
-            md["segmentation"] = seg_arr
-            decoded.append(md)
-        else:
-            decoded.append(m)
-    return decoded
-
-
 class SAM2Extractor:
     def __init__(self, device: torch.device, verbose: bool = False) -> None:
         devices_param, num_workers = resolve_devices_and_workers(device, SAM2Args.batch_size_per_gpu)
@@ -127,13 +96,12 @@ class SAM2Extractor:
             )
 
     async def extract_batch_async(self, image_paths: List[str]):
-        results: List[dict] = []
+        results: List[List[dict]] = []
         for i in tqdm(range(0, len(image_paths), self.num_workers), desc="Processing & extracting SAM2 auto-masks", leave=False):
             batch_paths = image_paths[i:i + self.num_workers]
             tasks = [process_single_image_async(path, self.client) for path in batch_paths]
             batch_results = await AsyncMultiWrapper.async_run_tasks(tasks, desc="SAM2 auto_mask", leave=False)
-            # pack for storage efficiency
-            results.extend([pack_auto_masks(m) for m in batch_results])
+            results.extend(batch_results)
             gc.collect()
         return results
 
@@ -158,20 +126,119 @@ if __name__ == "__main__":
     auto_masks_per_image = extract_sam2_features(image_paths, device=device, verbose=True)
     print(f"Extracted auto-masks for {len(auto_masks_per_image)} images. Visualizing instance conversion for first few...")
     vis_count = min(4, len(auto_masks_per_image))
-    fig, axes = plt.subplots(1, vis_count, figsize=(4 * vis_count, 4))
+    fig, axes = plt.subplots(2, vis_count, figsize=(4 * vis_count, 8))
     if vis_count == 1:
-        axes = [axes]
-    for ax, auto_masks in zip(axes, auto_masks_per_image[:vis_count]):
-        decoded = unpack_auto_masks(auto_masks)
+        axes = axes.reshape(2, 1)
+
+    for i, (auto_masks, image_path) in enumerate(zip(auto_masks_per_image[:vis_count], image_paths[:vis_count])):
+        # Load and display RGB image
+        rgb_img = Image.open(image_path).convert("RGB")
+        axes[0, i].imshow(rgb_img)
+        axes[0, i].set_title(f"RGB Image {i+1}")
+        axes[0, i].axis('off')
+
+        # Generate and display mask
         inst_mask, _ = SAM2utils.auto_masks_to_instance_mask(
-            decoded,
+            auto_masks,
             min_iou=float(SAM2Args.pred_iou_thresh),
             min_area=float(SAM2Args.min_mask_region_area),
             assign_by="area",
             start_from="low",
         )
         viz_mask, cmap, norm = SAM2utils.make_viz_mask_and_cmap(inst_mask)
-        ax.imshow(viz_mask, cmap=cmap, norm=norm, interpolation='nearest')
-        ax.axis('off')
+        axes[1, i].imshow(viz_mask, cmap=cmap, norm=norm, interpolation='nearest')
+        axes[1, i].set_title(f"Instance Mask {i+1}")
+        axes[1, i].axis('off')
+
     plt.tight_layout()
     plt.show()
+
+    # Demo 2: Test the full pipeline (extract -> save -> load -> visualize)
+    print("\n" + "=" * 60)
+    print("DEMO 2: Full pipeline test (extract -> save -> load -> visualize)")
+    print("=" * 60)
+
+    # Setup paths
+    test_dir = Path("test_sam2_pipeline")
+    test_dir.mkdir(exist_ok=True)
+    shard_size = 4
+
+    # Extract features
+    print("Extracting SAM2 features...")
+    extractor = make_sam2_extractor(device, verbose=True)
+    auto_masks_per_image = run_async_in_any_context(lambda: extractor.extract_batch_async(image_paths))
+
+    # Save shards (following extract_features_standalone.py logic)
+    print("Saving shards...")
+    n_imgs = len(auto_masks_per_image)
+    n_shards = math.ceil(n_imgs / shard_size)
+
+    for i in range(n_shards):
+        s, e = i * shard_size, min((i + 1) * shard_size, n_imgs)
+        batch_masks = auto_masks_per_image[s:e]
+
+        # Pack batch data using consolidated function
+        packed_batch = pack_batch_auto_masks(batch_masks)
+
+        # Save shard
+        np.savez_compressed(
+            test_dir / f"chunk_{i:04d}.npz",
+            **packed_batch
+        )
+
+    # Load shards using SAM2LazyAutoMasks
+    print("Loading shards with SAM2LazyAutoMasks...")
+    shard_paths = sorted(test_dir.glob("chunk_*.npz"))
+    lazy_shards = SAM2LazyAutoMasks(shard_paths)
+    print(f"Loaded {len(lazy_shards)} images from {len(shard_paths)} shards")
+
+    # Visualize loaded data
+    print("Visualizing loaded data...")
+    vis_count = min(3, len(lazy_shards))
+    fig, axes = plt.subplots(2, vis_count, figsize=(4 * vis_count, 8))
+    if vis_count == 1:
+        axes = axes.reshape(2, 1)
+
+    for i in range(vis_count):
+        # Original RGB
+        rgb_img = Image.open(image_paths[i]).convert("RGB")
+        axes[0, i].imshow(rgb_img)
+        axes[0, i].set_title(f"RGB {i+1}")
+        axes[0, i].axis('off')
+
+        # Loaded masks
+        loaded_masks = lazy_shards[i]
+        if len(loaded_masks) > 0:
+            inst_mask, _ = SAM2utils.auto_masks_to_instance_mask(
+                loaded_masks,
+                min_iou=float(SAM2Args.pred_iou_thresh),
+                min_area=float(SAM2Args.min_mask_region_area),
+                assign_by="area",
+                start_from="low",
+            )
+            viz_mask, cmap, norm = SAM2utils.make_viz_mask_and_cmap(inst_mask)
+            axes[1, i].imshow(viz_mask, cmap=cmap, norm=norm, interpolation='nearest')
+        else:
+            axes[1, i].imshow(np.zeros((100, 100), dtype=np.uint8), cmap='gray')
+        axes[1, i].set_title(f"Loaded Mask {i+1} ({len(loaded_masks)} masks)")
+        axes[1, i].axis('off')
+
+    plt.tight_layout()
+    plt.show()
+
+    # Print comparison
+    print("\nComparison:")
+    for i in range(min(3, len(auto_masks_per_image))):
+        original_count = len(auto_masks_per_image[i])
+        loaded_count = len(lazy_shards[i])
+        print(f"Image {i}: Original={original_count} masks, Loaded={loaded_count} masks")
+
+    # Cleanup - close figures and lazy shards before removing directory
+    plt.close('all')
+    del lazy_shards
+    import gc
+    gc.collect()
+
+    # Cleanup
+    shutil.rmtree(test_dir)
+    print(f"Cleaned up test directory: {test_dir}")

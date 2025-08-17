@@ -30,83 +30,8 @@ from tqdm.auto import tqdm
 
 from f3rm.features.clip_extract import CLIPArgs, make_clip_extractor
 from f3rm.features.dino_extract import DINOArgs, make_dino_extractor
-from f3rm.features.sam2_extract import SAM2Args, make_sam2_extractor, unpack_auto_masks
-from f3rm.features.utils import run_async_in_any_context
-
-
-class LazyFeatures:
-    """Memory-mapped shards with O(1) random access.
-
-    Exposes `feat[idx_img, y, x] → torch.Tensor(C)` and keeps each shard
-    mapped only once (OS handles paging).  Nothing is ever `torch.cat`-ed.
-    """
-
-    def __init__(self, shard_paths: List[Path], device: torch.device):
-        self.paths = shard_paths
-        self.device = device
-        self.mmaps = [None] * len(shard_paths)          # lazy mmap
-        self.lengths = []
-        for p in shard_paths:
-            arr = np.load(p, mmap_mode="r")
-            self.lengths.append(arr.shape[0])
-            if self.mmaps[0] is None:                     # keep dims
-                self.H, self.W, self.C = arr.shape[1:]
-        self.cum = np.cumsum([0] + self.lengths)          # prefix-sum
-
-    # helper → shard id, local idx
-    def _loc(self, idx_img: int) -> Tuple[int, int]:
-        sid = int(np.searchsorted(self.cum, idx_img, side="right") - 1)
-        return sid, idx_img - self.cum[sid]
-
-    def _get_shard(self, sid: int):
-        if self.mmaps[sid] is None:
-            self.mmaps[sid] = np.load(self.paths[sid], mmap_mode="r", allow_pickle=False)
-        return self.mmaps[sid]
-
-    # single triple access
-    def __getitem__(self, triple):
-        idx_img, y, x = triple
-        sid, loc = self._loc(int(idx_img))
-        feat = self._get_shard(sid)[loc, int(y), int(x)]        # numpy view
-        return torch.from_numpy(feat)
-
-
-class SAM2LazyAutoMasks:
-    """Sharded loader for SAM2 auto-masks stored as object arrays (lazy, random access).
-
-    - Mirrors the interface of `LazyFeatures` for consistency (takes `device`, though unused here)
-    - Each shard: np.array(list_of_images, dtype=object), saved with allow_pickle=True
-    - Each element: List[Dict] of auto masks for an image, segmentations may be packbits-encoded
-    - Provides O(1) random access and on-demand shard loading; decodes packbits on access
-    """
-
-    def __init__(self, shard_paths: List[Path], device: torch.device):
-        self.paths = shard_paths
-        self.device = device
-        self._loaded = [None] * len(shard_paths)
-        self.lengths: List[int] = []
-        for p in shard_paths:
-            arr = np.load(p, allow_pickle=True)
-            self.lengths.append(int(arr.shape[0]))
-        self.cum = np.cumsum([0] + self.lengths)
-
-    def _loc(self, idx_img: int) -> Tuple[int, int]:
-        sid = int(np.searchsorted(self.cum, idx_img, side="right") - 1)
-        return sid, idx_img - self.cum[sid]
-
-    def _get_shard(self, sid: int):
-        if self._loaded[sid] is None:
-            self._loaded[sid] = np.load(self.paths[sid], allow_pickle=True)
-        return self._loaded[sid]
-
-    def __len__(self) -> int:
-        return int(self.cum[-1])
-
-    def __getitem__(self, idx_img: int) -> List[dict]:
-        sid, loc = self._loc(int(idx_img))
-        entry = self._get_shard(sid)[loc]
-        # Decode packbits if present
-        return unpack_auto_masks(entry)
+from f3rm.features.sam2_extract import SAM2Args, make_sam2_extractor
+from f3rm.features.utils import run_async_in_any_context, SAM2LazyAutoMasks, LazyFeatures, pack_auto_masks, pack_batch_auto_masks
 
 
 FEAT_TYPE_TO_ARGS = {
@@ -149,8 +74,14 @@ async def _save_shards_generic(
         if feature_type in ("CLIP", "DINO"):
             np.save(root / f"chunk_{i:04d}.npy", data.cpu().numpy(), allow_pickle=False)
         elif feature_type == "SAM2":
-            # List[List[dict]] per shard → consistent 1D array with object dtype
-            np.save(root / f"chunk_{i:04d}.npy", np.array(data, dtype=object), allow_pickle=True)
+            # Pack SAM2 data into memory-mappable format using consolidated function
+            packed_batch = pack_batch_auto_masks(data)
+
+            # Store as single concatenated arrays for memory mapping
+            np.savez_compressed(
+                root / f"chunk_{i:04d}.npz",
+                **packed_batch
+            )
         del data
         torch.cuda.empty_cache()
         gc.collect()
@@ -158,7 +89,7 @@ async def _save_shards_generic(
     CONSOLE.print(f"Saved {feature_type} shards → {root}")
 
 
-def feature_loader(image_fnames: List[str], extract_args, data_dir: Path, feature_type: str, device: torch.device):
+def feature_loader(image_fnames: List[str], extract_args, data_dir: Path, feature_type: str):
     """Load cached features if they exist and match the expected configuration."""
     root, meta = get_cache_paths(data_dir, feature_type)
 
@@ -219,17 +150,20 @@ def feature_loader(image_fnames: List[str], extract_args, data_dir: Path, featur
         return None
 
     # Check shard files exist
-    shard_paths = sorted(root.glob("chunk_*.npy"))
+    if feature_type == "SAM2":
+        shard_paths = sorted(root.glob("chunk_*.npz"))
+    else:
+        shard_paths = sorted(root.glob("chunk_*.npy"))
     if not shard_paths:
         CONSOLE.print(f"[DEBUG] {feature_type}: CACHE MISS - No shard files found")
         return None
 
     if feature_type == "SAM2":
         CONSOLE.print(f"[DEBUG] {feature_type}: CACHE HIT - Using SAM2 lazy cache with {len(shard_paths)} shards")
-        return SAM2LazyAutoMasks(shard_paths, device)
+        return SAM2LazyAutoMasks(shard_paths)
 
     CONSOLE.print(f"[DEBUG] {feature_type}: CACHE HIT - Using mmap cache with {len(shard_paths)} shards")
-    return LazyFeatures(shard_paths, device)
+    return LazyFeatures(shard_paths)
 
 
 def get_image_filenames_from_dataparser(data_dir: Path) -> List[str]:
@@ -263,7 +197,7 @@ def extract_features_for_dataset(
     shard_size: int = 64,
     enable_cache: bool = True,
     force: bool = False,
-) -> Union[torch.Tensor, LazyFeatures]:
+) -> Union[torch.Tensor, LazyFeatures, SAM2LazyAutoMasks]:
     """
     Extract features for a dataset (same logic as FeatureDataManager.extract_features_sharded).
 
@@ -274,7 +208,7 @@ def extract_features_for_dataset(
 
     CONSOLE.print(f"[DEBUG] {feature_type}: enable_cache={enable_cache}, checking for cached features...")
     feats = (
-        feature_loader(image_fnames, args, data_dir, feature_type, device)
+        feature_loader(image_fnames, args, data_dir, feature_type)
         if enable_cache and not force
         else None
     )
@@ -298,7 +232,7 @@ def extract_features_for_dataset(
 
     run_async_in_any_context(_run)
 
-    loaded = feature_loader(image_fnames, args, data_dir, feature_type, device)
+    loaded = feature_loader(image_fnames, args, data_dir, feature_type)
     return loaded if loaded is not None else torch.empty(0)
 
 

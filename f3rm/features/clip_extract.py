@@ -20,7 +20,7 @@ class CLIPArgs:
     skip_center_crop: bool = True
     batch_size_per_gpu: int = 8
     agg_scales: List[float] = [0.25, 0.5, 1.0, 1.5]
-    agg_weights: Optional[List[float]] = [1, 2, 5.5, 2]
+    agg_weights: Optional[List[float]] = [1.5, 3, 6, 3]
 
     @classmethod
     def id_dict(cls):
@@ -59,6 +59,7 @@ class CLIPExtractor:
                 tensor_format="HWC",
                 padding_mode="constant",
                 return_meta=False,
+                ret_internal_feats=False,
             )
 
     async def extract_batch_async(self, image_paths: List[str]) -> torch.Tensor:
@@ -79,6 +80,8 @@ class CLIPExtractor:
                     interpolation_mode="bilinear",
                     tensor_format="HWC",
                     padding_mode="constant",
+                    return_meta=False,
+                    ret_internal_feats=False,
                 )
                 for path in chunk
             ]

@@ -27,4 +27,5 @@ exports/
 **/*notrack*
 **/.clang-format
 **/.vscode
+**/.cursor
 Hierarchical-Localization/
