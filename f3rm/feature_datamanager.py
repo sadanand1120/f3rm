@@ -54,6 +54,19 @@ class FeatureDataManager(VanillaDataManager):
         self.features = features         # ≤-1 GB LazyFeatures or a real tensor
         self.eval_offset = len(self.train_dataset)
 
+        # Load SAM2 auto masks lazily (for centroid cache GT); uses the same image order
+        image_fnames = self.train_dataset.image_filenames + self.eval_dataset.image_filenames
+        self.sam2_masks = extract_features_for_dataset(
+            image_fnames=image_fnames,
+            data_dir=self.config.dataparser.data,
+            feature_type="SAM2",
+            device=self.device,
+            shard_size=64,
+            enable_cache=self.config.enable_cache,
+            force=False,
+        )
+        CONSOLE.print("Loaded SAM2 lazy auto-masks for centroid supervision cache")
+
         # Set metadata, so we can initialize model with feature dimensionality
         feat_dim = (self.features.C if isinstance(self.features, LazyFeatures) else self.features.shape[-1])
         self.train_dataset.metadata["feature_type"] = self.config.feature_type

@@ -11,6 +11,7 @@ from sam2.features.clip_main import CLIPfeatures
 from f3rm.features.utils import LazyFeatures, SAM2LazyAutoMasks
 from f3rm.features.sam2_extract import SAM2Args
 from depthany2.viz_utils import viz_pc, pcd_from_np, _save_pcd_via_open3d
+from f3rm.shaders import CentroidShader
 
 
 class CLIPSAMSegmenter:
@@ -24,6 +25,8 @@ class CLIPSAMSegmenter:
         self.clip_features = LazyFeatures(sorted(self.feat_root.glob("clip/chunk_*.npy")))
         self.sam2_masks = SAM2LazyAutoMasks(sorted(self.feat_root.glob("sam2/chunk_*.npz")))
         _, self.pipeline, _, _ = eval_setup(config_path=self.config_path, test_mode="test")
+        self.pipeline.eval()
+        self.centroid_shader = CentroidShader(self.pipeline.model.field.spatial_distortion)
         self.train_image_fnames = [str(p) for p in self.pipeline.datamanager.train_dataset.image_filenames]
         self.eval_image_fnames = [str(p) for p in self.pipeline.datamanager.eval_dataset.image_filenames]
         self.eval_offset = self.pipeline.datamanager.eval_offset
@@ -91,16 +94,18 @@ class CLIPSAMSegmenter:
         c_tensor = torch.tensor([local_cam_idx], device=cams.device)
         camera_opt_to_camera = self.pipeline.datamanager.eval_camera_optimizer(c_tensor) if split == 'eval' else self.pipeline.datamanager.train_camera_optimizer(c_tensor)
         camera_ray_bundle = cams.generate_rays(camera_indices=local_cam_idx, camera_opt_to_camera=camera_opt_to_camera)
-        self.pipeline.eval()
         outputs = self.pipeline.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle, render_features=render_features)
-        self.pipeline.train()
         pred_rgb = outputs["rgb"]
         depth_raw = outputs["depth"]
         depth_colored = colormaps.apply_depth_colormap(depth_raw, accumulation=outputs["accumulation"])
         result = {"pred_rgb": pred_rgb, "depth_raw": depth_raw.squeeze(-1), "depth_colored": depth_colored}
         if render_features:
-            result["feature_pca"] = outputs["feature_pca"]  # on cpu
-            result["feature"] = outputs["feature"]  # on cpu
+            result["feature_pca"] = outputs["feature_pca"]
+            result["feature"] = outputs["feature"]
+            if self.pipeline.model.config.centroid_enable:
+                result["centroid_pred"] = outputs["centroid_pred"]
+                result["centroid_offset"] = outputs["centroid_offset"]
+                result["centroid_pred_rgb"] = outputs["centroid_pred_rgb"]
         original_c2w_34 = cams.camera_to_worlds[local_cam_idx].cpu().numpy()
         original_c2w = np.vstack([original_c2w_34, np.array([[0, 0, 0, 1]])])
         camera_opt_to_camera_4x4 = np.vstack([camera_opt_to_camera[0].cpu().numpy(), np.array([[0, 0, 0, 1]])])
@@ -130,18 +135,18 @@ class CLIPSAMSegmenter:
 
 
 if __name__ == "__main__":
-    IMAGE_PATH = "datasets/f3rm/custom/betaipad/small/images/frame_00115.png"
-    CONFIG_PATH = "bugfix_outputs/betaipad_small_pipe_default/f3rm/2025-08-15_155758/config.yml"
+    IMAGE_PATH = "datasets/f3rm/custom/betabook/small/images/frame_00001.png"
+    CONFIG_PATH = "cent_outputs/betabook_small_pipe_cent_cold15k_nodensemb/f3rm/2025-08-17_211558/config.yml"
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     DEBUG = False
-    
-    TEXT_PROMPT = "ipad"
+
+    TEXT_PROMPT = "book"
     NEGATIVE_TEXT = "object"
     SOFTMAX_TEMP = 0.01
     MIN_INSTANCE_PERCENT = 1.0
     TOP_MEAN_PERCENT = 5
-    
-    RENDER_FEATURES = False
+
+    RENDER_FEATURES = True
 
     print(f"IMAGE_PATH: {IMAGE_PATH}, CONFIG_PATH: {CONFIG_PATH}")
     segmenter = CLIPSAMSegmenter(data_dir=Path(IMAGE_PATH).parent.parent, config_path=CONFIG_PATH, debug=DEBUG)
@@ -193,14 +198,29 @@ if __name__ == "__main__":
         axes[2, 0].imshow(pipeline_outputs["feature_pca"].numpy())
         axes[2, 0].set_title("Pred CLIP PCA (Pipeline)")
         axes[2, 0].axis('off')
-        axes[2, 1].imshow(pred_clip_pca.cpu().numpy())
-        axes[2, 1].set_title("Pred CLIP PCA (GT Proj)")
-        axes[2, 1].axis('off')
+        if segmenter.pipeline.model.config.centroid_enable:
+            cent_rgb = pipeline_outputs["centroid_pred_rgb"].cpu().numpy()
+            axes[2, 1].imshow(cent_rgb)
+            axes[2, 1].set_title("Pred Centroid RGB")
+            axes[2, 1].axis('off')
+            offset = pipeline_outputs["centroid_offset"].cpu()
+            offset_norm = torch.linalg.norm(offset, dim=-1).numpy()
+            axes[2, 2].imshow(offset_norm, cmap='magma')
+            axes[2, 2].set_title("Centroid Offset |.|")
+            axes[2, 2].axis('off')
+            cent_rgb2 = segmenter.centroid_shader(pipeline_outputs["centroid_pred"]).cpu().numpy()
+            axes[2, 3].imshow(cent_rgb2)
+            axes[2, 3].set_title("Centroid Pred (Shader)")
+            axes[2, 3].axis('off')
+        else:
+            axes[2, 1].axis('off')
+            axes[2, 2].axis('off')
+            axes[2, 3].axis('off')
     else:
         axes[2, 0].axis('off')
         axes[2, 1].axis('off')
-    axes[2, 2].axis('off')
-    axes[2, 3].axis('off')
+        axes[2, 2].axis('off')
+        axes[2, 3].axis('off')
 
     plt.tight_layout()
     plt.show()

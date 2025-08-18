@@ -45,9 +45,14 @@ f3rm_method = MethodSpecification(
                 predict_normals=True,
                 feat_condition_on_density=False,  # degraded performance
                 feat_condition_density_grad_to_nerf=False,   # degraded performance
+                # Centroid head controls
+                centroid_enable=False,
+                centroid_loss_weight=1e-3,
+                centroid_condition_on_density=False,
+                centroid_condition_density_grad_to_nerf=False,
+                centroid_hidden_dim=64,
+                centroid_num_layers=2,
             ),
-            # Train-depth cache control
-            train_depth_cache_enable=True,
             steps_per_train_cache_update=0,
             train_cache_cold_start_skip_steps=0,
             steps_per_train_image_viz=500,

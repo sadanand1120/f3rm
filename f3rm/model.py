@@ -24,8 +24,9 @@ from torch.nn import Parameter
 
 from f3rm.feature_field import FeatureField, FeatureFieldHeadNames
 from f3rm.pca_colormap import apply_pca_colormap_return_proj
-from f3rm.renderer import FeatureRenderer
+from f3rm.renderer import FeatureRenderer, CentroidRenderer
 from f3rm.features.clip_extract import CLIPArgs
+from f3rm.shaders import CentroidShader
 
 
 @dataclass
@@ -51,6 +52,17 @@ class FeatureFieldModelConfig(NerfactoModelConfig):
     # Feature Field MLP Head
     feat_hidden_dim: int = 64
     feat_num_layers: int = 2
+
+    # Centroid-offset head controls (single knob)
+    centroid_enable: bool = True  # Enable centroid-offset head (train + render + cache)
+    centroid_loss_weight: float = 1e-3  # Loss weight for centroid-offset regression
+    centroid_condition_on_density: bool = True  # Condition centroid head on NeRF density embedding
+    centroid_condition_density_grad_to_nerf: bool = False  # Allow centroid head gradients into NeRF density embedding
+    centroid_hidden_dim: int = 64  # Centroid head hidden dim
+    centroid_num_layers: int = 2  # Centroid head num layers
+    # Centroid cache helpers (used in pipeline)
+    centroid_min_instance_percent: float = 1.0  # Filter small instances when building centroid GT
+    centroid_min_accum: float = 0.0  # Min accumulation to consider a pixel valid in centroid GT
 
 
 @dataclass
@@ -126,11 +138,6 @@ class FeatureFieldModel(NerfactoModel):
 
     feature_field: FeatureField
     renderer_feature: FeatureRenderer
-    _train_depth_cache_enabled: bool = False
-
-    # Default no-op cache accessor; pipeline overrides this with a real function
-    def _get_train_depth_cache(self):
-        return {}
 
     def populate_modules(self):
         super().populate_modules()
@@ -142,8 +149,11 @@ class FeatureFieldModel(NerfactoModel):
         self.feature_field = FeatureField(
             feature_dim=feature_dim,
             spatial_distortion=self.field.spatial_distortion,
-            cond_on_density=self.config.feat_condition_on_density,
+            cond_on_density_feature=self.config.feat_condition_on_density,
+            cond_on_density_centroid=self.config.centroid_condition_on_density,
             density_embedding_dim=getattr(self.field, "geo_feat_dim", 15),
+            feat_grad_to_density=self.config.feat_condition_density_grad_to_nerf,
+            centroid_grad_to_density=self.config.centroid_condition_density_grad_to_nerf,
             use_pe=self.config.feat_use_pe,
             pe_n_freq=self.config.feat_pe_n_freq,
             num_levels=self.config.feat_num_levels,
@@ -153,9 +163,13 @@ class FeatureFieldModel(NerfactoModel):
             features_per_level=self.config.feat_features_per_level,
             hidden_dim=self.config.feat_hidden_dim,
             num_layers=self.config.feat_num_layers,
+            centroid_hidden_dim=self.config.centroid_hidden_dim,
+            centroid_num_layers=self.config.centroid_num_layers,
         )
 
         self.renderer_feature = FeatureRenderer()
+        self.renderer_centroid = CentroidRenderer()
+        self.centroid_shader = CentroidShader(self.field.spatial_distortion)
         self.setup_gui()
 
     def setup_gui(self):
@@ -206,15 +220,23 @@ class FeatureFieldModel(NerfactoModel):
         expected_depth = self.renderer_expected_depth(weights=weights, ray_samples=ray_samples)
         accumulation = self.renderer_accumulation(weights=weights)
 
-        # Feature outputs (optionally conditioned on density embedding from NeRF)
+        # Feature/Centroid outputs (optionally conditioned on density embedding from NeRF)
         if render_features:
+            need_density = self.config.feat_condition_on_density or (self.config.centroid_enable and self.config.centroid_condition_on_density)
             density_embedding = None
-            if self.config.feat_condition_on_density:
-                _, density_embedding = self.field.get_density(ray_samples)
-                if not self.config.feat_condition_density_grad_to_nerf:
-                    density_embedding = density_embedding.detach()
+            if need_density:
+                _, density_embed_raw = self.field.get_density(ray_samples)
+                allow_grad = False
+                if self.config.feat_condition_on_density and self.config.feat_condition_density_grad_to_nerf:
+                    allow_grad = True
+                if self.config.centroid_enable and self.config.centroid_condition_on_density and self.config.centroid_condition_density_grad_to_nerf:
+                    allow_grad = True
+                density_embedding = density_embed_raw if allow_grad else density_embed_raw.detach()
             ff_outputs = self.feature_field(ray_samples, density_embedding=density_embedding)
             features = self.renderer_feature(features=ff_outputs[FeatureFieldHeadNames.FEATURE], weights=weights)
+            # Allow centroid forward anytime during eval/inference; gate during training until post cold-start
+            if self.config.centroid_enable and (not self.training or getattr(self, "_train_centroid_cache_enabled", False)):
+                centroid_offset = self.renderer_centroid(values=ff_outputs[FeatureFieldHeadNames.CENTROID_OFFSET], weights=weights)
 
         outputs = {
             "rgb": rgb,
@@ -224,6 +246,8 @@ class FeatureFieldModel(NerfactoModel):
         }
         if render_features:
             outputs["feature"] = features
+            if self.config.centroid_enable and (not self.training or getattr(self, "_train_centroid_cache_enabled", False)):
+                outputs["centroid_offset"] = centroid_offset
 
         if self.config.predict_normals:
             normals = self.renderer_normals(normals=field_outputs[FieldHeadNames.NORMALS], weights=weights)
@@ -234,6 +258,9 @@ class FeatureFieldModel(NerfactoModel):
         if self.training:
             outputs["weights_list"] = weights_list
             outputs["ray_samples_list"] = ray_samples_list
+            # Save ray geometry for centroid supervision
+            outputs["ray_origins"] = ray_bundle.origins
+            outputs["ray_directions"] = ray_bundle.directions
 
         if self.training and self.config.predict_normals:
             outputs["rendered_orientation_loss"] = orientation_loss(
@@ -265,17 +292,51 @@ class FeatureFieldModel(NerfactoModel):
         loss_dict = super().get_loss_dict(outputs, batch, metrics_dict)
         target_feats = batch["feature"].to(self.device)
         loss_dict["feature_loss"] = self.config.feat_loss_weight * F.mse_loss(outputs["feature"], target_feats)
-        # Dummy check: only during training, assert cached depth exists and is HxWx1
-        if self.training and self._train_depth_cache_enabled:
-            full_cache = self._get_train_depth_cache()  # type: ignore[attr-defined]
-            cam_idx = int(torch.mode(batch["indices"][:, 0].to(self.device)).values.item())
-            assert cam_idx in full_cache, f"train depth cache missing camera {cam_idx}"
-            depth_img = full_cache[cam_idx]
-            assert depth_img.ndim == 3 and depth_img.shape[-1] == 1, "cached depth must be HxWx1"
-            # Also verify cache covers all cameras present in this batch
-            unique_cams = torch.unique(batch["indices"][:, 0]).tolist()
-            missing = [int(ci) for ci in unique_cams if int(ci) not in full_cache]
-            assert not missing, f"train depth cache missing cameras {missing}; expected all of {list(map(int, unique_cams))}"
+        # Centroid-offset loss (supervision via cache).
+        if self.training and self.config.centroid_enable and getattr(self, "_train_centroid_cache_enabled", False):
+            full_cache = self._get_train_centroid_cache()  # type: ignore[attr-defined]
+            ray_indices = batch["indices"].to(self.device)
+            cam_idx = ray_indices[:, 0].long()
+            yi = ray_indices[:, 1].long()
+            xi = ray_indices[:, 2].long()
+
+            # Strict: all cameras in batch must be present in cache
+            unique_cams = torch.unique(cam_idx).tolist()
+            for ci in unique_cams:
+                assert int(ci) in full_cache, f"Centroid cache missing camera {int(ci)}"
+
+            # Assemble GT on CPU per camera, then move picks to GPU (avoids moving full images to GPU)
+            num_rays = cam_idx.shape[0]
+            gt_centroids = torch.zeros((num_rays, 3), device=self.device, dtype=outputs["depth"].dtype)
+            valid_mask_t = torch.zeros((num_rays,), device=self.device, dtype=torch.bool)
+            with torch.no_grad():
+                for ci in unique_cams:
+                    ci_int = int(ci)
+                    sel = (cam_idx == ci)
+                    idxs = torch.nonzero(sel, as_tuple=True)[0]
+                    if idxs.numel() == 0:
+                        continue
+                    y_sel = yi[idxs].cpu().long()
+                    x_sel = xi[idxs].cpu().long()
+                    c_img_cpu, v_img_cpu = full_cache[ci_int]
+                    # c_img_cpu: HxWx3 float32 (CPU), v_img_cpu: HxWx1 bool (CPU)
+                    c_pick = c_img_cpu[y_sel, x_sel]              # Nx3 (CPU)
+                    v_pick = v_img_cpu[y_sel, x_sel].squeeze(-1)  # N (CPU) bool
+                    gt_centroids[idxs] = c_pick.to(self.device, non_blocking=True)
+                    valid_mask_t[idxs] = v_pick.to(self.device, non_blocking=True)
+
+            # World point via median depth
+            w = outputs["ray_origins"].to(self.device) + outputs["ray_directions"].to(self.device) * outputs["depth"].to(self.device)
+            pred_offset = outputs["centroid_offset"].to(self.device)
+            gt_offset = w - gt_centroids
+
+            if valid_mask_t.any():
+                sl1 = F.smooth_l1_loss(pred_offset[valid_mask_t], gt_offset[valid_mask_t])
+                loss_dict["centroid_offset_loss"] = self.config.centroid_loss_weight * sl1
+                if metrics_dict is not None:
+                    l2 = torch.linalg.norm(pred_offset[valid_mask_t] - gt_offset[valid_mask_t], dim=-1).mean()
+                    metrics_dict["centroid_offset_l2"] = l2
+                    metrics_dict["centroid_valid_fraction"] = valid_mask_t.float().mean()
         return loss_dict
 
     def get_outputs_for_camera_ray_bundle(self, camera_ray_bundle: RayBundle, render_features: bool = True) -> Dict[str, torch.Tensor]:
@@ -318,6 +379,14 @@ class FeatureFieldModel(NerfactoModel):
             outputs["feature"], viewer_utils.pca_proj
         )
 
+        # Append centroid prediction visualization if enabled
+        # Allow during eval/inference regardless of cold-start; gate during training until post cold-start
+        if self.config.centroid_enable and (not self.training or getattr(self, "_train_centroid_cache_enabled", False)) and "centroid_offset" in outputs:
+            w = camera_ray_bundle.origins + camera_ray_bundle.directions * outputs["depth"]
+            centroid_pred = w - outputs["centroid_offset"]
+            outputs["centroid_pred"] = centroid_pred
+            outputs["centroid_pred_rgb"] = self.centroid_shader(centroid_pred)
+
         # Nothing else to do if not CLIP features or no positives
         if self.kwargs["metadata"]["feature_type"] != "CLIP" or not viewer_utils.has_positives:
             return outputs
@@ -356,4 +425,6 @@ class FeatureFieldModel(NerfactoModel):
         metrics_dict, images_dict = super().get_image_metrics_and_images(outputs, batch)
         if "feature_pca" in outputs:
             images_dict["feature_pca"] = outputs["feature_pca"]
+        if "centroid_pred_rgb" in outputs:
+            images_dict["centroid_pred_rgb"] = outputs["centroid_pred_rgb"]
         return metrics_dict, images_dict
