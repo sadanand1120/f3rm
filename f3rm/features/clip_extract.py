@@ -18,7 +18,7 @@ class CLIPArgs:
     model_pretrained: str = "openai"
     load_size: int = 2048
     skip_center_crop: bool = True
-    batch_size_per_gpu: int = 8
+    batch_size_per_gpu: int = 4
     agg_scales: List[float] = [0.25, 0.5, 1.0, 1.5]
     agg_weights: Optional[List[float]] = [1.5, 3, 6, 3]
 

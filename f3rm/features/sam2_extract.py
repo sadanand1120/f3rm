@@ -145,9 +145,18 @@ if __name__ == "__main__":
             assign_by="area",
             start_from="low",
         )
+        if inst_mask is None:
+            # No valid masks found, create empty instance mask
+            if auto_masks:
+                h, w = auto_masks[0]['segmentation'].shape
+            else:
+                # Use actual image dimensions as fallback
+                img = Image.open(image_paths[i])
+                h, w = img.height, img.width
+            inst_mask = np.zeros((h, w), dtype=np.uint16)
         viz_mask, cmap, norm = SAM2utils.make_viz_mask_and_cmap(inst_mask)
         axes[1, i].imshow(viz_mask, cmap=cmap, norm=norm, interpolation='nearest')
-        axes[1, i].set_title(f"Instance Mask {i+1}")
+        axes[1, i].set_title(f"Instance Mask {i+1} ({len(np.unique(inst_mask)) - 1} inst)")
         axes[1, i].axis('off')
 
     plt.tight_layout()
@@ -208,19 +217,25 @@ if __name__ == "__main__":
 
         # Loaded masks
         loaded_masks = lazy_shards[i]
-        if len(loaded_masks) > 0:
-            inst_mask, _ = SAM2utils.auto_masks_to_instance_mask(
-                loaded_masks,
-                min_iou=float(SAM2Args.pred_iou_thresh),
-                min_area=float(SAM2Args.min_mask_region_area),
-                assign_by="area",
-                start_from="low",
-            )
-            viz_mask, cmap, norm = SAM2utils.make_viz_mask_and_cmap(inst_mask)
-            axes[1, i].imshow(viz_mask, cmap=cmap, norm=norm, interpolation='nearest')
-        else:
-            axes[1, i].imshow(np.zeros((100, 100), dtype=np.uint8), cmap='gray')
-        axes[1, i].set_title(f"Loaded Mask {i+1} ({len(loaded_masks)} masks)")
+        inst_mask, _ = SAM2utils.auto_masks_to_instance_mask(
+            loaded_masks,
+            min_iou=float(SAM2Args.pred_iou_thresh),
+            min_area=float(SAM2Args.min_mask_region_area),
+            assign_by="area",
+            start_from="low",
+        )
+        if inst_mask is None:
+            # No valid masks found, create empty instance mask
+            if loaded_masks:
+                h, w = loaded_masks[0]['segmentation'].shape
+            else:
+                # Use actual image dimensions as fallback
+                img = Image.open(image_paths[i])
+                h, w = img.height, img.width
+            inst_mask = np.zeros((h, w), dtype=np.uint16)
+        viz_mask, cmap, norm = SAM2utils.make_viz_mask_and_cmap(inst_mask)
+        axes[1, i].imshow(viz_mask, cmap=cmap, norm=norm, interpolation='nearest')
+        axes[1, i].set_title(f"Loaded Mask {i+1} ({len(loaded_masks)} masks, {len(np.unique(inst_mask)) - 1} inst)")
         axes[1, i].axis('off')
 
     plt.tight_layout()

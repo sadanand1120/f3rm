@@ -11,8 +11,10 @@ from f3rm.trainer import F3RMTrainerConfig
 from f3rm.pipeline import FeaturePipelineConfig
 
 # TODO: Look at https://docs.nerf.studio/nerfology/methods/nerfacto.html, try bigger model for better scenes!
-# TODO: (maybe) replace the f3rm utils's pca with ur optimized sam2 pca
+# TODO: (maybe) replace the f3rm utils's pca with ur sam2 pca (did speed testing, both were almost same)
 # TODO: optimize code by calling super().bla at places (e.g. super().get_train_loss_dict() in pipeline.py)
+# TODO: reduce training time, look at original feature loading (.pt based) in f3rm, maybe thats the issue?
+# TODO: do model compression so training time is reduced as well, instead of having separate entire MLPs, just have a larger common trunk where possible, and have separate output heads
 f3rm_method = MethodSpecification(
     config=F3RMTrainerConfig(
         method_name="f3rm",
@@ -29,6 +31,8 @@ f3rm_method = MethodSpecification(
         pipeline=FeaturePipelineConfig(
             datamanager=FeatureDataManagerConfig(
                 feature_type="CLIP",
+                sam2_feature_type="SAM2",
+                foreground_feature_type="FOREGROUND_",
                 dataparser=NerfstudioDataParserConfig(train_split_fraction=0.95),
                 train_num_rays_per_batch=8192,
                 eval_num_rays_per_batch=4096,
@@ -47,11 +51,24 @@ f3rm_method = MethodSpecification(
                 feat_condition_density_grad_to_nerf=False,   # degraded performance
                 # Centroid head controls
                 centroid_enable=False,
-                centroid_loss_weight=1e-3,
+                centroid_loss_weight=2e-3,
                 centroid_condition_on_density=False,
                 centroid_condition_density_grad_to_nerf=False,
                 centroid_hidden_dim=64,
                 centroid_num_layers=2,
+                centroid_gt_blend=0.5,
+                centroid_blend_after_steps=0,
+                # Foreground head controls
+                foreground_enable=True,
+                foreground_condition_on_density=False,
+                foreground_condition_density_grad_to_nerf=False,
+                enable_campose_refine_feature_field=False,
+                foreground_loss_weight=2e-3,
+                foreground_hidden_dim=64,
+                foreground_num_layers=2,
+                # spread-fg sharing trunk
+                centroid_spread_trunk_fg=0,
+                foreground_trunk_grad_to_spread=False,
             ),
             steps_per_train_cache_update=0,
             train_cache_cold_start_skip_steps=0,

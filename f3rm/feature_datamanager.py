@@ -38,6 +38,10 @@ class FeatureDataManagerConfig(VanillaDataManagerConfig):
     _target: Type = field(default_factory=lambda: FeatureDataManager)
     feature_type: Literal["CLIP", "DINO"] = "CLIP"
     """Feature type to extract."""
+    sam2_feature_type: str = "SAM2"
+    """SAM2 feature type for centroid supervision (SAM2, CLIPSAM_book, CLIPSAM_, etc.)."""
+    foreground_feature_type: str = "FOREGROUND_"
+    """Foreground feature type for separate foreground head (FOREGROUND_*, e.g., FOREGROUND_book)."""
     enable_cache: bool = True
     """Whether to cache extracted features."""
 
@@ -59,7 +63,7 @@ class FeatureDataManager(VanillaDataManager):
         self.sam2_masks = extract_features_for_dataset(
             image_fnames=image_fnames,
             data_dir=self.config.dataparser.data,
-            feature_type="SAM2",
+            feature_type=self.config.sam2_feature_type,
             device=self.device,
             shard_size=64,
             enable_cache=self.config.enable_cache,
@@ -67,10 +71,24 @@ class FeatureDataManager(VanillaDataManager):
         )
         CONSOLE.print("Loaded SAM2 lazy auto-masks for centroid supervision cache")
 
+        # Load FOREGROUND shards lazily (2-dim one-hot per pixel), same image order
+        self.fg_maps = extract_features_for_dataset(
+            image_fnames=image_fnames,
+            data_dir=self.config.dataparser.data,
+            feature_type=self.config.foreground_feature_type,
+            device=self.device,
+            shard_size=64,
+            enable_cache=self.config.enable_cache,
+            force=False,
+        )
+        CONSOLE.print("Loaded FOREGROUND lazy maps for foreground head supervision")
+
         # Set metadata, so we can initialize model with feature dimensionality
         feat_dim = (self.features.C if isinstance(self.features, LazyFeatures) else self.features.shape[-1])
         self.train_dataset.metadata["feature_type"] = self.config.feature_type
         self.train_dataset.metadata["feature_dim"] = feat_dim
+        # Expose presence of foreground maps via metadata
+        self.train_dataset.metadata["has_foreground"] = True
 
         # Determine scaling factors for nearest neighbor interpolation
         feat_h, feat_w = (features.H, features.W) if isinstance(features, LazyFeatures) else features.shape[1:3]
@@ -127,6 +145,8 @@ class FeatureDataManager(VanillaDataManager):
         batch["image"] = _async_to_cuda(batch["image"], self.device)
         camera_idx, y_idx, x_idx = self._index_triplet(batch, self.scale_h, self.scale_w)
         batch["feature"] = self._gather_feats(self.features, camera_idx, y_idx, x_idx)
+        # Foreground one-hot target (2-dim): use global camera_idx for eval offset? For train, indices are train split only
+        batch["foreground"] = self._gather_feats(self.fg_maps, camera_idx, y_idx, x_idx)
         if step % 100 == 0:
             torch.cuda.empty_cache()
         return ray_bundle, batch
@@ -137,4 +157,5 @@ class FeatureDataManager(VanillaDataManager):
         camera_idx, y_idx, x_idx = self._index_triplet(batch, self.scale_h, self.scale_w)
         camera_idx_global = camera_idx + self.eval_offset
         batch["feature"] = self._gather_feats(self.features, camera_idx_global, y_idx, x_idx)
+        batch["foreground"] = self._gather_feats(self.fg_maps, camera_idx_global, y_idx, x_idx)
         return ray_bundle, batch

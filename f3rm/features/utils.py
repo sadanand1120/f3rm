@@ -1,4 +1,5 @@
 from typing import Optional, Tuple, Callable, Any, List, Dict
+import json
 
 import asyncio
 import concurrent.futures
@@ -180,6 +181,10 @@ class SAM2LazyAutoMasks(BaseLazyShards):
         pred_iou_data = packed_data["pred_iou_data"]
         area_data = packed_data["area_data"]
 
+        # Validate that we have data to unpack
+        if len(mask_data) == 0 or len(mask_shapes) == 0:
+            return []
+
         start_idx = 0
         for i in range(packed_data["num_masks"]):
             h, w = mask_shapes[i]
@@ -190,6 +195,10 @@ class SAM2LazyAutoMasks(BaseLazyShards):
             # Calculate packed size for this mask
             packed_size = (h * w + 7) // 8  # Round up for packbits
             end_idx = start_idx + packed_size
+
+            # Validate we have enough data
+            if end_idx > len(mask_data):
+                break
 
             # Extract and unpack this mask's data
             packed = mask_data[start_idx:end_idx]
@@ -210,6 +219,37 @@ class SAM2LazyAutoMasks(BaseLazyShards):
         return decoded
 
 
+class TextLazyFeatures(BaseLazyShards):
+    """Lazy loading for TEXT features from sharded .json files."""
+
+    def __init__(self, shard_paths: List[Path]):
+        super().__init__(shard_paths)
+
+    def _setup_lengths(self):
+        """Count total number of images across all shards."""
+        for p in self.paths:
+            with open(p, 'r') as f:
+                data = json.load(f)
+            self.lengths.append(len(data))
+
+    def _get_shard(self, sid: int):
+        """Load a specific shard."""
+        with open(self.paths[sid], 'r') as f:
+            return json.load(f)
+
+    def __len__(self) -> int:
+        return int(self.cum[-1])
+
+    def __getitem__(self, idx_img: int) -> List[str]:
+        """Get text objects for a specific image index."""
+        sid, loc = self._loc(int(idx_img))
+        shard_data = self._get_shard(sid)
+
+        # Get image path at this index and return its objects
+        image_paths = list(shard_data.keys())
+        return shard_data[image_paths[loc]]
+
+
 def pack_auto_masks(auto_masks: List[dict]) -> dict:
     """Pack auto masks into a memory-mappable format.
 
@@ -225,8 +265,8 @@ def pack_auto_masks(auto_masks: List[dict]) -> dict:
         return {
             "num_masks": 0,
             "mask_data": np.array([], dtype=np.uint8),
-            "mask_shapes": np.array([], dtype=np.int32),
-            "bbox_data": np.array([], dtype=np.float32),
+            "mask_shapes": np.empty((0, 2), dtype=np.int32),
+            "bbox_data": np.empty((0, 4), dtype=np.float32),
             "pred_iou_data": np.array([], dtype=np.float32),
             "area_data": np.array([], dtype=np.float32)
         }
@@ -258,8 +298,8 @@ def pack_auto_masks(auto_masks: List[dict]) -> dict:
         return {
             "num_masks": 0,
             "mask_data": np.array([], dtype=np.uint8),
-            "mask_shapes": np.array([], dtype=np.int32),
-            "bbox_data": np.array([], dtype=np.float32),
+            "mask_shapes": np.empty((0, 2), dtype=np.int32),
+            "bbox_data": np.empty((0, 4), dtype=np.float32),
             "pred_iou_data": np.array([], dtype=np.float32),
             "area_data": np.array([], dtype=np.float32)
         }
@@ -312,8 +352,11 @@ def pack_batch_auto_masks(batch_masks: List[List[dict]]) -> dict:
         packed = pack_auto_masks(image_masks)
         all_num_masks.append(packed["num_masks"])
         all_mask_data.append(packed["mask_data"])
-        all_mask_shapes.append(packed["mask_shapes"])
-        all_bbox_data.append(packed["bbox_data"])
+        # Ensure 2D (N,2) for shapes, 2D (N,4) for bboxes
+        ms = packed["mask_shapes"].reshape(-1, 2)
+        bb = packed["bbox_data"].reshape(-1, 4)
+        all_mask_shapes.append(ms)
+        all_bbox_data.append(bb)
         all_pred_iou_data.append(packed["pred_iou_data"])
         all_area_data.append(packed["area_data"])
         image_offsets.append(image_offsets[-1] + len(packed["mask_data"]))
