@@ -72,7 +72,7 @@ def sample_feature_pointcloud(
     tensor_lists = {"points": [], "rgbs": [], "features": []}
     # Raw outputs (before shaders)
     raw_additional_outputs = {
-        "pred_normals": [], "centroid": [], "centroid_spread": [], "foreground_probs": []
+        "pred_normals": [], "centroid": [], "centroid_spread": [], "foreground_logits": []
     }
     pca_proj = pca_min = pca_max = None
     collected_points = 0
@@ -149,9 +149,10 @@ def sample_feature_pointcloud(
                     # Apply spread shaders (exactly as in model.py lines 493-494)
                     final_additional["centroid_spread_error_rgb"] = pipeline.model.spread_shader(raw_tensor[..., :1])
                     final_additional["centroid_spread_prob_rgb"] = pipeline.model.prob_shader(raw_tensor[..., 1:2])
-                elif key == "foreground_probs":
-                    # Apply foreground shader (exactly as in model.py line 497)
-                    final_additional["foreground_prob_rgb"] = pipeline.model.prob_from_probs_shader(raw_tensor[..., 1:2])
+                elif key == "foreground_logits":
+                    # Convert logits → probs for class-1, then apply shader (matches model full-image viz)
+                    probs = torch.softmax(raw_tensor / 1.0, dim=-1)[..., 1:2]  # 1.0 is softmax temp
+                    final_additional["foreground_prob_rgb"] = pipeline.model.prob_from_probs_shader(probs)
             progress.advance(process_task)
 
     return results["points"], results["rgbs"], results["features"], feature_pca, pca_proj, pca_min, pca_max, final_additional

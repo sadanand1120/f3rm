@@ -363,7 +363,8 @@ def visualize_additional(
     semantic_filter_mode: Optional[str] = None,
     semantic_threshold: float = 0.502,
     semantic_softmax_temp: float = 1.0,
-    semantic_negatives: Optional[List[str]] = None
+    semantic_negatives: Optional[List[str]] = None,
+    foreground_prob_thresh: Optional[float] = None
 ):
     """Visualize additional pointcloud with optional filtering."""
     pcd = data.get_additional_pointcloud(output_name)
@@ -381,6 +382,20 @@ def visualize_additional(
         semantic_filter_query, semantic_filter_mode, semantic_threshold,
         semantic_softmax_temp, semantic_negatives
     )
+
+    # Apply foreground probability threshold if requested
+    if foreground_prob_thresh is not None:
+        # Load foreground probabilities from the exported data
+        fg_probs = data.get_additional_pointcloud("foreground_prob_rgb")
+        if fg_probs is not None:
+            fg_colors = np.asarray(fg_probs.colors)
+            # Extract foreground probability from RGB (assuming grayscale encoding)
+            fg_prob_values = fg_colors[:, 0]  # Use red channel as grayscale probability
+            # Make points with low foreground probability black
+            low_fg_mask = fg_prob_values < foreground_prob_thresh
+            colors[low_fg_mask] = [0.0, 0.0, 0.0]  # Black
+        else:
+            console.print(f"[yellow]Warning: foreground_prob_rgb not found, skipping foreground threshold filtering")
 
     filtered_pcd = o3d.geometry.PointCloud()
     filtered_pcd.points = o3d.utility.Vector3dVector(points)
@@ -556,6 +571,10 @@ def main():
     parser.add_argument("--background-alpha", type=float, default=0.3,
                         help="Semantic mode: transparency of RGB background (0.0=invisible, 1.0=full RGB, default: 0.3)")
 
+    # Foreground probability threshold argument
+    parser.add_argument("--foreground-prob-thresh", type=float, default=None,
+                        help="Additional mode: threshold for foreground probability filtering (points below threshold become black)")
+
     args = parser.parse_args()
 
     # Load pointcloud data (reuse if already loaded)
@@ -613,7 +632,8 @@ def main():
             args.semantic_filter_mode,
             args.threshold,
             args.softmax_temp,
-            args.semantic_negatives
+            args.semantic_negatives,
+            args.foreground_prob_thresh
         )
     elif args.mode == "semantic":
         # Allow using --query or fallback to --semantic-filter-query for semantic mode

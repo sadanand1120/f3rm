@@ -19,12 +19,27 @@ class CLIPSAMSegmenter:
         self.debug = debug
         self.data_dir = Path(data_dir)
         self.config_path = Path(config_path)
+
+        # Load pipeline first to get config
+        _, self.pipeline, _, _ = eval_setup(config_path=self.config_path, test_mode="test")
+        sam2_feature_type = self.pipeline.datamanager.config.sam2_feature_type
+
         self.feat_root = self.data_dir / "features"
         clip_meta = torch.load(self.feat_root / "clip" / "meta.pt")
         self.feat_image_fnames = clip_meta["image_fnames"]
         self.clip_features = LazyFeatures(sorted(self.feat_root.glob("clip/chunk_*.npy")))
-        self.sam2_masks = SAM2LazyAutoMasks(sorted(self.feat_root.glob("sam2/chunk_*.npz")))
-        _, self.pipeline, _, _ = eval_setup(config_path=self.config_path, test_mode="test")
+
+        # Load SAM2 masks based on the feature type from config
+        sam2_feat_dir = self.feat_root / sam2_feature_type.lower()
+        # TODO: hijacked for now to maintain consistency with debug_instance.py
+        sam2_feat_dir = self.feat_root / "sam2"
+        # sam2_feat_dir = self.feat_root / "clipsam_book_table"
+        if sam2_feat_dir.exists():
+            self.sam2_masks = SAM2LazyAutoMasks(sorted(sam2_feat_dir.glob("chunk_*.npz")))
+            print(f"****Loaded SAM2 lazy auto-masks for {sam2_feature_type} supervision cache")
+        else:
+            raise FileNotFoundError(f"SAM2 feature directory not found: {sam2_feat_dir}")
+
         self.pipeline.eval()
         self.centroid_shader = CentroidShader(self.pipeline.model.field.spatial_distortion)
         self.train_image_fnames = [str(p) for p in self.pipeline.datamanager.train_dataset.image_filenames]
@@ -89,12 +104,17 @@ class CLIPSAMSegmenter:
         return segment_sim_map
 
     @torch.no_grad()
-    def get_pipeline_outputs(self, split: str, local_cam_idx: int, render_features: bool = False):
+    def get_pipeline_outputs(self, split: str, local_cam_idx: int, render_features: bool = False, render_centroid: bool = True, render_spread: bool = True, render_foreground: bool = True):
         cams = self.pipeline.datamanager.eval_ray_generator.cameras if split == 'eval' else self.pipeline.datamanager.train_ray_generator.cameras
         c_tensor = torch.tensor([local_cam_idx], device=cams.device)
         camera_opt_to_camera = self.pipeline.datamanager.eval_camera_optimizer(c_tensor) if split == 'eval' else self.pipeline.datamanager.train_camera_optimizer(c_tensor)
         camera_ray_bundle = cams.generate_rays(camera_indices=local_cam_idx, camera_opt_to_camera=camera_opt_to_camera)
-        outputs = self.pipeline.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle, render_features=render_features)
+        outputs = self.pipeline.model.get_outputs_for_camera_ray_bundle(
+            camera_ray_bundle,
+            render_features=render_features,
+            render_centroid=render_centroid,
+            render_foreground=render_foreground,
+        )
         pred_rgb = outputs["rgb"]
         depth_raw = outputs["depth"]
         depth_colored = colormaps.apply_depth_colormap(depth_raw, accumulation=outputs["accumulation"])
@@ -102,10 +122,27 @@ class CLIPSAMSegmenter:
         if render_features:
             result["feature_pca"] = outputs["feature_pca"]
             result["feature"] = outputs["feature"]
-            if self.pipeline.model.config.centroid_enable:
-                result["centroid_pred"] = outputs["centroid_pred"]
-                result["centroid_offset"] = outputs["centroid_offset"]
-                result["centroid_pred_rgb"] = outputs["centroid_pred_rgb"]
+        # Centroid predictions are provided independently of feature rendering
+        if render_centroid and self.pipeline.model.config.centroid_enable:
+            result["centroid_pred"] = outputs["centroid_pred"]
+            result["centroid_pred_rgb"] = outputs["centroid_pred_rgb"]
+            # Centroid spread predictions - now separate error and probability channels
+            if render_spread:
+                if "centroid_spread" in outputs:
+                    result["centroid_spread"] = outputs["centroid_spread"]
+                if "centroid_spread_error_rgb" in outputs:
+                    result["centroid_spread_error_rgb"] = outputs["centroid_spread_error_rgb"]
+                if "centroid_spread_prob_rgb" in outputs:
+                    result["centroid_spread_prob_rgb"] = outputs["centroid_spread_prob_rgb"]
+        # Foreground visualization
+        if render_foreground and ("foreground_prob_rgb" in outputs):
+            result["foreground_prob_rgb"] = outputs["foreground_prob_rgb"]
+        # Model now returns aggregated logits; expose probs explicitly for raw viz
+        if render_foreground and ("foreground_logits" in outputs):
+            fg_logits = outputs["foreground_logits"]
+            fg_probs = torch.softmax(fg_logits, dim=-1)
+            result["foreground_logits"] = fg_logits
+            result["foreground_probs"] = fg_probs
         original_c2w_34 = cams.camera_to_worlds[local_cam_idx].cpu().numpy()
         original_c2w = np.vstack([original_c2w_34, np.array([[0, 0, 0, 1]])])
         camera_opt_to_camera_4x4 = np.vstack([camera_opt_to_camera[0].cpu().numpy(), np.array([[0, 0, 0, 1]])])
@@ -135,18 +172,21 @@ class CLIPSAMSegmenter:
 
 
 if __name__ == "__main__":
-    IMAGE_PATH = "datasets/f3rm/custom/betabook/small/images/frame_00001.png"
-    CONFIG_PATH = "cent_outputs/betabook_small_pipe_cent_cold15k_nodensemb/f3rm/2025-08-17_211558/config.yml"
+    IMAGE_PATH = "datasets/f3rm/custom/betamulti1/small/images/frame_00001.png"
+    CONFIG_PATH = "cent7_outputs/betam1_small_cstext_lang32_loss8e3_trunk0F_fg64x2/f3rm/2025-08-27_152754/config.yml"
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     DEBUG = False
 
-    TEXT_PROMPT = "book"
-    NEGATIVE_TEXT = "object"
+    TEXT_PROMPT = "notebook"
+    NEGATIVE_TEXTS = ["object", "floor", "wall"]
     SOFTMAX_TEMP = 0.01
     MIN_INSTANCE_PERCENT = 1.0
-    TOP_MEAN_PERCENT = 5
+    TOP_MEAN_PERCENT = 15
 
     RENDER_FEATURES = True
+    RENDER_CENTROID = True
+    RENDER_SPREAD = True
+    RENDER_FOREGROUND = True
 
     print(f"IMAGE_PATH: {IMAGE_PATH}, CONFIG_PATH: {CONFIG_PATH}")
     segmenter = CLIPSAMSegmenter(data_dir=Path(IMAGE_PATH).parent.parent, config_path=CONFIG_PATH, debug=DEBUG)
@@ -154,20 +194,38 @@ if __name__ == "__main__":
     feat_image_index, image_path, split, local_cam_idx = segmenter.get_cam_info(image_path=IMAGE_PATH)
     clip_patch_feats = segmenter.clip_features[feat_image_index].to(DEVICE)
     text_emb = clip_model.encode_text(TEXT_PROMPT)
-    neg_text_embs = torch.stack([clip_model.encode_text(NEGATIVE_TEXT)], dim=0)
+    neg_text_embs = torch.stack([clip_model.encode_text(neg_text) for neg_text in NEGATIVE_TEXTS], dim=0)
     sim_map = clip_model.compute_similarity(clip_patch_feats, text_emb, neg_text_embs=neg_text_embs, softmax_temp=SOFTMAX_TEMP, normalize=True)
     auto_masks = segmenter.sam2_masks[feat_image_index]
-    inst_mask, _ = SAM2utils.auto_masks_to_instance_mask(auto_masks, min_iou=float(SAM2Args.pred_iou_thresh), min_area=float(SAM2Args.min_mask_region_area), assign_by="area", start_from="low")
+    inst_mask_result = SAM2utils.auto_masks_to_instance_mask(auto_masks, min_iou=float(SAM2Args.pred_iou_thresh), min_area=float(SAM2Args.min_mask_region_area), assign_by="area", start_from="low")
+    if inst_mask_result[0] is None:
+        # No valid masks found, create empty instance mask
+        if auto_masks:
+            h, w = auto_masks[0]['segmentation'].shape
+        else:
+            # Use actual image dimensions as fallback
+            img = Image.open(image_path)
+            h, w = img.height, img.width
+        inst_mask = np.zeros((h, w), dtype=np.uint16)
+    else:
+        inst_mask = inst_mask_result[0]
     inst_mask = segmenter.filter_sam2_inst_mask(inst_mask, MIN_INSTANCE_PERCENT)
     sam2_viz_mask, cmap, norm = SAM2utils.make_viz_mask_and_cmap(inst_mask)
     sim_map_upscaled = np.array(Image.fromarray(sim_map.cpu().numpy()).resize((inst_mask.shape[1], inst_mask.shape[0]), Image.BILINEAR))
     segment_sim_map = segmenter.compute_segment_similarity(sim_map_upscaled, inst_mask, TOP_MEAN_PERCENT)
-    pipeline_outputs, camera_ray_bundle, optimized_c2w = segmenter.get_pipeline_outputs(split, local_cam_idx, render_features=RENDER_FEATURES)
+    pipeline_outputs, camera_ray_bundle, optimized_c2w = segmenter.get_pipeline_outputs(
+        split,
+        local_cam_idx,
+        render_features=RENDER_FEATURES,
+        render_centroid=RENDER_CENTROID,
+        render_spread=RENDER_SPREAD,
+        render_foreground=RENDER_FOREGROUND,
+    )
     gt_clip_pca, proj_V, low_rank_min, low_rank_max = apply_pca_colormap(clip_patch_feats, return_proj=True, niter=5, q_min=0.01, q_max=0.99)
     if RENDER_FEATURES:
         pred_clip_pca = apply_pca_colormap(pipeline_outputs["feature"].to(DEVICE), proj_V=proj_V, low_rank_min=low_rank_min, low_rank_max=low_rank_max)
 
-    fig, axes = plt.subplots(3, 4, figsize=(20, 12))
+    fig, axes = plt.subplots(4, 4, figsize=(20, 16))
     axes[0, 0].imshow(Image.open(image_path).convert("RGB"))
     axes[0, 0].set_title("GT RGB")
     axes[0, 0].axis('off')
@@ -178,7 +236,7 @@ if __name__ == "__main__":
     axes[0, 2].set_title("GT CLIP PCA Visualization")
     axes[0, 2].axis('off')
     axes[0, 3].imshow(sim_map_upscaled, cmap="gray")
-    axes[0, 3].set_title(f"GT CLIP Similarity: {TEXT_PROMPT} vs {NEGATIVE_TEXT}")
+    axes[0, 3].set_title(f"GT CLIP Similarity: {TEXT_PROMPT} vs {', '.join(NEGATIVE_TEXTS)}")
     axes[0, 3].axis('off')
 
     axes[1, 0].imshow(pipeline_outputs["pred_rgb"].cpu().numpy())
@@ -194,35 +252,85 @@ if __name__ == "__main__":
     axes[1, 3].set_title("GT Segment-Refined CLIP Sim")
     axes[1, 3].axis('off')
 
-    if RENDER_FEATURES:
+    # Feature viz (independent)
+    if RENDER_FEATURES and ("feature_pca" in pipeline_outputs):
         axes[2, 0].imshow(pipeline_outputs["feature_pca"].numpy())
         axes[2, 0].set_title("Pred CLIP PCA (Pipeline)")
         axes[2, 0].axis('off')
-        if segmenter.pipeline.model.config.centroid_enable:
-            cent_rgb = pipeline_outputs["centroid_pred_rgb"].cpu().numpy()
-            axes[2, 1].imshow(cent_rgb)
-            axes[2, 1].set_title("Pred Centroid RGB")
-            axes[2, 1].axis('off')
-            offset = pipeline_outputs["centroid_offset"].cpu()
-            offset_norm = torch.linalg.norm(offset, dim=-1).numpy()
-            axes[2, 2].imshow(offset_norm, cmap='magma')
-            axes[2, 2].set_title("Centroid Offset |.|")
-            axes[2, 2].axis('off')
-            cent_rgb2 = segmenter.centroid_shader(pipeline_outputs["centroid_pred"]).cpu().numpy()
-            axes[2, 3].imshow(cent_rgb2)
-            axes[2, 3].set_title("Centroid Pred (Shader)")
-            axes[2, 3].axis('off')
-        else:
-            axes[2, 1].axis('off')
-            axes[2, 2].axis('off')
-            axes[2, 3].axis('off')
     else:
         axes[2, 0].axis('off')
+
+    # Centroid viz (independent)
+    if RENDER_CENTROID and ("centroid_pred_rgb" in pipeline_outputs) and ("centroid_pred" in pipeline_outputs):
+        cent_rgb = pipeline_outputs["centroid_pred_rgb"].cpu().numpy()
+        axes[2, 1].imshow(cent_rgb)
+        axes[2, 1].set_title("Pred Centroid RGB")
+        axes[2, 1].axis('off')
+
+        # Centroid spread error visualization (raw values)
+        if "centroid_spread" in pipeline_outputs:
+            spread_raw = pipeline_outputs["centroid_spread"].cpu().numpy()
+            # Use only the first channel (error)
+            spread_error = spread_raw[..., 0]  # HxWx1 -> HxW
+            # Use a colormap that handles negative values well
+            axes[2, 2].imshow(spread_error, cmap='RdYlBu_r')
+            axes[2, 2].set_title("Pred Centroid Spread Error (Raw)")
+            axes[2, 2].axis('off')
+        else:
+            axes[2, 2].axis('off')
+
+        # Centroid spread probability visualization (raw logits)
+        if "centroid_spread" in pipeline_outputs:
+            spread_raw = pipeline_outputs["centroid_spread"].cpu().numpy()
+            # Use only the second channel (probability)
+            spread_prob = spread_raw[..., 1]  # HxWx1 -> HxW
+            # Use grayscale for probability values
+            axes[2, 3].imshow(spread_prob, cmap='gray')
+            axes[2, 3].set_title("Pred Centroid Spread Logit (Raw)")
+            axes[2, 3].axis('off')
+        else:
+            axes[2, 3].axis('off')
+    else:
         axes[2, 1].axis('off')
         axes[2, 2].axis('off')
         axes[2, 3].axis('off')
 
-    plt.tight_layout()
+    # 4th row: Centroid spread shader outputs
+    if RENDER_CENTROID and ("centroid_spread_error_rgb" in pipeline_outputs):
+        spread_error_rgb = pipeline_outputs["centroid_spread_error_rgb"].cpu().numpy()
+        axes[3, 0].imshow(spread_error_rgb)
+        axes[3, 0].set_title("Centroid Spread Error (Shader)")
+        axes[3, 0].axis('off')
+    else:
+        axes[3, 0].axis('off')
+
+    if RENDER_CENTROID and ("centroid_spread_prob_rgb" in pipeline_outputs):
+        spread_prob_rgb = pipeline_outputs["centroid_spread_prob_rgb"].cpu().numpy()
+        axes[3, 1].imshow(spread_prob_rgb)
+        axes[3, 1].set_title("Centroid Spread Prob (Shader)")
+        axes[3, 1].axis('off')
+    else:
+        axes[3, 1].axis('off')
+
+    # Foreground prob (shader) if present
+    if RENDER_FOREGROUND and ("foreground_prob_rgb" in pipeline_outputs):
+        fg_prob_rgb = pipeline_outputs["foreground_prob_rgb"].cpu().numpy()
+        axes[3, 2].imshow(fg_prob_rgb)
+        axes[3, 2].set_title("Foreground Prob (Shader)")
+        axes[3, 2].axis('off')
+    else:
+        axes[3, 2].axis('off')
+    # Foreground raw prob (channel 1) if present
+    if RENDER_FOREGROUND and ("foreground_probs" in pipeline_outputs):
+        fg_probs = pipeline_outputs["foreground_probs"].cpu().numpy()
+        fg_prob_ch1 = fg_probs[..., 1]
+        axes[3, 3].imshow(fg_prob_ch1, cmap='gray')
+        axes[3, 3].set_title("Foreground Prob ch1 (Raw)")
+        axes[3, 3].axis('off')
+    else:
+        axes[3, 3].axis('off')
+
+    plt.subplots_adjust(wspace=0.1, hspace=0.3)
     plt.show()
     print(f"Depth range: [{pipeline_outputs['depth_raw'].cpu().numpy().min():.3f}, {pipeline_outputs['depth_raw'].cpu().numpy().max():.3f}]")
 
