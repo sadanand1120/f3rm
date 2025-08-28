@@ -6,6 +6,7 @@ from typing import Dict, List, Optional, Type
 import open_clip
 import torch
 import torch.nn.functional as F
+import numpy as np
 from nerfstudio.cameras.rays import RayBundle, RaySamples
 from nerfstudio.field_components.field_heads import FieldHeadNames
 from nerfstudio.model_components.losses import (
@@ -251,8 +252,14 @@ class FeatureFieldModel(NerfactoModel):
 
         # Feature/Centroid/Spread/Foreground outputs (optionally conditioned on density embedding from NeRF)
         # If foreground trunk tap is enabled, we need to compute centroid spread even if not explicitly requested
-        need_spread_for_fg = render_foreground and self.config.centroid_spread_trunk_fg > 0
-        if render_features or (render_centroid and self.config.centroid_enable and (not self.training or getattr(self, "_train_centroid_cache_enabled", False))) or (render_spread and self.config.centroid_enable and (not self.training or getattr(self, "_train_centroid_cache_enabled", False))) or render_foreground or need_spread_for_fg:
+        need_spread_for_fg = (render_foreground and self.config.foreground_enable and self.config.centroid_spread_trunk_fg > 0)
+        if (
+            render_features
+            or (render_centroid and self.config.centroid_enable)
+            or (render_spread and self.config.centroid_enable)
+            or (render_foreground and self.config.foreground_enable)
+            or need_spread_for_fg
+        ):
             cut_cam_refine: bool = not getattr(self.config, "enable_campose_refine_feature_field", True)
             need_density = (
                 (render_features and self.config.feat_condition_on_density)
@@ -281,16 +288,17 @@ class FeatureFieldModel(NerfactoModel):
             if render_features:
                 feat_vals = self.feature_field.get_feature(ray_samples, density_embedding=density_embedding)
                 features = self.renderer_feature(features=feat_vals, weights=custom_weights)
-            if render_centroid and self.config.centroid_enable and (not self.training or getattr(self, "_train_centroid_cache_enabled", False)):
+            if render_centroid and self.config.centroid_enable:
                 cent_vals = self.feature_field.get_centroid(ray_samples, density_embedding=density_embedding)
                 centroid_pred = self.renderer_centroid(values=cent_vals, weights=custom_weights)
-            if (render_spread or need_spread_for_fg) and self.config.centroid_enable and (not self.training or getattr(self, "_train_centroid_cache_enabled", False)):
-                # Two-channel spread head: [error, foreground_logit]
+            if (render_spread or need_spread_for_fg) and self.config.centroid_enable:
+                # Four-channel spread head: [error, foreground_logit, soft0_logit, soft1_logit]
                 spread_vals = self.feature_field.get_centroid_spread(ray_samples, density_embedding=density_embedding)
                 centroid_spread_2ch = self.renderer_spread(values=spread_vals, weights=custom_weights)
-            if render_foreground:
+            if render_foreground and self.config.foreground_enable:
                 fg_vals = self.feature_field.get_foreground(ray_samples, density_embedding=density_embedding)
-                foreground_probs = self.renderer_classprob(values=fg_vals, weights=custom_weights)
+                # Port rendering logic: aggregate logits along ray, then softmax for viz/loss
+                foreground_logits = self.renderer_spread(values=fg_vals, weights=custom_weights)
 
         outputs = {
             "rgb": rgb,
@@ -300,12 +308,12 @@ class FeatureFieldModel(NerfactoModel):
         }
         if render_features:
             outputs["feature"] = features
-        if render_centroid and self.config.centroid_enable and (not self.training or getattr(self, "_train_centroid_cache_enabled", False)):
+        if render_centroid and self.config.centroid_enable:
             outputs["centroid"] = centroid_pred
-        if (render_spread or need_spread_for_fg) and self.config.centroid_enable and (not self.training or getattr(self, "_train_centroid_cache_enabled", False)):
+        if (render_spread or need_spread_for_fg) and self.config.centroid_enable:
             outputs["centroid_spread"] = centroid_spread_2ch
-        if render_foreground:
-            outputs["foreground_probs"] = foreground_probs
+        if render_foreground and self.config.foreground_enable:
+            outputs["foreground_logits"] = foreground_logits
 
         if self.config.predict_normals:
             normals = self.renderer_normals(normals=field_outputs[FieldHeadNames.NORMALS], weights=weights)
@@ -345,11 +353,10 @@ class FeatureFieldModel(NerfactoModel):
         target_feats = batch["feature"].to(self.device)
         metrics_dict["feature_error"] = F.mse_loss(outputs["feature"], target_feats)
         # Foreground metrics if available
-        if self.config.foreground_enable and ("foreground_probs" in outputs) and ("foreground" in batch):
-            fg_probs = outputs["foreground_probs"]
+        if self.config.foreground_enable and ("foreground_logits" in outputs) and ("foreground" in batch):
+            probs = torch.softmax(outputs["foreground_logits"], dim=-1)
             fg_target = batch["foreground"].to(self.device)
-            # Accuracy over argmax
-            pred = fg_probs.argmax(dim=-1)
+            pred = probs.argmax(dim=-1)
             targ = fg_target.argmax(dim=-1)
             metrics_dict["foreground_acc"] = (pred == targ).float().mean()
         return metrics_dict
@@ -359,21 +366,12 @@ class FeatureFieldModel(NerfactoModel):
         target_feats = batch["feature"].to(self.device)
         loss_dict["feature_loss"] = self.config.feat_loss_weight * F.mse_loss(outputs["feature"], target_feats)
         # Foreground classification loss (independent, supervised every step when available)
-        if self.config.foreground_enable and ("foreground_probs" in outputs) and ("foreground" in batch):
-            fg_probs = outputs["foreground_probs"]
+        if self.config.foreground_enable and ("foreground_logits" in outputs):
+            fg_logits = outputs["foreground_logits"].view(-1, 2)
             fg_target = batch["foreground"].to(self.device)
-            # Convert one-hot to class indices
-            if fg_target.ndim == fg_probs.ndim:
-                fg_target_idx = fg_target.argmax(dim=-1)
-            else:
-                fg_target_idx = fg_target.long()
-            eps = 1e-6
-            probs_flat = fg_probs.view(-1, 2)
-            probs_clamped = torch.clamp(probs_flat, eps, 1.0)
-            idx_flat = fg_target_idx.view(-1)
-            picked = probs_clamped[torch.arange(probs_clamped.shape[0], device=probs_clamped.device), idx_flat]
-            loss_ce = (-torch.log(picked)).mean()
-            loss_dict["foreground_loss"] = self.config.foreground_loss_weight * loss_ce
+            fg_target_idx = fg_target.argmax(dim=-1).view(-1)
+            ce = F.cross_entropy(fg_logits, fg_target_idx)
+            loss_dict["foreground_loss"] = self.config.foreground_loss_weight * ce
         # Centroid loss (supervision via cache).
         if self.training and self.config.centroid_enable and getattr(self, "_train_centroid_cache_enabled", False):
             full_cache = self._get_train_centroid_cache()  # type: ignore[attr-defined]
@@ -431,7 +429,6 @@ class FeatureFieldModel(NerfactoModel):
                     assert int(ci) in spread_cache, f"Centroid spread cache missing camera {int(ci)}"
                 num_rays = cam_idx.shape[0]
                 target_spread = torch.zeros((num_rays, 2), device=self.device, dtype=pred_spread.dtype)
-                supervise_mask = torch.zeros((num_rays,), dtype=torch.bool, device=self.device)
                 with torch.no_grad():
                     for ci in unique_cams:
                         ci_int = int(ci)
@@ -443,18 +440,19 @@ class FeatureFieldModel(NerfactoModel):
                         x_sel = xi[idxs].cpu().long()
                         s_img_cpu, s_valid_cpu = spread_cache[ci_int]
                         s_pick = s_img_cpu[y_sel, x_sel]
-                        sv_pick = s_valid_cpu[y_sel, x_sel].squeeze(-1)
                         target_spread[idxs] = s_pick.to(self.device, non_blocking=True)
-                        supervise_mask[idxs] = sv_pick.to(self.device, non_blocking=True)
-
-                if supervise_mask.any():
-                    # Loss = MSE on error channel + BCE on foreground prob channel
-                    err_loss = F.mse_loss(pred_spread[supervise_mask, 0:1], target_spread[supervise_mask, 0:1])
-                    prob_loss = F.binary_cross_entropy_with_logits(
-                        pred_spread[supervise_mask, 1:2], target_spread[supervise_mask, 1:2]
-                    )
-                    loss_dict["centroid_spread_error_loss"] = self.config.centroid_loss_weight * err_loss
-                    loss_dict["centroid_spread_prob_loss"] = self.config.centroid_loss_weight * prob_loss
+                # Loss = MSE on error channel + BCE on foreground prob channel (all picks)
+                err_loss = F.mse_loss(pred_spread[:, 0:1], target_spread[:, 0:1])
+                prob_loss = F.binary_cross_entropy_with_logits(
+                    pred_spread[:, 1:2], target_spread[:, 1:2]
+                )
+                loss_dict["centroid_spread_error_loss"] = self.config.centroid_loss_weight * err_loss
+                loss_dict["centroid_spread_prob_loss"] = self.config.centroid_loss_weight * prob_loss
+                # Cross-entropy on softmax logits using same GT (convert prob → class index)
+                soft_logits = pred_spread[:, 2:4]
+                targ_idx = (target_spread[:, 1] > 0.5).long()
+                soft_ce = F.cross_entropy(soft_logits, targ_idx)
+                loss_dict["centroid_spread_prob_soft_loss"] = self.config.centroid_loss_weight * soft_ce
         # Cold-start spread supervision: supervise constant -1 everywhere (background sentinel)
         elif self.training and self.config.centroid_enable and ("centroid_spread" in outputs):
             # Cold start: do not supervise spread (consistent with centroid)
@@ -508,14 +506,30 @@ class FeatureFieldModel(NerfactoModel):
             outputs["centroid_pred"] = outputs["centroid"]
             outputs["centroid_pred_rgb"] = self.centroid_shader(outputs["centroid"])
         if render_centroid and self.config.centroid_enable and "centroid_spread" in outputs:
-            # Channel 0: error map (scalar shader); Channel 1: foreground probability (prob shader)
+            # Channels: [err, fg_logit, soft0_logit, soft1_logit]
             outputs["centroid_spread_error_rgb"] = self.spread_shader(outputs["centroid_spread"][..., :1])
             outputs["centroid_spread_prob_rgb"] = self.prob_shader(outputs["centroid_spread"][..., 1:2])
+            # Softmax probability for class-1 using soft logits
+            soft_logits = outputs["centroid_spread"][..., 2:4]
+            soft_probs = torch.softmax(soft_logits, dim=-1)[..., 1:2]
+            outputs["centroid_spread_prob_soft_rgb"] = self.prob_from_probs_shader(soft_probs)
+            # Also expose GTs for side-by-side when provided by pipeline cache images
+            if "centroid_spread_gt_full" in outputs:
+                gt_prob = outputs["centroid_spread_gt_full"][..., 1:2]
+                outputs["centroid_spread_prob_gt_rgb"] = self.prob_shader(gt_prob)
+            if "centroid_spread_prob_soft_gt_full" in outputs:
+                gt_soft = outputs["centroid_spread_prob_soft_gt_full"][..., 1:2]
+                outputs["centroid_spread_prob_soft_gt_rgb"] = self.prob_from_probs_shader(gt_soft)
 
-        # Foreground visualization (softmax probability for class-1)
-        if self.config.foreground_enable and ("foreground_probs" in outputs):
-            probs = outputs["foreground_probs"][..., 1:2]
+        # Foreground visualization: apply softmax on aggregated logits for class-1
+        if self.config.foreground_enable and ("foreground_logits" in outputs):
+            probs = torch.softmax(outputs["foreground_logits"], dim=-1)[..., 1:2]
             outputs["foreground_prob_rgb"] = self.prob_from_probs_shader(probs)
+        # Visualize softmax-base centroid-spread probability if present
+        if self.config.centroid_enable and ("centroid_spread" in outputs):
+            soft_logits = outputs["centroid_spread"][..., 2:4]
+            soft_probs = torch.softmax(soft_logits, dim=-1)[..., 1:2]
+            outputs["centroid_spread_prob_soft"] = soft_probs
 
         # Nothing else to do if not CLIP features or no positives
         if not render_features or "feature" not in outputs or self.kwargs["metadata"]["feature_type"] != "CLIP" or not viewer_utils.has_positives:
@@ -561,6 +575,38 @@ class FeatureFieldModel(NerfactoModel):
             images_dict["centroid_spread_error_rgb"] = outputs["centroid_spread_error_rgb"]
         if "centroid_spread_prob_rgb" in outputs:
             images_dict["centroid_spread_prob_rgb"] = outputs["centroid_spread_prob_rgb"]
+        if "centroid_spread_prob_soft_rgb" in outputs:
+            images_dict["centroid_spread_prob_soft_rgb"] = outputs["centroid_spread_prob_soft_rgb"]
+        if "centroid_spread_prob_gt_rgb" in outputs:
+            images_dict["centroid_spread_prob_gt_rgb"] = outputs["centroid_spread_prob_gt_rgb"]
+        if ("centroid_spread_prob_rgb" in images_dict) and ("centroid_spread_prob_gt_rgb" in images_dict):
+            images_dict["centroid_spread_prob_vs_gt"] = torch.cat([images_dict["centroid_spread_prob_rgb"], images_dict["centroid_spread_prob_gt_rgb"]], dim=1)
+        if ("centroid_spread_prob_soft_rgb" in images_dict) and ("centroid_spread_prob_gt_rgb" in images_dict):
+            images_dict["centroid_spread_prob_soft_vs_gt"] = torch.cat([images_dict["centroid_spread_prob_soft_rgb"], images_dict["centroid_spread_prob_gt_rgb"]], dim=1)
         if "foreground_prob_rgb" in outputs:
             images_dict["foreground_prob_rgb"] = outputs["foreground_prob_rgb"]
+
+        # Foreground GT and side-by-side viz
+        if self.config.foreground_enable and ("foreground" in batch) and ("foreground_prob_rgb" in outputs):
+            fg_gt = batch["foreground"].to(self.device)
+            if fg_gt.ndim == 4 and fg_gt.shape[0] == 1:
+                fg_gt = fg_gt.squeeze(0)
+            if fg_gt.ndim == 3 and fg_gt.shape[0] == 2:
+                fg_gt = fg_gt.permute(1, 2, 0)
+            fg_gt_prob = fg_gt[..., 1:2]
+
+            fg_gt_rgb = self.prob_from_probs_shader(fg_gt_prob)
+
+            images_dict["foreground_prob_gt"] = fg_gt_rgb
+            images_dict["foreground_prob_vs_gt"] = torch.cat([outputs["foreground_prob_rgb"], fg_gt_rgb], dim=1)
+
+        # Centroid spread: side-by-side preds vs GTs
+        if ("centroid_spread_prob_rgb" in images_dict) and ("centroid_spread_prob_gt_rgb" in outputs):
+            images_dict["centroid_spread_prob_gt_rgb"] = outputs["centroid_spread_prob_gt_rgb"]
+            images_dict["centroid_spread_prob_vs_gt"] = torch.cat([images_dict["centroid_spread_prob_rgb"], images_dict["centroid_spread_prob_gt_rgb"]], dim=1)
+
+        if ("centroid_spread_prob_soft_rgb" in images_dict) and ("centroid_spread_prob_soft_gt_rgb" in outputs):
+            images_dict["centroid_spread_prob_soft_gt_rgb"] = outputs["centroid_spread_prob_soft_gt_rgb"]
+            images_dict["centroid_spread_prob_soft_vs_gt"] = torch.cat([images_dict["centroid_spread_prob_soft_rgb"], images_dict["centroid_spread_prob_soft_gt_rgb"]], dim=1)
+
         return metrics_dict, images_dict

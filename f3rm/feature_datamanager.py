@@ -97,9 +97,16 @@ class FeatureDataManager(VanillaDataManager):
         assert len(im_h) == 1, "All images must have the same height"
         assert len(im_w) == 1, "All images must have the same width"
         im_h, im_w = im_h.pop(), im_w.pop()
-        self.scale_h = feat_h / im_h
-        self.scale_w = feat_w / im_w
-        CONSOLE.print(f"Feat h: {feat_h}, Feat w: {feat_w}, Feat c: {feat_dim}, Im h: {im_h}, Im w: {im_w}, Scale h: {self.scale_h}, Scale w: {self.scale_w}")
+        # Feature scaling (for CLIP/DINO features)
+        self.feat_scale_h = feat_h / im_h
+        self.feat_scale_w = feat_w / im_w
+        # Foreground scaling (infer from actual FG map dimensions)
+        fg_h, fg_w = (self.fg_maps.H, self.fg_maps.W) if isinstance(self.fg_maps, LazyFeatures) else self.fg_maps.shape[1:3]
+        self.fg_scale_h = fg_h / im_h
+        self.fg_scale_w = fg_w / im_w
+        CONSOLE.print(f"Feat h: {feat_h}, Feat w: {feat_w}, Feat c: {feat_dim}, Im h: {im_h}, Im w: {im_w}")
+        CONSOLE.print(f"Feat scale h: {self.feat_scale_h}, Feat scale w: {self.feat_scale_w}")
+        CONSOLE.print(f"FG scale h: {self.fg_scale_h}, FG scale w: {self.fg_scale_w}")
         # assert np.isclose(
         #    self.scale_h, self.scale_w, atol=1.5e-3
         # ), f"Scales must be similar, got h={self.scale_h} and w={self.scale_w}"
@@ -143,10 +150,12 @@ class FeatureDataManager(VanillaDataManager):
     def next_train(self, step: int) -> Tuple[RayBundle, Dict]:
         ray_bundle, batch = super().next_train(step)
         batch["image"] = _async_to_cuda(batch["image"], self.device)
-        camera_idx, y_idx, x_idx = self._index_triplet(batch, self.scale_h, self.scale_w)
-        batch["feature"] = self._gather_feats(self.features, camera_idx, y_idx, x_idx)
-        # Foreground one-hot target (2-dim): use global camera_idx for eval offset? For train, indices are train split only
-        batch["foreground"] = self._gather_feats(self.fg_maps, camera_idx, y_idx, x_idx)
+        # Features sampled on feature grid (scaled)
+        camera_idx, y_feat, x_feat = self._index_triplet(batch, self.feat_scale_h, self.feat_scale_w)
+        batch["feature"] = self._gather_feats(self.features, camera_idx, y_feat, x_feat)
+        # Foreground maps at image resolution (no scaling)
+        cam_fg, y_fg, x_fg = self._index_triplet(batch, self.fg_scale_h, self.fg_scale_w)
+        batch["foreground"] = self._gather_feats(self.fg_maps, cam_fg, y_fg, x_fg)
         if step % 100 == 0:
             torch.cuda.empty_cache()
         return ray_bundle, batch
@@ -154,8 +163,12 @@ class FeatureDataManager(VanillaDataManager):
     def next_eval(self, step: int) -> Tuple[RayBundle, Dict]:
         ray_bundle, batch = super().next_eval(step)
         batch["image"] = _async_to_cuda(batch["image"], self.device)
-        camera_idx, y_idx, x_idx = self._index_triplet(batch, self.scale_h, self.scale_w)
+        # Features on feature grid (scaled) with eval offset
+        camera_idx, y_feat, x_feat = self._index_triplet(batch, self.feat_scale_h, self.feat_scale_w)
         camera_idx_global = camera_idx + self.eval_offset
-        batch["feature"] = self._gather_feats(self.features, camera_idx_global, y_idx, x_idx)
-        batch["foreground"] = self._gather_feats(self.fg_maps, camera_idx_global, y_idx, x_idx)
+        batch["feature"] = self._gather_feats(self.features, camera_idx_global, y_feat, x_feat)
+        # Foreground maps at image resolution (no scaling) with eval offset
+        cam_fg, y_fg, x_fg = self._index_triplet(batch, self.fg_scale_h, self.fg_scale_w)
+        cam_fg_global = cam_fg + self.eval_offset
+        batch["foreground"] = self._gather_feats(self.fg_maps, cam_fg_global, y_fg, x_fg)
         return ray_bundle, batch

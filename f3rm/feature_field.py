@@ -120,11 +120,11 @@ class FeatureField(Field):
             },
         )
 
-        # Centroid spread head (scalar) - outputs both spread predictions and trunk features for foreground
+        # Centroid spread head (scalar) - outputs spread preds (2), softmax logits (2), and optional trunk features
         mlp_in_dims_spread = self.encoding.n_output_dims + (density_embedding_dim if self.cond_on_density_centroid else 0)
         self.mlp_centroid_spread = tcnn.Network(
             n_input_dims=mlp_in_dims_spread,
-            n_output_dims=2 + (self.centroid_spread_trunk_fg if self.centroid_spread_trunk_fg > 0 else 0),
+            n_output_dims=4 + (self.centroid_spread_trunk_fg if self.centroid_spread_trunk_fg > 0 else 0),
             network_config={
                 "otype": "FullyFusedMLP",
                 "activation": "ReLU",
@@ -192,8 +192,8 @@ class FeatureField(Field):
                 cond = cond.detach()
             encoded_spread = torch.cat([encoded_spread, cond], dim=-1)
         spread_full = self.mlp_centroid_spread(encoded_spread).view(*ray_samples.frustums.directions.shape[:-1], -1)
-        # Return full output if requested, otherwise only first 2 channels for backward compatibility
-        return spread_full if return_full else spread_full[..., :2]
+        # Return full output (4 + trunk) only when requested (foreground trunk); default returns first 4 channels
+        return spread_full if return_full else spread_full[..., :4]
 
     def get_foreground(self, ray_samples: RaySamples, density_embedding: Optional[Tensor] = None) -> Tensor:
         encoded_base = self._encode_positions(ray_samples)
@@ -207,7 +207,8 @@ class FeatureField(Field):
         if self.centroid_spread_trunk_fg > 0:
             # Get the full centroid spread output and extract trunk features
             spread_full = self.get_centroid_spread(ray_samples, density_embedding=density_embedding, return_full=True)
-            trunk_feat = spread_full[..., 2:2 + self.centroid_spread_trunk_fg]
+            # Trunk starts after 4 channels: [err, fg_logit, soft0_logit, soft1_logit]
+            trunk_feat = spread_full[..., 4:4 + self.centroid_spread_trunk_fg]
             # Flatten trunk features to match encoded_base shape for concatenation
             trunk_feat = trunk_feat.view(-1, self.centroid_spread_trunk_fg)
             if not self.foreground_trunk_grad_to_spread:

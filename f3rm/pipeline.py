@@ -156,6 +156,7 @@ class FeaturePipeline(VanillaPipeline):
                         self._train_centroid_spread_cache[ci] = s_img.cpu()
                         self._train_centroid_spread_valid[ci] = s_valid.cpu()
                         images["centroid_spread_gt_full"] = s_img
+                        images["centroid_spread_prob_soft_gt_full"] = torch.cat([1.0 - s_img[..., 1:2], s_img[..., 1:2]], dim=-1)
                         if rep_centroid_rgb is None:
                             rep_centroid_rgb = c_rgb
                         if rep_spread_err_rgb is None:
@@ -176,6 +177,7 @@ class FeaturePipeline(VanillaPipeline):
                     self._train_centroid_spread_cache[ci] = s_img.cpu()
                     self._train_centroid_spread_valid[ci] = s_valid.cpu()
                     images["centroid_spread_gt_full"] = s_img
+                    images["centroid_spread_prob_soft_gt_full"] = torch.cat([1.0 - s_img[..., 1:2], s_img[..., 1:2]], dim=-1)
                     if rep_depth is None:
                         rep_depth = images["depth"]
 
@@ -392,6 +394,20 @@ class FeaturePipeline(VanillaPipeline):
         full_batch = self.datamanager.train_dataset.get_data(ci)
         # Reuse model's image/metrics helper for identical formatting (GT|Pred concat)
         _, images_dict = self.model.get_image_metrics_and_images(outputs, full_batch)
+        # Add foreground pred vs GT side-by-side using full-image GT from datamanager
+        if self.model.config.foreground_enable and ("foreground_prob_rgb" in outputs):
+            ci_global = ci  # train split uses train indices directly
+            # Use original FOREGROUND_ datamanager map
+            fg_map = self.datamanager.fg_maps[ci_global]
+            if isinstance(fg_map, np.ndarray):
+                fg_map = torch.from_numpy(fg_map)
+            fg_map = fg_map.to(self.device).float()
+            fg_gt_prob = fg_map[..., 1:2]
+
+            fg_gt_rgb = self.model.prob_from_probs_shader(fg_gt_prob)
+
+            images_dict["foreground_prob_gt"] = fg_gt_rgb
+            images_dict["foreground_prob_vs_gt"] = torch.cat([outputs["foreground_prob_rgb"], fg_gt_rgb], dim=1)
         for key, img in images_dict.items():
             writer.put_image(name=f"Train Images/{key}", image=img, step=step)
         # Also log centroid cache if present (after cold start)
@@ -429,6 +445,24 @@ class FeaturePipeline(VanillaPipeline):
             images_dict["centroid_cache"] = centroid_rgb
             images_dict["centroid_spread_error_cache"] = spread_err_rgb
             images_dict["centroid_spread_prob_cache"] = spread_prob_rgb
+            # Side-by-side pred vs GT for centroid spread prob and prob_soft
+            if ("centroid_spread_prob_rgb" in outputs) and (spread_prob_rgb is not None):
+                images_dict["centroid_spread_prob_vs_gt"] = torch.cat([outputs["centroid_spread_prob_rgb"], spread_prob_rgb], dim=1)
+            if ("centroid_spread_prob_soft_rgb" in outputs) and (spread_prob_rgb is not None):
+                images_dict["centroid_spread_prob_soft_vs_gt"] = torch.cat([outputs["centroid_spread_prob_soft_rgb"], spread_prob_rgb], dim=1)
+        # Add foreground pred vs GT side-by-side if available in eval batch
+        if self.model.config.foreground_enable and ("foreground_prob_rgb" in outputs):
+            ci_global = int(image_idx) + getattr(self.datamanager, "eval_offset", 0)
+            fg_map = self.datamanager.fg_maps[ci_global]
+            if isinstance(fg_map, np.ndarray):
+                fg_map = torch.from_numpy(fg_map)
+            fg_map = fg_map.to(self.device).float()
+            fg_gt_prob = fg_map[..., 1:2]
+
+            fg_gt_rgb = self.model.prob_from_probs_shader(fg_gt_prob)
+
+            images_dict["foreground_prob_gt"] = fg_gt_rgb
+            images_dict["foreground_prob_vs_gt"] = torch.cat([outputs["foreground_prob_rgb"], fg_gt_rgb], dim=1)
         assert "image_idx" not in metrics_dict
         metrics_dict["image_idx"] = image_idx
         assert "num_rays" not in metrics_dict
