@@ -2,7 +2,7 @@
 """
 Standalone Feature Extraction Script
 
-This script extracts features (CLIP, DINO, SAM2, TEXT, CLIPSAM_*, FOREGROUND_*) for a dataset
+This script extracts features (CLIP, DINO, SAM2, TEXT, CLIPSAM_*, FOREGROUND_*, ORIENTANY_*) for a dataset
 and caches them in shards at the exact same location and format as expected by
 the training pipeline. This allows pre-processing features independently of training.
 
@@ -12,7 +12,7 @@ Usage:
         --feature-type CLIP \
         --shard-size 64
 
-Supported feature types: CLIP, DINO, SAM2, TEXT, CLIPSAM_*, FOREGROUND_*
+Supported feature types: CLIP, DINO, SAM2, TEXT, CLIPSAM_*, FOREGROUND_*, ORIENTANY_*
 """
 
 import argparse
@@ -34,8 +34,9 @@ from f3rm.features.dino_extract import DINOArgs, make_dino_extractor
 from f3rm.features.sam2_extract import SAM2Args, make_sam2_extractor
 from f3rm.features.clipsam_extract import CLIPSAMArgs, make_clipsam_extractor, parse_clipsam_feature_type
 from f3rm.features.foreground_extract import FOREGROUNDArgs, make_foreground_extractor, parse_foreground_feature_type
+from f3rm.features.orientany_extract import ORIENTANYArgs, make_orientany_extractor, parse_orientany_feature_type
 from f3rm.features.text_extract import TextArgs, make_text_extractor
-from f3rm.features.utils import run_async_in_any_context, SAM2LazyAutoMasks, LazyFeatures, TextLazyFeatures, pack_auto_masks, pack_batch_auto_masks
+from f3rm.features.utils import run_async_in_any_context, SAM2LazyAutoMasks, LazyFeatures, TextLazyFeatures, ORIENTANYLazyFeatures, pack_auto_masks, pack_batch_auto_masks
 
 
 FEAT_TYPE_TO_ARGS = {
@@ -45,6 +46,7 @@ FEAT_TYPE_TO_ARGS = {
     "CLIPSAM": CLIPSAMArgs,  # Base class, but actual feature types will be CLIPSAM_*
     "TEXT": TextArgs,
     "FOREGROUND": FOREGROUNDArgs,
+    "ORIENTANY": ORIENTANYArgs,
 }
 
 FEAT_TYPE_TO_MAKE_EXTRACTOR: Dict[str, Callable[[torch.device, bool], Any]] = {
@@ -59,8 +61,8 @@ FEAT_TYPE_TO_MAKE_EXTRACTOR: Dict[str, Callable[[torch.device, bool], Any]] = {
 
 def get_cache_paths(data_dir: Path, feature_type: str) -> Tuple[Path, Path]:
     """Get cache directory and metadata paths for a feature type."""
-    # For CLIPSAM, use the full feature type as directory name to separate different prompts
-    if feature_type.startswith("CLIPSAM_"):
+    # For CLIPSAM/FOREGROUND/ORIENTANY, use the full feature type as directory name to separate different prompts
+    if feature_type.startswith("CLIPSAM_") or feature_type.startswith("FOREGROUND_") or feature_type.startswith("ORIENTANY_"):
         root = data_dir / "features" / feature_type.lower()
     else:
         root = data_dir / "features" / feature_type.lower()
@@ -81,7 +83,7 @@ async def _save_shards_generic(
     n_imgs = len(image_fnames)
     n_shards = math.ceil(n_imgs / shard_sz)
 
-    # Build extractor; CLIPSAM/FOREGROUND need data_dir to find CLIP/SAM2 caches; TEXT needs data_dir for logs
+    # Build extractor; CLIPSAM/FOREGROUND/ORIENTANY need data_dir to find CLIP/SAM2 caches; TEXT needs data_dir for logs
     if feature_type.startswith("CLIPSAM_"):
         parsed_prompts = parse_clipsam_feature_type(feature_type)
         # Empty list indicates: use per-image TEXT shards → pass None to extractor
@@ -93,6 +95,11 @@ async def _save_shards_generic(
         text_prompts_arg = None if (parsed_prompts is not None and len(parsed_prompts) == 0) else parsed_prompts
         CONSOLE.print(f"FOREGROUND parsed text prompts: {parsed_prompts} -> using {'TEXT shards' if text_prompts_arg is None else 'global prompts'}")
         extractor = make_foreground_extractor(device, verbose=True, data_dir=data_dir, text_prompts=text_prompts_arg)
+    elif feature_type.startswith("ORIENTANY_"):
+        parsed_prompts = parse_orientany_feature_type(feature_type)
+        text_prompts_arg = None if (parsed_prompts is not None and len(parsed_prompts) == 0) else parsed_prompts
+        CONSOLE.print(f"ORIENTANY parsed text prompts: {parsed_prompts} -> using {'TEXT shards' if text_prompts_arg is None else 'global prompts'}")
+        extractor = make_orientany_extractor(device, verbose=True, data_dir=data_dir, text_prompts=text_prompts_arg)
     elif feature_type == "TEXT":
         extractor = make_text_extractor(device, verbose=True, data_dir=data_dir)
     else:
@@ -108,6 +115,19 @@ async def _save_shards_generic(
             # FOREGROUND returns a list of np.ndarray (H, W, 2). Stack and save like CLIP/DINO
             stacked = np.stack(data, axis=0).astype(np.float32)
             np.save(root / f"chunk_{i:04d}.npy", stacked, allow_pickle=False)
+        elif feature_type.startswith("ORIENTANY_"):
+            # ORIENTANY returns a list of dicts with 'pixel_data' and 'instance_features'
+            # Save pixel data and instance features separately
+            pixel_data_list = [item['pixel_data'] for item in data]
+            instance_features_list = [item['instance_features'] for item in data]
+
+            # Stack pixel data (H, W, 3) for each image
+            stacked_pixel_data = np.stack(pixel_data_list, axis=0).astype(np.float32)
+            np.save(root / f"chunk_{i:04d}_pixel.npy", stacked_pixel_data, allow_pickle=False)
+
+            # Save instance features as JSON for easy access
+            with open(root / f"chunk_{i:04d}_instances.json", 'w') as f:
+                json.dump(instance_features_list, f, indent=2)
         elif feature_type.startswith("CLIPSAM_") or feature_type == "SAM2":
             # Pack SAM2 data into memory-mappable format using consolidated function
             packed_batch = pack_batch_auto_masks(data)
@@ -198,6 +218,16 @@ def feature_loader(image_fnames: List[str], extract_args, data_dir: Path, featur
         shard_paths = sorted(root.glob("chunk_*.npz"))
     elif feature_type == "TEXT":
         shard_paths = sorted(root.glob("chunk_*.json"))
+    elif feature_type.startswith("FOREGROUND_"):
+        shard_paths = sorted(root.glob("chunk_*.npy"))
+    elif feature_type.startswith("ORIENTANY_"):
+        # ORIENTANY has both pixel data (.npy) and instance features (.json)
+        pixel_shards = sorted(root.glob("chunk_*_pixel.npy"))
+        instance_shards = sorted(root.glob("chunk_*_instances.json"))
+        if not pixel_shards or not instance_shards:
+            shard_paths = []
+        else:
+            shard_paths = pixel_shards  # Use pixel shards for existence check
     else:
         shard_paths = sorted(root.glob("chunk_*.npy"))
     if not shard_paths:
@@ -210,6 +240,15 @@ def feature_loader(image_fnames: List[str], extract_args, data_dir: Path, featur
     elif feature_type == "TEXT":
         CONSOLE.print(f"[DEBUG] {feature_type}: CACHE HIT - Using TEXT lazy cache with {len(shard_paths)} shards")
         return TextLazyFeatures(shard_paths)
+    elif feature_type.startswith("FOREGROUND_"):
+        CONSOLE.print(f"[DEBUG] {feature_type}: CACHE HIT - Using mmap cache with {len(shard_paths)} shards")
+        return LazyFeatures(shard_paths)
+    elif feature_type.startswith("ORIENTANY_"):
+        # ORIENTANY uses custom lazy loader for separate pixel/instance data
+        pixel_shards = sorted(root.glob("chunk_*_pixel.npy"))
+        instance_shards = sorted(root.glob("chunk_*_instances.json"))
+        CONSOLE.print(f"[DEBUG] {feature_type}: CACHE HIT - Using ORIENTANY lazy cache with {len(pixel_shards)} shards")
+        return ORIENTANYLazyFeatures(pixel_shards, instance_shards)
 
     CONSOLE.print(f"[DEBUG] {feature_type}: CACHE HIT - Using mmap cache with {len(shard_paths)} shards")
     return LazyFeatures(shard_paths)
@@ -241,12 +280,12 @@ def get_image_filenames_from_dataparser(data_dir: Path) -> List[str]:
 def extract_features_for_dataset(
     image_fnames: List[str],
     data_dir: Path,
-    feature_type: Literal["CLIP", "DINO", "SAM2", "TEXT", "CLIPSAM_*", "FOREGROUND_*"],
+    feature_type: Literal["CLIP", "DINO", "SAM2", "TEXT", "CLIPSAM_*", "FOREGROUND_*", "ORIENTANY_*"],
     device: torch.device,
     shard_size: int = 64,
     enable_cache: bool = True,
     force: bool = False,
-) -> Union[torch.Tensor, LazyFeatures, SAM2LazyAutoMasks, TextLazyFeatures]:
+) -> Union[torch.Tensor, LazyFeatures, SAM2LazyAutoMasks, TextLazyFeatures, ORIENTANYLazyFeatures]:
     """
     Extract features for a dataset (same logic as FeatureDataManager.extract_features_sharded).
 
@@ -258,6 +297,8 @@ def extract_features_for_dataset(
         args = CLIPSAMArgs
     elif feature_type.startswith("FOREGROUND_"):
         args = FOREGROUNDArgs
+    elif feature_type.startswith("ORIENTANY_"):
+        args = ORIENTANYArgs
     else:
         args = FEAT_TYPE_TO_ARGS[feature_type]
 
@@ -293,7 +334,7 @@ def extract_features_for_dataset(
 
 def extract_features_standalone(
     data_dir: Path,
-    feature_type: Literal["CLIP", "DINO", "SAM2", "TEXT", "CLIPSAM_*", "FOREGROUND_*"],
+    feature_type: Literal["CLIP", "DINO", "SAM2", "TEXT", "CLIPSAM_*", "FOREGROUND_*", "ORIENTANY_*"],
     shard_size: int = 64,
     device: str = "auto",
     force: bool = False,
@@ -349,7 +390,8 @@ def main():
             "Feature type to extract.\n"
             "- CLIPSAM: 'CLIPSAM_book' or 'CLIPSAM_book_pen' (global prompts), 'CLIPSAM_' (use TEXT shards).\n"
             "- FOREGROUND: 'FOREGROUND_book' or 'FOREGROUND_book_pen' (global), 'FOREGROUND_' (use TEXT shards).\n"
-            "Examples: CLIP, DINO, SAM2, TEXT, CLIPSAM_book, CLIPSAM_, FOREGROUND_book, FOREGROUND_."
+            "- ORIENTANY: 'ORIENTANY_book' or 'ORIENTANY_book_pen' (global), 'ORIENTANY_' (use TEXT shards).\n"
+            "Examples: CLIP, DINO, SAM2, TEXT, CLIPSAM_book, CLIPSAM_, FOREGROUND_book, FOREGROUND_, ORIENTANY_book, ORIENTANY_."
         )
     )
 

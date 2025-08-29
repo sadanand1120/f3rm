@@ -1,0 +1,93 @@
+{
+    "cropsmallEx03": {
+        "dino_mode": "small",
+        "in_dim": 384,
+        "out_dim": 722,
+        "ro_offset": 90,
+        "ro_range": 180
+    },
+    "base100p2": {
+        "dino_mode": "base",
+        "in_dim": 768,
+        "out_dim": 902,
+        "ro_offset": 180,
+        "ro_range": 360
+    },
+    "base100p": {
+        "dino_mode": "base",
+        "in_dim": 768,
+        "out_dim": 902,
+        "ro_offset": 180,
+        "ro_range": 360
+    },
+    "base75p2": {
+        "dino_mode": "base",
+        "in_dim": 768,
+        "out_dim": 902,
+        "ro_offset": 180,
+        "ro_range": 360
+    },
+    "base75p": {
+        "dino_mode": "base",
+        "in_dim": 768,
+        "out_dim": 902,
+        "ro_offset": 180,
+        "ro_range": 360
+    },
+    "base50p": {
+        "dino_mode": "base",
+        "in_dim": 768,
+        "out_dim": 902,
+        "ro_offset": 180,
+        "ro_range": 360
+    },
+    "base25p": {
+        "dino_mode": "base",
+        "in_dim": 768,
+        "out_dim": 902,
+        "ro_offset": 180,
+        "ro_range": 360
+    },
+    "cropbaseEx03": {
+        "dino_mode": "base",
+        "in_dim": 768,
+        "out_dim": 722,
+        "ro_offset": 90,
+        "ro_range": 180
+    },
+    "celarge": {
+        "dino_mode": "large",
+        "in_dim": 1024,
+        "out_dim": 602,
+        "ro_offset": 30,
+        "ro_range": 60
+    },
+    "croplargeEX03": {
+        "dino_mode": "large",
+        "in_dim": 1024,
+        "out_dim": 722,
+        "ro_offset": 90,
+        "ro_range": 180
+    },
+    "croplargeEX2": {
+        "dino_mode": "large",
+        "in_dim": 1024,
+        "out_dim": 722,
+        "ro_offset": 90,
+        "ro_range": 180
+    },
+    "mixreallarge": {
+        "dino_mode": "large",
+        "in_dim": 1024,
+        "out_dim": 902,
+        "ro_offset": 180,
+        "ro_range": 360
+    },
+    "ronormsigma1": {
+        "dino_mode": "large",
+        "in_dim": 1024,
+        "out_dim": 902,
+        "ro_offset": 180,
+        "ro_range": 360
+    }
+}

@@ -370,3 +370,54 @@ def pack_batch_auto_masks(batch_masks: List[List[dict]]) -> dict:
         "area_data": np.concatenate(all_area_data) if all_area_data else np.array([], dtype=np.float32),
         "image_offsets": np.array(image_offsets, dtype=np.int32)
     }
+
+
+class ORIENTANYLazyFeatures(BaseLazyShards):
+    """Lazy loading for ORIENTANY features stored as separate pixel data and instance features."""
+
+    def __init__(self, pixel_shard_paths: List[Path], instance_shard_paths: List[Path]):
+        super().__init__(pixel_shard_paths)  # Use pixel shards for indexing
+        self.instance_shard_paths = instance_shard_paths
+        assert len(pixel_shard_paths) == len(instance_shard_paths), "Pixel and instance shards must match"
+
+    def _setup_lengths(self):
+        """Count total number of images across all pixel shards."""
+        for p in self.paths:
+            # Load just shape info without loading full data
+            arr = np.load(p, mmap_mode="r")
+            self.lengths.append(arr.shape[0])
+            del arr  # Explicitly free memory after getting shape info
+
+    def __len__(self) -> int:
+        return int(self.cum[-1])
+
+    def __getitem__(self, idx: int) -> np.ndarray:
+        """Get ORIENTANY features for a single image as (H, W, 904) array."""
+        shard_idx, local_idx = self._loc(idx)
+
+        # Load pixel data (H, W, 3) - [fg_one_hot, instance_id]
+        pixel_data = np.load(self.paths[shard_idx])[local_idx]  # (H, W, 3)
+
+        # Load instance features mapping
+        with open(self.instance_shard_paths[shard_idx], 'r') as f:
+            instance_features_list = json.load(f)
+        instance_features = instance_features_list[local_idx]  # {instance_id: 902D_features}
+
+        # Reconstruct full feature array (H, W, 904)
+        h, w, _ = pixel_data.shape
+        full_features = np.zeros((h, w, 904), dtype=np.float32)
+
+        # Set foreground one-hot at the end
+        full_features[..., 902:904] = pixel_data[..., :2]  # foreground one-hot
+
+        # For each foreground pixel, get its instance features
+        for instance_id, instance_feat in instance_features.items():
+            instance_id = int(instance_id)
+            mask = (pixel_data[..., 2] == instance_id)
+            if np.any(mask):
+                # Convert list back to numpy array if needed
+                if isinstance(instance_feat, list):
+                    instance_feat = np.array(instance_feat, dtype=np.float32)
+                full_features[mask, :902] = instance_feat
+
+        return full_features

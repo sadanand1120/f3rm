@@ -29,3 +29,5 @@ exports/
 **/.vscode
 **/.cursor
 Hierarchical-Localization/
+*.pt
+*.pth

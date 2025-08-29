@@ -1,0 +1,11 @@
+#Install manually
+#torch
+
+transformers
+matplotlib
+pillow
+huggingface-hub
+gradio
+numpy==1.26.4
+onnxruntime
+rembg
