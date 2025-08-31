@@ -1,9 +1,12 @@
 import gc
 import asyncio
+import json
+import os
 from typing import List, Optional, Dict, Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from pathlib import Path
 from PIL import Image
 from tqdm.auto import tqdm
@@ -13,7 +16,16 @@ from sam2.features.utils import SAM2utils
 from sam2.features.clip_main import CLIPfeatures
 from sam2.features.utils import AsyncMultiWrapper
 
-from f3rm.features.utils import LazyFeatures, SAM2LazyAutoMasks, TextLazyFeatures, run_async_in_any_context, resolve_devices_and_workers
+from f3rm.features.utils import (
+    LazyFeatures, SAM2LazyAutoMasks, TextLazyFeatures,
+    run_async_in_any_context,
+    resolve_devices_and_workers,
+    get_nerf_ccs_to_normal_ccs_T,
+    build_transform_lookup,
+    get_nerf_ccs_to_orig_nerf_world,
+    get_orig_to_final_nerf_world_transform_scale,
+    get_conf_temp_scaled_logits
+)
 from f3rm.features.sam2_extract import SAM2Args
 from f3rm.features.orientany.orientany_main import OrientAny
 
@@ -25,6 +37,9 @@ class ORIENTANYArgs:
     sim_thresh: float = 0.7
     min_instance_percent: float = 1.0
     batch_size_per_gpu: int = 4
+    conf_exp_scaling: float = 6
+    batch_phi: int = 32
+    batch_theta: int = 32
 
     @classmethod
     def id_dict(cls):
@@ -34,6 +49,9 @@ class ORIENTANYArgs:
             "top_mean_percent": float(cls.top_mean_percent),
             "sim_thresh": float(cls.sim_thresh),
             "min_instance_percent": float(cls.min_instance_percent),
+            "conf_exp_scaling": float(cls.conf_exp_scaling),
+            "batch_phi": int(cls.batch_phi),
+            "batch_theta": int(cls.batch_theta),
         }
 
 
@@ -79,6 +97,17 @@ class ORIENTANYWorker:
 
         self.clip_model = CLIPfeatures(device=self.device)
         self.orient_any = OrientAny("f3rm/features/orientany/ckpts", "ronormsigma1_dino_weight.pt")
+
+        # Load camera transforms for distribution propagation
+        transforms_path = self.data_dir / "transforms.json"
+        if transforms_path.exists():
+            T_orig_to_final_nerf_world, orig_to_final_nerf_world_scale = get_orig_to_final_nerf_world_transform_scale(str(transforms_path))
+            dataset_transforms_data = json.load(open(transforms_path, "r"))
+            self.transforms_lookup = build_transform_lookup(dataset_transforms_data["frames"])
+            self.T_orig_to_final_nerf_world = T_orig_to_final_nerf_world
+            self.orig_to_final_nerf_world_scale = orig_to_final_nerf_world_scale
+        else:
+            raise ValueError("transforms.json not found")
 
     async def compute_orientany_for_image_async(self, image_path: str) -> Dict[str, Any]:
         # map image → index
@@ -224,22 +253,59 @@ class ORIENTANYWorker:
             instance_img_array[..., 3] = seg * 255
             instance_img = Image.fromarray(instance_img_array, 'RGBA')
 
-            # Get OrientAny predictions
+            # Get OrientAny predictions for cam1 (current image camera)
             rm_bkg_img = self.orient_any.preprocess_remove_bkg(instance_img, do_remove_background=False)
             outs = self.orient_any.get_model_outputs(rm_bkg_img, viz_distn=False)
 
             # Extract logits
-            gaus_ax_logits = outs['gaus_ax_logits']  # 360D
-            gaus_pl_logits = outs['gaus_pl_logits']  # 180D
-            gaus_ro_logits = outs['gaus_ro_logits']  # 360D
-            conf_logits = outs['conf_logits']        # 2D
+            gaus_ax_logits = torch.from_numpy(outs['gaus_ax_logits']).to(self.device)  # 360D
+            gaus_pl_logits = torch.from_numpy(outs['gaus_pl_logits']).to(self.device)  # 180D
+            gaus_ro_logits = torch.from_numpy(outs['gaus_ro_logits']).to(self.device)  # 360D
+            conf_logits = torch.from_numpy(outs['conf_logits']).to(self.device)
 
-            # Store instance features: 902D vector
+            # Apply confidence scaling
+            conf_scaled_ax_logits = get_conf_temp_scaled_logits(gaus_ax_logits, outs['confidence'], drop_exp_factor=ORIENTANYArgs.conf_exp_scaling)
+            conf_scaled_pl_logits = get_conf_temp_scaled_logits(gaus_pl_logits, outs['confidence'], drop_exp_factor=ORIENTANYArgs.conf_exp_scaling)
+            conf_scaled_ro_logits = get_conf_temp_scaled_logits(gaus_ro_logits, outs['confidence'], drop_exp_factor=ORIENTANYArgs.conf_exp_scaling)
+
+            # Convert to probabilities
+            probs_ax = F.softmax(conf_scaled_ax_logits, dim=0)
+            probs_pl = F.softmax(conf_scaled_pl_logits, dim=0)
+            probs_ro = F.softmax(conf_scaled_ro_logits, dim=0)
+
+            # Propagate distributions to world camera (cam2 = unit transformation)
+            # Get cam1 transforms (following notebook logic exactly)
+            nerf_ccs1_to_orig_nerf_world = get_nerf_ccs_to_orig_nerf_world(os.path.basename(image_path), self.transforms_lookup)
+            nerf_ccs1_to_final_nerf_world = self.T_orig_to_final_nerf_world @ nerf_ccs1_to_orig_nerf_world
+            nerf_ccs1_to_final_nerf_world[:3, 3] *= self.orig_to_final_nerf_world_scale
+
+            # Define world coordinate system as 4x4 identity (explicit)
+            nerf_ccs2_to_final_nerf_world = np.eye(4)
+            normal_ccs2_to_final_nerf_world = nerf_ccs2_to_final_nerf_world @ np.linalg.inv(get_nerf_ccs_to_normal_ccs_T())
+
+            # Convert to normal CCS (following notebook Cell 6 logic)
+            normal_ccs1_to_final_nerf_world = nerf_ccs1_to_final_nerf_world @ np.linalg.inv(get_nerf_ccs_to_normal_ccs_T())
+
+            # Get normal_ccs1_to_normal_ccs2 (cam1 to world)
+            normal_ccs1_to_normal_ccs2 = np.linalg.inv(normal_ccs2_to_final_nerf_world) @ normal_ccs1_to_final_nerf_world
+            R_normal_cam1_to_normal_world = normal_ccs1_to_normal_ccs2[:3, :3]
+
+            # Propagate distributions
+            probs_ax_world, probs_pl_world, probs_ro_world = self.orient_any.push_distributions_to_new_view(
+                probs_ax, probs_pl, probs_ro,
+                torch.from_numpy(R_normal_cam1_to_normal_world.astype(np.float32)).to(self.device),
+                batch_phi=ORIENTANYArgs.batch_phi,
+                batch_theta=ORIENTANYArgs.batch_theta,
+                device=self.device,
+                show_progress=True
+            )
+
+            # Store propagated probabilities: 902D vector
             instance_feat = np.concatenate([
-                gaus_ax_logits,  # 360D
-                gaus_pl_logits,  # 180D
-                gaus_ro_logits,  # 360D
-                conf_logits      # 2D
+                probs_ax_world.cpu().numpy(),  # 360D
+                probs_pl_world.cpu().numpy(),  # 180D
+                probs_ro_world.cpu().numpy(),  # 360D
+                conf_logits.cpu().numpy()      # 2D
             ]).astype(np.float32)
 
             instance_features[next_instance_id] = instance_feat.tolist()  # Convert to list for JSON serialization
@@ -250,6 +316,9 @@ class ORIENTANYWorker:
 
             # Clean up instance-specific memory
             del instance_img, rm_bkg_img, outs, gaus_ax_logits, gaus_pl_logits, gaus_ro_logits, conf_logits
+            del conf_scaled_ax_logits, conf_scaled_pl_logits, conf_scaled_ro_logits
+            del probs_ax, probs_pl, probs_ro
+            del probs_ax_world, probs_pl_world, probs_ro_world
 
         return {
             'pixel_data': pixel_data,  # (H, W, 3) - [fg_one_hot, instance_id]
@@ -322,7 +391,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Extract orientation features using global prompts
-    extractor = make_orientany_extractor(device=device, data_dir=data_root, text_prompts=["book"], verbose=True)
+    extractor = make_orientany_extractor(device=device, data_dir=data_root, text_prompts=["book", "table"], verbose=True)
     features_data = run_async_in_any_context(lambda: extractor.extract_batch_async(image_paths))
     print(f"Extracted {len(features_data)} feature maps")
 
@@ -359,7 +428,7 @@ if __name__ == "__main__":
     if vis_count == 1:
         axes = axes.reshape(3, 1)
 
-    for i in range(vis_count):
+    for i in tqdm(range(vis_count), desc="Visualizing results"):
         # RGB image
         rgb = Image.open(image_paths[i]).convert("RGB")
         axes[0, i].imshow(rgb)
@@ -375,7 +444,7 @@ if __name__ == "__main__":
 
         # Orientation RGB
         if fg is not None:
-            # Get argmax predictions for the three angles
+            # Get argmax predictions for the three angles (now from propagated probabilities)
             gaus_ax_pred = np.argmax(features[i][..., 0:360], axis=-1)  # 0-359
             gaus_pl_pred = np.argmax(features[i][..., 360:540], axis=-1)  # 0-179
             gaus_ro_pred = np.argmax(features[i][..., 540:900], axis=-1)  # 0-359
@@ -389,7 +458,7 @@ if __name__ == "__main__":
             # Only show colors for foreground pixels
             orient_rgb[~fg.astype(bool)] = 0
             axes[2, i].imshow(orient_rgb)
-            axes[2, i].set_title("Orientation RGB")
+            axes[2, i].set_title("Orientation RGB (World-Propagated)")
         axes[2, i].axis('off')
 
     plt.tight_layout()

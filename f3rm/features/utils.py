@@ -4,8 +4,97 @@ import json
 import asyncio
 import concurrent.futures
 import numpy as np
+import os
+import yaml
 import torch
 from pathlib import Path
+
+from nerfstudio.cameras import camera_utils
+
+
+def get_conf_temp_scaled_logits(logits, confidence, drop_exp_factor=6, eps=1e-8):
+    """
+    Scale logits by confidence.
+    T = 1/max(confidence^drop_exp_factor, eps). Lower confidence -> higher T -> flatter probs.
+    """
+    x = torch.as_tensor(logits, dtype=torch.float32)
+    T = 1.0 / max(float(confidence)**drop_exp_factor, eps)
+    return x / T
+
+
+def build_transform_lookup(frames):
+    return {frame["file_path"]: np.asarray(frame["transform_matrix"]) for frame in frames}
+
+
+def get_nerf_ccs_to_normal_ccs_T():
+    """Get the transformation matrix from NeRF CCS to normal CCS."""
+    T = np.asarray([
+        [1, 0, 0, 0],
+        [0, -1, 0, 0],
+        [0, 0, -1, 0],
+        [0, 0, 0, 1]
+    ])
+    return T
+
+
+def get_nerf_ccs_to_orig_nerf_world(filename, transforms_lookup):
+    for k, v in transforms_lookup.items():
+        if os.path.basename(k) == filename:
+            return v
+    raise KeyError(f"No transform found for {filename}")
+
+
+def get_orig_to_final_nerf_world_transform_scale(dataset_transforms_path: str, model_outputdir_path: str = None):
+    """
+    if model output dir path not provided, assumes defaults and computes
+    """
+    dataset_transforms_path = Path(dataset_transforms_path)
+    dataset_transforms_data = json.load(open(dataset_transforms_path, "r"))
+    if model_outputdir_path is not None:
+        model_dp_transforms_path = Path(model_outputdir_path) / "dataparser_transforms.json"
+        model_config_path = Path(model_outputdir_path) / "config.yml"
+        model_dp_transforms_data = json.load(open(model_dp_transforms_path, "r"))
+        model_config = yaml.load(model_config_path.read_text(), Loader=yaml.Loader)
+        loaded_global_transform = np.array(model_dp_transforms_data["transform"])
+        loaded_global_transform_44 = np.vstack([loaded_global_transform, np.array([[0, 0, 0, 1]])])
+        loaded_global_scale = model_dp_transforms_data["scale"]
+        if "applied_transform" in dataset_transforms_data:
+            applied_transform = np.asarray(dataset_transforms_data["applied_transform"])
+            applied_transform_44 = np.vstack([applied_transform, np.array([[0, 0, 0, 1]])])
+        else:
+            applied_transform_44 = np.eye(4)
+        if "applied_scale" in dataset_transforms_data:
+            applied_scale = float(dataset_transforms_data["applied_scale"])
+        else:
+            applied_scale = 1.0
+        T_orig_to_final_nerf_world = loaded_global_transform_44 @ np.linalg.inv(applied_transform_44)
+        orig_to_final_nerf_world_scale = loaded_global_scale / applied_scale
+        return T_orig_to_final_nerf_world, orig_to_final_nerf_world_scale
+    else:
+        # TODO: add asserts to pipeline, model etc to NOT change these defaults
+        _model_default_orientation_method = "up"
+        _model_default_center_method = "poses"
+        _model_default_auto_scale_poses = True
+        _model_default_scale_factor = 1.0
+        # orient and center
+        all_poses = []
+        for frame in dataset_transforms_data["frames"]:
+            pose = np.array(frame["transform_matrix"], dtype=np.float32)
+            all_poses.append(pose)
+        all_poses = torch.from_numpy(np.array(all_poses))
+        if "orientation_override" in dataset_transforms_data:
+            orientation_method = dataset_transforms_data["orientation_override"]
+        else:
+            orientation_method = _model_default_orientation_method
+        center_method = _model_default_center_method
+        oriented_poses, transform_matrix = camera_utils.auto_orient_and_center_poses(all_poses, method=orientation_method, center_method=center_method)
+        transform_matrix_44 = torch.cat([transform_matrix, torch.tensor([[0, 0, 0, 1]], dtype=transform_matrix.dtype)], dim=0)
+        # scale poses
+        scale_factor = 1.0
+        if _model_default_auto_scale_poses:
+            scale_factor /= float(torch.max(torch.abs(oriented_poses[:, :3, 3])))
+        scale_factor *= _model_default_scale_factor
+        return transform_matrix_44.cpu().numpy(), float(scale_factor)
 
 
 def resolve_devices_and_workers(device: torch.device, batch_size_per_gpu: int) -> Tuple[Optional[torch.device], int]:

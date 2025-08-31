@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 import json
 import os
 import math
+from tqdm.auto import tqdm
 
 from f3rm.features.orientany.vision_tower import DINOv2_MLP
 from f3rm.features.orientany.homography import Homography
@@ -221,6 +222,174 @@ class OrientAny:
         delta = math.degrees(math.atan2(R_delta[0, 1], R_delta[0, 0]))
         delta = ((delta + 180.0) % 360.0) - 180.0                # (-180, 180]
         return {'phi': phi, 'theta_elev': theta_elev, 'delta': delta}
+
+    # Batch rotation utilities for distribution propagation
+    @staticmethod
+    def _rotX_batch(a):
+        """Batch rotation around X-axis"""
+        ca, sa = torch.cos(a), torch.sin(a)
+        R = torch.zeros((a.shape[0], 3, 3), dtype=a.dtype, device=a.device)
+        R[:, 0, 0] = 1.0
+        R[:, 1, 1] = ca
+        R[:, 1, 2] = sa
+        R[:, 2, 1] = -sa
+        R[:, 2, 2] = ca
+        return R
+
+    @staticmethod
+    def _rotY_batch(a):
+        """Batch rotation around Y-axis"""
+        ca, sa = torch.cos(a), torch.sin(a)
+        R = torch.zeros((a.shape[0], 3, 3), dtype=a.dtype, device=a.device)
+        R[:, 0, 0] = ca
+        R[:, 0, 2] = -sa
+        R[:, 1, 1] = 1.0
+        R[:, 2, 0] = sa
+        R[:, 2, 2] = ca
+        return R
+
+    @staticmethod
+    def _rotZ_batch(a):
+        """Batch rotation around Z-axis"""
+        ca, sa = torch.cos(a), torch.sin(a)
+        R = torch.zeros((a.shape[0], 3, 3), dtype=a.dtype, device=a.device)
+        R[:, 0, 0] = ca
+        R[:, 0, 1] = sa
+        R[:, 1, 0] = -sa
+        R[:, 1, 1] = ca
+        R[:, 2, 2] = 1.0
+        return R
+
+    @staticmethod
+    def _angles_to_R_batch(phi_deg, theta_elev_deg, delta_deg):
+        """Convert batch of angles to rotation matrices using OrientAny conventions"""
+        dev = phi_deg.device
+        A2 = torch.tensor([[0., 1., 0.],
+                          [0., 0., -1.],
+                          [-1., 0., 0.]], device=dev, dtype=torch.float32)
+        phi = torch.deg2rad(phi_deg.float())
+        theta_elev = torch.deg2rad(theta_elev_deg.float())
+        delta = torch.deg2rad(delta_deg.float())
+        # Follow exact same logic as get_R_objw2cam: T3 @ T2 @ T1 where T1=Z(phi), T2=Y(-theta_elev), T3=X(-delta)
+        T_wcs_to_wcs_intermed = OrientAny._rotX_batch(-delta) @ OrientAny._rotY_batch(-theta_elev) @ OrientAny._rotZ_batch(phi)
+        # Apply A2 transformation: T_wcs_intermed_to_ccs_facing_origin @ T_wcs_to_wcs_intermed
+        R = A2 @ T_wcs_to_wcs_intermed
+        return R
+
+    @staticmethod
+    def _angles_from_R_batch(R):
+        """Extract angles from batch of rotation matrices using OrientAny conventions"""
+        # Follow exact same logic as _angles_from_R
+        # 1) Camera-center direction in world coords: v = -R^T e_z
+        # For batch: R has shape [N, 3, 3], so R^T has shape [N, 3, 3] with transposed matrices
+        # R^T @ [0,0,1] for each matrix gives the third column of R^T, which is the third row of R
+        # So -R^T @ [0,0,1] is -R[:, 2, :] (negative of third row of each matrix)
+        v = -R[:, 2, :]  # This is -R^T @ [0,0,1] for each matrix in the batch
+        v = v / (v.norm(dim=1, keepdim=True).clamp_min(1e-8))
+
+        # 2) Azimuth and elevation
+        phi = torch.rad2deg(torch.atan2(v[:, 1], v[:, 0])) % 360.0       # [0, 360)
+        theta_elev = torch.rad2deg(torch.asin(v[:, 2].clamp(-1, 1)))      # [-90, 90]
+
+        # 3) Zero-roll reference and residual roll about +Z_C
+        A2 = torch.tensor([[0., 1., 0.],
+                          [0., 0., -1.],
+                          [-1., 0., 0.]], device=R.device, dtype=torch.float32)
+        R1 = OrientAny._rotZ_batch(torch.deg2rad(phi.float()))
+        R2 = OrientAny._rotY_batch(torch.deg2rad(-theta_elev.float()))
+        R0 = A2 @ R2 @ R1
+        R_delta = R @ R0.transpose(1, 2)  # R0.T for batch matrices
+        delta = torch.rad2deg(torch.atan2(R_delta[:, 0, 1], R_delta[:, 0, 0]))
+        delta = ((delta + 180.0) % 360.0) - 180.0                         # (-180, 180]
+        return phi, theta_elev, delta
+
+    @torch.no_grad()
+    def push_distributions_to_new_view(self, probs_phi, probs_theta, probs_delta, R_ccs1_to_ccs2,
+                                       batch_phi=24, batch_theta=12, device=None, show_progress=True):
+        """
+        Propagate angle distributions from camera view 1 to camera view 2.
+
+        Args:
+            probs_phi: [Np] azimuth probabilities (e.g., 360), bin i -> φ=i deg
+            probs_theta: [Nt] polar probabilities (e.g., 180), bin j -> θelev=j-90 deg  
+            probs_delta: [Nd] roll probabilities (e.g., ro_range), bin k -> δ=k-ro_offset deg
+            R_ccs1_to_ccs2: [3,3] rotation matrix from camera 1 to camera 2 (torch tensor)
+            batch_phi: batching along φ to control memory
+            batch_theta: batching along θ to control memory
+            device: target device for computation
+
+        Returns:
+            probs_phi_w: [Np] propagated azimuth probabilities
+            probs_theta_w: [Nt] propagated polar probabilities  
+            probs_delta_w: [Nd] propagated roll probabilities
+        """
+        if device is None:
+            device = (probs_phi.device if isinstance(probs_phi, torch.Tensor)
+                      else ('cuda' if torch.cuda.is_available() else 'cpu'))
+
+        def to(x): return torch.as_tensor(x, dtype=torch.float32, device=device)
+        p_phi, p_theta, p_delta = to(probs_phi), to(probs_theta), to(probs_delta)
+
+        Np, Nt, Nd = p_phi.numel(), p_theta.numel(), p_delta.numel()
+        ro_offset = self.model_config['ro_offset']
+
+        phi_bins = torch.arange(Np, device=device, dtype=torch.float32)
+        theta_bins = torch.arange(Nt, device=device, dtype=torch.float32) - 90.0
+        delta_bins = torch.arange(Nd, device=device, dtype=torch.float32) - float(ro_offset)
+
+        h_phi = torch.zeros(Np, device=device)
+        h_theta = torch.zeros(Nt, device=device)
+        h_delta = torch.zeros(Nd, device=device)
+        R_ccs1_to_ccs2 = to(R_ccs1_to_ccs2)
+
+        total_phi_batches = (Np + batch_phi - 1) // batch_phi
+        total_theta_batches = (Nt + batch_theta - 1) // batch_theta
+        total_iterations = total_phi_batches * total_theta_batches
+
+        pbar = tqdm(total=total_iterations, desc="Propagating distributions", disable=not show_progress, leave=False)
+
+        for i0 in range(0, Np, batch_phi):
+            i1 = min(i0 + batch_phi, Np)
+            phi_idx = torch.arange(i0, i1, device=device)
+            phi_deg = phi_bins[phi_idx]
+            p_phi_b = p_phi[phi_idx]
+
+            for j0 in range(0, Nt, batch_theta):
+                j1 = min(j0 + batch_theta, Nt)
+                theta_idx = torch.arange(j0, j1, device=device)
+                theta_deg = theta_bins[theta_idx]
+                p_theta_b = p_theta[theta_idx]
+
+                Phi, Theta = torch.meshgrid(phi_deg, theta_deg, indexing='ij')
+                Wpair = (p_phi_b[:, None] * p_theta_b[None, :]).reshape(-1)
+
+                M = Wpair.numel()
+                phi_all = Phi.reshape(-1).repeat_interleave(Nd)
+                theta_all = Theta.reshape(-1).repeat_interleave(Nd)
+                delta_all = delta_bins.repeat(M)
+                weights = Wpair.repeat_interleave(Nd) * p_delta.repeat(M)
+
+                R_oc = OrientAny._angles_to_R_batch(phi_all, theta_all, delta_all)
+                R_ow = R_ccs1_to_ccs2.unsqueeze(0) @ R_oc
+                phi_w, theta_w, delta_w = OrientAny._angles_from_R_batch(R_ow)
+
+                # Map back to integer bins
+                phi_w_idx = (torch.round(phi_w) % Np).long()
+                theta_w_idx = (torch.round(theta_w) + 90.0).clamp(0, Nt - 1).long()
+                delta_w_idx = (torch.round(delta_w) + ro_offset).remainder(Nd).long()
+
+                h_phi += torch.bincount(phi_w_idx, weights=weights, minlength=Np)
+                h_theta += torch.bincount(theta_w_idx, weights=weights, minlength=Nt)
+                h_delta += torch.bincount(delta_w_idx, weights=weights, minlength=Nd)
+
+                pbar.update(1)
+
+        pbar.close()
+
+        h_phi = h_phi / h_phi.sum().clamp_min(1e-12)
+        h_theta = h_theta / h_theta.sum().clamp_min(1e-12)
+        h_delta = h_delta / h_delta.sum().clamp_min(1e-12)
+        return h_phi, h_theta, h_delta
 
 
 if __name__ == "__main__":

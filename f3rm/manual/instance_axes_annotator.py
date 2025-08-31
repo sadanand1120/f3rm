@@ -708,7 +708,7 @@ class AxesAnnotator:
         Args:
             image (np.ndarray): Image to draw on (will be modified in-place)
             center (tuple): (x, y) center point for axes
-            rotation_matrix (np.ndarray): 3x3 rotation matrix
+            rotation_matrix (np.ndarray): 3x3 rotation matrix, ie, R_objtarget_to_nerf_ccs
             axis_length (int): Length of axes in pixels
             axis_thickness (int): Thickness of axes lines
 
