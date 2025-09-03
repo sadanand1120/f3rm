@@ -82,16 +82,14 @@ class FeatureFieldModelConfig(NerfactoModelConfig):
     centroid_spread_trunk_fg: int = 16  # 0 disables
     foreground_trunk_grad_to_spread: bool = False  # allow grads from fg head into spread trunk
 
-    # OrientAny head controls (separate orientation classifier with 902 logits; supervised via ORIENTANY_* shards)
+    # OrientAny head controls (4 separate heads: azimuth, polar, roll, foreground; supervised via ORIENTANY_* shards)
     orientany_enable: bool = True  # Enable separate OrientAny head (train + render)
     orientany_loss_weight: float = 1e-3  # Loss weight for OrientAny classification
     orientany_condition_on_density: bool = True  # Condition OrientAny head on NeRF density embedding
     orientany_condition_density_grad_to_nerf: bool = False  # Allow OrientAny head gradients into NeRF density embedding
-    orientany_hidden_dim: int = 128  # OrientAny head hidden dim (larger due to 902 output dims)
+    orientany_hidden_dim: int = 64  # OrientAny head hidden dim
     orientany_num_layers: int = 3  # OrientAny head num layers (deeper due to complexity)
-    # OrientAny head uses same xyz-based encoding as feature head (no direction input)
-    # Optional: feed centroid-spread trunk features into OrientAny head for better calibration
-    centroid_spread_trunk_orientany: int = 16  # 0 disables
+    centroid_spread_trunk_orientany: int = 16  # 0 disables spread trunk input
     orientany_trunk_grad_to_spread: bool = False  # Allow OrientAny head gradients into centroid-spread trunk
 
     # Camera-pose refinement control: if False, cut gradient from all custom heads to camera optimizer (via detached weights)
@@ -330,19 +328,30 @@ class FeatureFieldModel(NerfactoModel):
                 # Port rendering logic: aggregate logits along ray, then softmax for viz/loss
                 foreground_logits = self.renderer_spread(values=fg_vals, weights=custom_weights)
                 del fg_vals
+
             if render_orientany and self.config.orientany_enable:
-                orientany_vals = self.feature_field.get_orientany(ray_samples, density_embedding=density_embedding)
-                if not self.training:  # High-dimensional OrientAny (902D)
-                    with torch.no_grad():
-                        orientany_vals_cpu = orientany_vals.detach().cpu()
-                        weights_cpu = custom_weights.detach().cpu()
-                        orientany_logits_cpu = self.renderer_spread(values=orientany_vals_cpu, weights=weights_cpu)
-                        orientany_logits = orientany_logits_cpu.to(orientany_vals.device, non_blocking=True)
-                        del orientany_vals_cpu, weights_cpu, orientany_logits_cpu
-                else:
-                    # Port rendering logic: aggregate logits along ray, then softmax for viz/loss
-                    orientany_logits = self.renderer_spread(values=orientany_vals, weights=custom_weights)
-                del orientany_vals
+                # Get separate OrientAny outputs (density_embedding might be None if not needed)
+                orientany_azimuth_vals = self.feature_field.get_orientany_azimuth(ray_samples, density_embedding=density_embedding)
+                orientany_polar_vals = self.feature_field.get_orientany_polar(ray_samples, density_embedding=density_embedding)
+                orientany_roll_vals = self.feature_field.get_orientany_roll(ray_samples, density_embedding=density_embedding)
+                orientany_foreground_vals = self.feature_field.get_orientany_foreground(ray_samples, density_embedding=density_embedding)
+
+                # Render each component separately (simplified - always on same device)
+                orientany_azimuth_logits = self.renderer_spread(values=orientany_azimuth_vals, weights=custom_weights)
+                orientany_polar_logits = self.renderer_spread(values=orientany_polar_vals, weights=custom_weights)
+                orientany_roll_logits = self.renderer_spread(values=orientany_roll_vals, weights=custom_weights)
+                orientany_foreground_logits = self.renderer_spread(values=orientany_foreground_vals, weights=custom_weights)
+
+                # Concatenate for backward compatibility
+                orientany_logits = torch.cat([orientany_azimuth_logits, orientany_polar_logits, orientany_roll_logits, orientany_foreground_logits], dim=-1)
+
+                # Clean up intermediates
+                del orientany_azimuth_vals, orientany_polar_vals, orientany_roll_vals, orientany_foreground_vals
+                del orientany_azimuth_logits, orientany_polar_logits, orientany_roll_logits, orientany_foreground_logits
+
+            # Clean up density embedding if it was created (after all heads have used it)
+            if density_embedding is not None:
+                del density_embedding
 
         outputs = {
             "rgb": rgb,
@@ -421,89 +430,45 @@ class FeatureFieldModel(NerfactoModel):
             ce = F.cross_entropy(fg_logits, fg_target_idx)
             loss_dict["foreground_loss"] = self.config.foreground_loss_weight * ce
 
-        # OrientAny classification loss (2 von Mises + 1 normal + 1 foreground loss)
+        # OrientAny classification loss (4 separate losses: azimuth, polar, roll, foreground)
         if self.config.orientany_enable and ("orientany_logits" in outputs) and ("orientany" in batch):
-            orientany_logits = outputs["orientany_logits"].view(-1, 902)  # (N, 902)
+            orientany_logits = outputs["orientany_logits"].view(-1, 902).to(self.device)  # (N, 902) - ensure on correct device
             orientany_target = batch["orientany"].to(self.device, non_blocking=True)  # (N, 10) - compact GT
 
             # Split logits into components
             gaus_ax_logits = orientany_logits[:, 0:360]      # azimuth logits
             gaus_pl_logits = orientany_logits[:, 360:540]    # polar logits
             gaus_ro_logits = orientany_logits[:, 540:900]    # roll logits
-            fg_logits = orientany_logits[:, 900:902]         # foreground logits
+            orientany_fg_logits = orientany_logits[:, 900:902]  # OrientAny foreground logits
 
             # Extract GT parameters
-            fg_target = orientany_target[:, 8:10]  # foreground one-hot
-            fg_mask = fg_target[:, 1] > 0.5  # GT foreground pixels
+            orientany_fg_target = orientany_target[:, 8:10]  # OrientAny foreground one-hot
+            orientany_fg_mask = orientany_fg_target[:, 1] > 0.5  # GT foreground pixels
 
-            # Foreground loss: supervise all pixels (always computed)
-            ce_fg = F.cross_entropy(fg_logits, fg_target.argmax(dim=-1))
+            # OrientAny foreground loss: supervise all pixels (use CE for stability)
+            orientany_fg_target_idx = orientany_fg_target.argmax(dim=-1)
+            orientany_fg_loss = F.cross_entropy(orientany_fg_logits, orientany_fg_target_idx)
+            loss_dict["orientany_foreground_loss"] = self.config.orientany_loss_weight * orientany_fg_loss
 
-            # Orientation losses: only for GT foreground pixels
-            if fg_mask.any():
-                # Extract distribution parameters for GT foreground pixels
-                fg_indices = fg_mask.nonzero(as_tuple=True)[0]
-                ax_mean_fg = orientany_target[fg_indices, 0]    # azimuth mean
-                ax_kappa_fg = orientany_target[fg_indices, 1]   # azimuth kappa
-                pl_mean_fg = orientany_target[fg_indices, 2]    # polar mean
-                pl_std_fg = orientany_target[fg_indices, 3]     # polar std
-                ro_mean_fg = orientany_target[fg_indices, 4]    # roll mean
-                ro_kappa_fg = orientany_target[fg_indices, 5]   # roll kappa
+            # Orientation losses: only for GT foreground pixels, no supervision for background
+            if orientany_fg_mask.any():
+                # Foreground pixels only
+                fg_indices = orientany_fg_mask.nonzero(as_tuple=True)[0]
+                # Convert GT means to discrete class indices
+                ax_idx = torch.clamp(torch.round(orientany_target[fg_indices, 0]), 0, 359).long()
+                pl_idx = torch.clamp(torch.round(orientany_target[fg_indices, 2]), 0, 179).long()
+                ro_idx = torch.clamp(torch.round(orientany_target[fg_indices, 4]), 0, 359).long()
 
-                # Clamp distribution parameters to valid ranges to prevent NaN
-                ax_kappa_fg = torch.clamp(ax_kappa_fg, min=1e-6, max=100.0)
-                pl_std_fg = torch.clamp(pl_std_fg, min=1e-6, max=180.0)
-                ro_kappa_fg = torch.clamp(ro_kappa_fg, min=1e-6, max=100.0)
+                # Cross-entropy losses (more stable)
+                ce_ax = F.cross_entropy(gaus_ax_logits[fg_indices], ax_idx)
+                ce_pl = F.cross_entropy(gaus_pl_logits[fg_indices], pl_idx)
+                ce_ro = F.cross_entropy(gaus_ro_logits[fg_indices], ro_idx)
 
-                # Generate target distributions
-                ax_target_probs = von_mises_to_probs(ax_mean_fg, ax_kappa_fg, n_bins=360, angle_min_deg=0.0, period_deg=360.0)
-                pl_target_probs = normal_to_probs(pl_mean_fg, pl_std_fg, n_bins=180, angle_min_deg=0.0, period_deg=180.0)
-                ro_target_probs = von_mises_to_probs(ro_mean_fg, ro_kappa_fg, n_bins=360, angle_min_deg=0.0, period_deg=360.0)
-
-                # Ensure target probabilities are valid (sum to 1, no NaN/inf)
-                ax_target_probs = ax_target_probs / (ax_target_probs.sum(dim=-1, keepdim=True) + 1e-8)
-                pl_target_probs = pl_target_probs / (pl_target_probs.sum(dim=-1, keepdim=True) + 1e-8)
-                ro_target_probs = ro_target_probs / (ro_target_probs.sum(dim=-1, keepdim=True) + 1e-8)
-
-                # Model probabilities for GT foreground pixels only
-                ax_probs = F.softmax(gaus_ax_logits[fg_mask], dim=-1)
-                pl_probs = F.softmax(gaus_pl_logits[fg_mask], dim=-1)
-                ro_probs = F.softmax(gaus_ro_logits[fg_mask], dim=-1)
-
-                # Add small epsilon to prevent log(0) in KL divergence
-                ax_probs = ax_probs + 1e-8
-                pl_probs = pl_probs + 1e-8
-                ro_probs = ro_probs + 1e-8
-                ax_target_probs = ax_target_probs + 1e-8
-                pl_target_probs = pl_target_probs + 1e-8
-                ro_target_probs = ro_target_probs + 1e-8
-
-                # KL divergence losses
-                kl_azimuth = F.kl_div(ax_probs.log(), ax_target_probs, reduction='batchmean')
-                kl_polar = F.kl_div(pl_probs.log(), pl_target_probs, reduction='batchmean')
-                kl_roll = F.kl_div(ro_probs.log(), ro_target_probs, reduction='batchmean')
-
-                # Check for NaN in individual losses and replace with zero if found
-                if torch.isnan(kl_azimuth):
-                    kl_azimuth = torch.zeros_like(kl_azimuth)
-                if torch.isnan(kl_polar):
-                    kl_polar = torch.zeros_like(kl_polar)
-                if torch.isnan(kl_roll):
-                    kl_roll = torch.zeros_like(kl_roll)
-            else:
-                # No GT foreground pixels - orientation losses are zero but keep gradients
-                kl_azimuth = torch.zeros(1, device=self.device, requires_grad=True).sum()
-                kl_polar = torch.zeros(1, device=self.device, requires_grad=True).sum()
-                kl_roll = torch.zeros(1, device=self.device, requires_grad=True).sum()
-
-            # Combine losses
-            orientany_loss = kl_azimuth + kl_polar + kl_roll + ce_fg
-
-            # Final NaN check and replacement
-            if torch.isnan(orientany_loss):
-                orientany_loss = torch.zeros_like(orientany_loss)
-
-            loss_dict["orientany_loss"] = self.config.orientany_loss_weight * orientany_loss
+                # Store separate losses (don't add them)
+                loss_dict["orientany_azimuth_loss"] = self.config.orientany_loss_weight * ce_ax
+                loss_dict["orientany_polar_loss"] = self.config.orientany_loss_weight * ce_pl
+                loss_dict["orientany_roll_loss"] = self.config.orientany_loss_weight * ce_ro
+            # No else clause - background pixels get no supervision at all
         # Centroid loss (supervision via cache).
         if self.training and self.config.centroid_enable and getattr(self, "_train_centroid_cache_enabled", False):
             full_cache = self._get_train_centroid_cache()  # type: ignore[attr-defined]
@@ -667,11 +632,14 @@ class FeatureFieldModel(NerfactoModel):
             gaus_ax_pred = orientany_logits[..., 0:360].argmax(dim=-1)      # 0-359 (azimuth logits)
             gaus_pl_pred = orientany_logits[..., 360:540].argmax(dim=-1)    # 0-179 (polar logits)
             gaus_ro_pred = orientany_logits[..., 540:900].argmax(dim=-1)    # 0-359 (roll logits)
-            fg_logits = orientany_logits[..., 900:902]                      # foreground logits
+            orientany_fg_logits = orientany_logits[..., 900:902]             # OrientAny foreground logits
 
             # Get foreground mask from predictions
-            fg_probs = torch.softmax(fg_logits, dim=-1)
-            fg_mask = fg_probs[..., 1] > 0.5  # foreground pixels
+            orientany_fg_probs = torch.softmax(orientany_fg_logits, dim=-1)
+            orientany_fg_mask = orientany_fg_probs[..., 1] > 0.5  # foreground pixels
+
+            # OrientAny foreground visualization: apply softmax on aggregated logits for class-1
+            outputs["orientany_foreground_prob_rgb"] = self.prob_from_probs_shader(orientany_fg_probs[..., 1:2])
 
             # Convert to RGB: azimuth->R, polar->G, roll->B (on CPU)
             orient_rgb = torch.zeros((*orientany_logits.shape[:-1], 3), dtype=torch.float32)
@@ -680,7 +648,7 @@ class FeatureFieldModel(NerfactoModel):
             orient_rgb[..., 2] = gaus_ro_pred.float() / 359.0  # B: roll
 
             # Only show colors for foreground pixels (set background to black)
-            orient_rgb[~fg_mask] = 0.0
+            orient_rgb[~orientany_fg_mask] = 0.0
 
             # Keep on CPU for memory efficiency
             outputs["orientany_rgb"] = orient_rgb
@@ -750,6 +718,8 @@ class FeatureFieldModel(NerfactoModel):
             images_dict["foreground_prob_rgb"] = outputs["foreground_prob_rgb"]
         if "orientany_rgb" in outputs:
             images_dict["orientany_rgb"] = outputs["orientany_rgb"]
+        if "orientany_foreground_prob_rgb" in outputs:
+            images_dict["orientany_foreground_prob_rgb"] = outputs["orientany_foreground_prob_rgb"]
 
         # Foreground GT and side-by-side viz
         if self.config.foreground_enable and ("foreground" in batch) and ("foreground_prob_rgb" in outputs):
@@ -777,7 +747,7 @@ class FeatureFieldModel(NerfactoModel):
             ax_mean_gt = orientany_gt[..., 0].cpu()  # azimuth mean
             pl_mean_gt = orientany_gt[..., 2].cpu()  # polar mean
             ro_mean_gt = orientany_gt[..., 4].cpu()  # roll mean
-            fg_gt = orientany_gt[..., 9].cpu() > 0.5  # foreground mask from GT
+            orientany_fg_gt = orientany_gt[..., 9].cpu() > 0.5  # OrientAny foreground mask from GT
 
             orientany_gt_rgb = torch.zeros((*orientany_gt.shape[:-1], 3), device="cpu")
             orientany_gt_rgb[..., 0] = torch.clamp(ax_mean_gt / 359.0, 0, 1)
@@ -785,10 +755,17 @@ class FeatureFieldModel(NerfactoModel):
             orientany_gt_rgb[..., 2] = torch.clamp(ro_mean_gt / 359.0, 0, 1)
 
             # Only show colors for foreground pixels (set background to black)
-            orientany_gt_rgb[~fg_gt] = 0.0
+            orientany_gt_rgb[~orientany_fg_gt] = 0.0
 
             images_dict["orientany_gt_rgb"] = orientany_gt_rgb
             images_dict["orientany_vs_gt"] = torch.cat([outputs["orientany_rgb"], orientany_gt_rgb], dim=1)
+
+            # OrientAny foreground GT visualization
+            orientany_fg_gt_prob = orientany_gt[..., 9:10].cpu()  # OrientAny foreground probability from GT
+            orientany_fg_gt_rgb = self.prob_from_probs_shader(orientany_fg_gt_prob)
+            images_dict["orientany_foreground_prob_gt"] = orientany_fg_gt_rgb
+            if "orientany_foreground_prob_rgb" in outputs:
+                images_dict["orientany_foreground_prob_vs_gt"] = torch.cat([outputs["orientany_foreground_prob_rgb"], orientany_fg_gt_rgb], dim=1)
 
         # Centroid spread: side-by-side preds vs GTs
         if ("centroid_spread_prob_rgb" in images_dict) and ("centroid_spread_prob_gt_rgb" in outputs):

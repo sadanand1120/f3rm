@@ -53,8 +53,8 @@ class FeatureField(Field):
         # Foreground head MLP (binary classification with 2 logits)
         foreground_hidden_dim: int = 64,
         foreground_num_layers: int = 2,
-        # OrientAny head MLP (902 logits: 360 azimuth + 180 polar + 360 roll + 2 foreground)
-        orientany_hidden_dim: int = 128,
+        # OrientAny head MLP (4 separate heads: 360 azimuth + 180 polar + 360 roll + 2 foreground)
+        orientany_hidden_dim: int = 64,
         orientany_num_layers: int = 3,
         # Optional trunk tap from centroid-spread encoder
         centroid_spread_trunk_fg: int = 0,
@@ -160,11 +160,52 @@ class FeatureField(Field):
             },
         )
 
-        # OrientAny head (902 logits: 360 azimuth + 180 polar + 360 roll + 2 foreground)
+        # OrientAny heads (4 separate MLPs: azimuth, polar, roll, foreground)
         mlp_in_dims_orientany = self.encoding.n_output_dims + (density_embedding_dim if self.cond_on_density_orientany else 0) + (self.centroid_spread_trunk_orientany if self.centroid_spread_trunk_orientany > 0 else 0)
-        self.mlp_orientany = tcnn.Network(
+
+        # Azimuth head (360 logits for 0-359 degrees)
+        self.mlp_orientany_azimuth = tcnn.Network(
             n_input_dims=mlp_in_dims_orientany,
-            n_output_dims=902,
+            n_output_dims=360,
+            network_config={
+                "otype": "FullyFusedMLP",
+                "activation": "ReLU",
+                "output_activation": "None",
+                "n_neurons": orientany_hidden_dim,
+                "n_hidden_layers": orientany_num_layers,
+            },
+        )
+
+        # Polar head (180 logits for 0-179 degrees)
+        self.mlp_orientany_polar = tcnn.Network(
+            n_input_dims=mlp_in_dims_orientany,
+            n_output_dims=180,
+            network_config={
+                "otype": "FullyFusedMLP",
+                "activation": "ReLU",
+                "output_activation": "None",
+                "n_neurons": orientany_hidden_dim,
+                "n_hidden_layers": orientany_num_layers,
+            },
+        )
+
+        # Roll head (360 logits for 0-359 degrees)
+        self.mlp_orientany_roll = tcnn.Network(
+            n_input_dims=mlp_in_dims_orientany,
+            n_output_dims=360,
+            network_config={
+                "otype": "FullyFusedMLP",
+                "activation": "ReLU",
+                "output_activation": "None",
+                "n_neurons": orientany_hidden_dim,
+                "n_hidden_layers": orientany_num_layers,
+            },
+        )
+
+        # OrientAny foreground head (2 logits for binary classification)
+        self.mlp_orientany_foreground = tcnn.Network(
+            n_input_dims=mlp_in_dims_orientany,
+            n_output_dims=2,
             network_config={
                 "otype": "FullyFusedMLP",
                 "activation": "ReLU",
@@ -244,11 +285,11 @@ class FeatureField(Field):
         logits = self.mlp_foreground(encoded_fg).view(*ray_samples.frustums.directions.shape[:-1], -1)
         return logits
 
-    def get_orientany(self, ray_samples: RaySamples, density_embedding: Optional[Tensor] = None) -> Tensor:
+    def get_orientany_azimuth(self, ray_samples: RaySamples, density_embedding: Optional[Tensor] = None) -> Tensor:
         encoded_base = self._encode_positions(ray_samples)
         parts = [encoded_base]
         if self.cond_on_density_orientany and density_embedding is not None:
-            cond = density_embedding.view(-1, density_embedding.shape[-1]).to(encoded_base)
+            cond = density_embedding.view(-1, density_embedding.shape[-1])
             if not self.orientany_grad_to_density:
                 cond = cond.detach()
             parts.append(cond)
@@ -264,16 +305,92 @@ class FeatureField(Field):
                 trunk_feat = trunk_feat.detach()
             parts.append(trunk_feat)
         encoded_orientany = torch.cat(parts, dim=-1)
-        logits = self.mlp_orientany(encoded_orientany).view(*ray_samples.frustums.directions.shape[:-1], -1)
+        logits = self.mlp_orientany_azimuth(encoded_orientany).view(*ray_samples.frustums.directions.shape[:-1], -1)
+        return logits
+
+    def get_orientany_polar(self, ray_samples: RaySamples, density_embedding: Optional[Tensor] = None) -> Tensor:
+        encoded_base = self._encode_positions(ray_samples)
+        parts = [encoded_base]
+        if self.cond_on_density_orientany and density_embedding is not None:
+            cond = density_embedding.view(-1, density_embedding.shape[-1])
+            if not self.orientany_grad_to_density:
+                cond = cond.detach()
+            parts.append(cond)
+        # Append optional centroid-spread trunk features if enabled
+        if self.centroid_spread_trunk_orientany > 0:
+            # Get the full centroid spread output and extract trunk features
+            spread_full = self.get_centroid_spread(ray_samples, density_embedding=density_embedding, return_full=True)
+            # Trunk starts after 4 channels: [err, fg_logit, soft0_logit, soft1_logit]
+            trunk_feat = spread_full[..., 4:4 + self.centroid_spread_trunk_orientany]
+            # Flatten trunk features to match encoded_base shape for concatenation
+            trunk_feat = trunk_feat.view(-1, self.centroid_spread_trunk_orientany)
+            if not self.orientany_trunk_grad_to_spread:
+                trunk_feat = trunk_feat.detach()
+            parts.append(trunk_feat)
+        encoded_orientany = torch.cat(parts, dim=-1)
+        logits = self.mlp_orientany_polar(encoded_orientany).view(*ray_samples.frustums.directions.shape[:-1], -1)
+        return logits
+
+    def get_orientany_roll(self, ray_samples: RaySamples, density_embedding: Optional[Tensor] = None) -> Tensor:
+        encoded_base = self._encode_positions(ray_samples)
+        parts = [encoded_base]
+        if self.cond_on_density_orientany and density_embedding is not None:
+            cond = density_embedding.view(-1, density_embedding.shape[-1])
+            if not self.orientany_grad_to_density:
+                cond = cond.detach()
+            parts.append(cond)
+        # Append optional centroid-spread trunk features if enabled
+        if self.centroid_spread_trunk_orientany > 0:
+            # Get the full centroid spread output and extract trunk features
+            spread_full = self.get_centroid_spread(ray_samples, density_embedding=density_embedding, return_full=True)
+            # Trunk starts after 4 channels: [err, fg_logit, soft0_logit, soft1_logit]
+            trunk_feat = spread_full[..., 4:4 + self.centroid_spread_trunk_orientany]
+            # Flatten trunk features to match encoded_base shape for concatenation
+            trunk_feat = trunk_feat.view(-1, self.centroid_spread_trunk_orientany)
+            if not self.orientany_trunk_grad_to_spread:
+                trunk_feat = trunk_feat.detach()
+            parts.append(trunk_feat)
+        encoded_orientany = torch.cat(parts, dim=-1)
+        logits = self.mlp_orientany_roll(encoded_orientany).view(*ray_samples.frustums.directions.shape[:-1], -1)
+        return logits
+
+    def get_orientany_foreground(self, ray_samples: RaySamples, density_embedding: Optional[Tensor] = None) -> Tensor:
+        encoded_base = self._encode_positions(ray_samples)
+        parts = [encoded_base]
+        if self.cond_on_density_orientany and density_embedding is not None:
+            cond = density_embedding.view(-1, density_embedding.shape[-1])
+            if not self.orientany_grad_to_density:
+                cond = cond.detach()
+            parts.append(cond)
+        # Append optional centroid-spread trunk features if enabled
+        if self.centroid_spread_trunk_orientany > 0:
+            # Get the full centroid spread output and extract trunk features
+            spread_full = self.get_centroid_spread(ray_samples, density_embedding=density_embedding, return_full=True)
+            # Trunk starts after 4 channels: [err, fg_logit, soft0_logit, soft1_logit]
+            trunk_feat = spread_full[..., 4:4 + self.centroid_spread_trunk_orientany]
+            # Flatten trunk features to match encoded_base shape for concatenation
+            trunk_feat = trunk_feat.view(-1, self.centroid_spread_trunk_orientany)
+            if not self.orientany_trunk_grad_to_spread:
+                trunk_feat = trunk_feat.detach()
+            parts.append(trunk_feat)
+        encoded_orientany = torch.cat(parts, dim=-1)
+        logits = self.mlp_orientany_foreground(encoded_orientany).view(*ray_samples.frustums.directions.shape[:-1], -1)
         return logits
 
     def get_outputs(self, ray_samples: RaySamples, density_embedding: Optional[Tensor] = None) -> Dict[FieldHeadNames, Tensor]:
-        """Backward-compatible method that computes both heads."""
+        """Compute all field outputs."""
         features = self.get_feature(ray_samples, density_embedding=density_embedding)
         centroid = self.get_centroid(ray_samples, density_embedding=density_embedding)
         centroid_spread = self.get_centroid_spread(ray_samples, density_embedding=density_embedding)
         foreground = self.get_foreground(ray_samples, density_embedding=density_embedding)
-        orientany = self.get_orientany(ray_samples, density_embedding=density_embedding)
+
+        # Get OrientAny components and concatenate
+        azimuth = self.get_orientany_azimuth(ray_samples, density_embedding)
+        polar = self.get_orientany_polar(ray_samples, density_embedding)
+        roll = self.get_orientany_roll(ray_samples, density_embedding)
+        orientany_fg = self.get_orientany_foreground(ray_samples, density_embedding)
+        orientany = torch.cat([azimuth, polar, roll, orientany_fg], dim=-1)
+
         return {
             FeatureFieldHeadNames.FEATURE: features,
             FeatureFieldHeadNames.CENTROID: centroid,
