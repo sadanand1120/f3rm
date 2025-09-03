@@ -59,6 +59,8 @@ class FeatureField(Field):
         # Optional trunk tap from centroid-spread encoder
         centroid_spread_trunk_fg: int = 0,
         foreground_trunk_grad_to_spread: bool = False,
+        # OrientAny input controls: xyz encoding and/or spread trunk
+        orientany_use_xyz_encoding: bool = True,
         centroid_spread_trunk_orientany: int = 0,
         orientany_trunk_grad_to_spread: bool = False,
     ):
@@ -76,8 +78,12 @@ class FeatureField(Field):
         # Foreground head shares the same positional encoding as other heads (no direction encoding)
         self.centroid_spread_trunk_fg = int(centroid_spread_trunk_fg)
         self.foreground_trunk_grad_to_spread = bool(foreground_trunk_grad_to_spread)
+        self.orientany_use_xyz_encoding = bool(orientany_use_xyz_encoding)
         self.centroid_spread_trunk_orientany = int(centroid_spread_trunk_orientany)
         self.orientany_trunk_grad_to_spread = bool(orientany_trunk_grad_to_spread)
+
+        # Assert that OrientAny heads have at least one input source
+        assert orientany_use_xyz_encoding or centroid_spread_trunk_orientany > 0, "OrientAny heads must have at least one input source: xyz encoding or spread trunk"
 
         # Feature field has its own hash grid
         growth_factor = np.exp((np.log(max_res) - np.log(start_res)) / (num_levels - 1))
@@ -161,7 +167,7 @@ class FeatureField(Field):
         )
 
         # OrientAny heads (4 separate MLPs: azimuth, polar, roll, foreground)
-        mlp_in_dims_orientany = self.encoding.n_output_dims + (density_embedding_dim if self.cond_on_density_orientany else 0) + (self.centroid_spread_trunk_orientany if self.centroid_spread_trunk_orientany > 0 else 0)
+        mlp_in_dims_orientany = (self.encoding.n_output_dims if self.orientany_use_xyz_encoding else 0) + (density_embedding_dim if self.cond_on_density_orientany else 0) + (self.centroid_spread_trunk_orientany if self.centroid_spread_trunk_orientany > 0 else 0)
 
         # Azimuth head (360 logits for 0-359 degrees)
         self.mlp_orientany_azimuth = tcnn.Network(
@@ -286,8 +292,10 @@ class FeatureField(Field):
         return logits
 
     def get_orientany_azimuth(self, ray_samples: RaySamples, density_embedding: Optional[Tensor] = None) -> Tensor:
-        encoded_base = self._encode_positions(ray_samples)
-        parts = [encoded_base]
+        parts = []
+        if self.orientany_use_xyz_encoding:
+            encoded_base = self._encode_positions(ray_samples)
+            parts.append(encoded_base)
         if self.cond_on_density_orientany and density_embedding is not None:
             cond = density_embedding.view(-1, density_embedding.shape[-1])
             if not self.orientany_grad_to_density:
@@ -309,8 +317,10 @@ class FeatureField(Field):
         return logits
 
     def get_orientany_polar(self, ray_samples: RaySamples, density_embedding: Optional[Tensor] = None) -> Tensor:
-        encoded_base = self._encode_positions(ray_samples)
-        parts = [encoded_base]
+        parts = []
+        if self.orientany_use_xyz_encoding:
+            encoded_base = self._encode_positions(ray_samples)
+            parts.append(encoded_base)
         if self.cond_on_density_orientany and density_embedding is not None:
             cond = density_embedding.view(-1, density_embedding.shape[-1])
             if not self.orientany_grad_to_density:
@@ -332,8 +342,10 @@ class FeatureField(Field):
         return logits
 
     def get_orientany_roll(self, ray_samples: RaySamples, density_embedding: Optional[Tensor] = None) -> Tensor:
-        encoded_base = self._encode_positions(ray_samples)
-        parts = [encoded_base]
+        parts = []
+        if self.orientany_use_xyz_encoding:
+            encoded_base = self._encode_positions(ray_samples)
+            parts.append(encoded_base)
         if self.cond_on_density_orientany and density_embedding is not None:
             cond = density_embedding.view(-1, density_embedding.shape[-1])
             if not self.orientany_grad_to_density:
@@ -355,8 +367,10 @@ class FeatureField(Field):
         return logits
 
     def get_orientany_foreground(self, ray_samples: RaySamples, density_embedding: Optional[Tensor] = None) -> Tensor:
-        encoded_base = self._encode_positions(ray_samples)
-        parts = [encoded_base]
+        parts = []
+        if self.orientany_use_xyz_encoding:
+            encoded_base = self._encode_positions(ray_samples)
+            parts.append(encoded_base)
         if self.cond_on_density_orientany and density_embedding is not None:
             cond = density_embedding.view(-1, density_embedding.shape[-1])
             if not self.orientany_grad_to_density:

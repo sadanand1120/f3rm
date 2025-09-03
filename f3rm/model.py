@@ -89,6 +89,8 @@ class FeatureFieldModelConfig(NerfactoModelConfig):
     orientany_condition_density_grad_to_nerf: bool = False  # Allow OrientAny head gradients into NeRF density embedding
     orientany_hidden_dim: int = 64  # OrientAny head hidden dim
     orientany_num_layers: int = 3  # OrientAny head num layers (deeper due to complexity)
+    # OrientAny input controls: xyz encoding and/or spread trunk
+    orientany_use_xyz_encoding: bool = True  # Use xyz positional encoding as input
     centroid_spread_trunk_orientany: int = 16  # 0 disables spread trunk input
     orientany_trunk_grad_to_spread: bool = False  # Allow OrientAny head gradients into centroid-spread trunk
 
@@ -204,6 +206,7 @@ class FeatureFieldModel(NerfactoModel):
             foreground_num_layers=self.config.foreground_num_layers,
             orientany_hidden_dim=self.config.orientany_hidden_dim,
             orientany_num_layers=self.config.orientany_num_layers,
+            orientany_use_xyz_encoding=self.config.orientany_use_xyz_encoding,
             centroid_spread_trunk_fg=self.config.centroid_spread_trunk_fg,
             foreground_trunk_grad_to_spread=self.config.foreground_trunk_grad_to_spread,
             centroid_spread_trunk_orientany=self.config.centroid_spread_trunk_orientany,
@@ -336,18 +339,33 @@ class FeatureFieldModel(NerfactoModel):
                 orientany_roll_vals = self.feature_field.get_orientany_roll(ray_samples, density_embedding=density_embedding)
                 orientany_foreground_vals = self.feature_field.get_orientany_foreground(ray_samples, density_embedding=density_embedding)
 
-                # Render each component separately (simplified - always on same device)
-                orientany_azimuth_logits = self.renderer_spread(values=orientany_azimuth_vals, weights=custom_weights)
-                orientany_polar_logits = self.renderer_spread(values=orientany_polar_vals, weights=custom_weights)
-                orientany_roll_logits = self.renderer_spread(values=orientany_roll_vals, weights=custom_weights)
-                orientany_foreground_logits = self.renderer_spread(values=orientany_foreground_vals, weights=custom_weights)
+                if not self.training:  # Eval: render on CPU for memory efficiency
+                    orientany_azimuth_logits_cpu = self.renderer_spread(values=orientany_azimuth_vals.cpu(), weights=custom_weights.cpu())
+                    orientany_polar_logits_cpu = self.renderer_spread(values=orientany_polar_vals.cpu(), weights=custom_weights.cpu())
+                    orientany_roll_logits_cpu = self.renderer_spread(values=orientany_roll_vals.cpu(), weights=custom_weights.cpu())
+                    orientany_foreground_logits_cpu = self.renderer_spread(values=orientany_foreground_vals.cpu(), weights=custom_weights.cpu())
 
-                # Concatenate for backward compatibility
-                orientany_logits = torch.cat([orientany_azimuth_logits, orientany_polar_logits, orientany_roll_logits, orientany_foreground_logits], dim=-1)
+                    # Concatenate on CPU for backward compatibility
+                    orientany_logits = torch.cat([orientany_azimuth_logits_cpu, orientany_polar_logits_cpu, orientany_roll_logits_cpu, orientany_foreground_logits_cpu], dim=-1)
+                    orientany_logits = orientany_logits.to(orientany_azimuth_vals.device, non_blocking=True)
 
-                # Clean up intermediates
+                    # Clean up CPU intermediates
+                    del orientany_azimuth_logits_cpu, orientany_polar_logits_cpu, orientany_roll_logits_cpu, orientany_foreground_logits_cpu
+                else:
+                    # Training: render each component separately on GPU
+                    orientany_azimuth_logits = self.renderer_spread(values=orientany_azimuth_vals, weights=custom_weights)
+                    orientany_polar_logits = self.renderer_spread(values=orientany_polar_vals, weights=custom_weights)
+                    orientany_roll_logits = self.renderer_spread(values=orientany_roll_vals, weights=custom_weights)
+                    orientany_foreground_logits = self.renderer_spread(values=orientany_foreground_vals, weights=custom_weights)
+
+                    # Concatenate for backward compatibility
+                    orientany_logits = torch.cat([orientany_azimuth_logits, orientany_polar_logits, orientany_roll_logits, orientany_foreground_logits], dim=-1)
+
+                    # Clean up GPU intermediates
+                    del orientany_azimuth_logits, orientany_polar_logits, orientany_roll_logits, orientany_foreground_logits
+
+                # Clean up input values
                 del orientany_azimuth_vals, orientany_polar_vals, orientany_roll_vals, orientany_foreground_vals
-                del orientany_azimuth_logits, orientany_polar_logits, orientany_roll_logits, orientany_foreground_logits
 
             # Clean up density embedding if it was created (after all heads have used it)
             if density_embedding is not None:

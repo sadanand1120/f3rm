@@ -16,6 +16,7 @@ from f3rm.pipeline import FeaturePipelineConfig
 # TODO: reduce training time, look at original feature loading (.pt based) in f3rm, maybe thats the issue?
 # TODO: do model compression so training time is reduced as well, instead of having separate entire MLPs, just have a larger common trunk where possible, and have separate output heads
 # TODO: hardcoded model config in orientany, then later after you unstash orientany, add asserts for these assumed model config in pipeline etc
+# TODO: review all code here and clean up abuse of usage of no_grad() vs detach(): https://www.geeksforgeeks.org/deep-learning/difference-between-detach-and-with-torchnograd-in-pytorch/
 f3rm_method = MethodSpecification(
     config=F3RMTrainerConfig(
         method_name="f3rm",
@@ -78,6 +79,8 @@ f3rm_method = MethodSpecification(
                 orientany_loss_weight=2e-3,
                 orientany_hidden_dim=64,
                 orientany_num_layers=1,
+                # OrientAny input controls: xyz encoding and/or spread trunk
+                orientany_use_xyz_encoding=True,
                 centroid_spread_trunk_orientany=64,
                 orientany_trunk_grad_to_spread=False,
             ),
