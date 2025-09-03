@@ -1,14 +1,18 @@
 from dataclasses import dataclass, field
 from typing import Dict, List, Literal, Optional, Type, Tuple
+from pathlib import Path
+from time import time
 
 import torch
 import numpy as np
 
 from nerfstudio.pipelines.base_pipeline import VanillaPipeline, VanillaPipelineConfig
+from nerfstudio.data.datamanagers.base_datamanager import VanillaDataManager
 from nerfstudio.utils import colormaps, writer
 from nerfstudio.utils import profiler
 from nerfstudio.utils.misc import step_check
 from rich.progress import Progress, BarColumn, TimeElapsedColumn, TextColumn
+from PIL import Image
 
 from sam2.features.utils import SAM2utils
 from f3rm.features.sam2_extract import SAM2Args
@@ -146,8 +150,8 @@ class FeaturePipeline(VanillaPipeline):
             ) as progress:
                 task = progress.add_task("Caching train centroid/depth", total=len(unique_cams))
                 for ci in unique_cams:
-                    # After cold start, render centroid preds to enable EMA (if enabled) and spread logic; skip feature rendering
-                    images = self._render_full_image_images_for_camera(ci, render_features=False, render_centroid=need_centroid_preds, render_foreground=self.model.config.foreground_enable)
+                    # After cold start, render centroid preds to enable EMA (if enabled) and spread logic; skip feature rendering and OrientAny for cache
+                    images = self._render_full_image_images_for_camera(ci, render_features=False, render_centroid=need_centroid_preds, render_foreground=self.model.config.foreground_enable, render_orientany=False)
                     if images is not None:
                         self._train_depth_cache[ci] = images["depth_raw"].detach()
                         c_img, v_img, c_rgb, s_img, s_err_rgb, s_prob_rgb, s_valid = self._compute_centroid_and_spread_gt_for_camera(ci, images, allow_blend=allow_blend)
@@ -165,10 +169,13 @@ class FeaturePipeline(VanillaPipeline):
                             rep_spread_prob_rgb = s_prob_rgb
                         if rep_depth is None:
                             rep_depth = images["depth"]
+                        # # TODO: Do you need this for VRAM management? Aggressive cleanup after each camera
+                        # del images, c_img, v_img, c_rgb, s_img, s_err_rgb, s_prob_rgb, s_valid
+                        # torch.cuda.empty_cache()
                     progress.advance(task)
         else:
             for ci in unique_cams:
-                images = self._render_full_image_images_for_camera(ci, render_features=False, render_centroid=need_centroid_preds, render_foreground=self.model.config.foreground_enable)
+                images = self._render_full_image_images_for_camera(ci, render_features=False, render_centroid=need_centroid_preds, render_foreground=self.model.config.foreground_enable, render_orientany=False)
                 if images is not None:
                     self._train_depth_cache[ci] = images["depth_raw"].detach()
                     c_img, v_img, _, s_img, _, _, s_valid = self._compute_centroid_and_spread_gt_for_camera(ci, images, allow_blend=allow_blend)
@@ -180,6 +187,9 @@ class FeaturePipeline(VanillaPipeline):
                     images["centroid_spread_prob_soft_gt_full"] = torch.cat([1.0 - s_img[..., 1:2], s_img[..., 1:2]], dim=-1)
                     if rep_depth is None:
                         rep_depth = images["depth"]
+                    # # TODO: Do you need this for VRAM management? Aggressive cleanup after each camera
+                    # del images, c_img, v_img, s_img, s_valid
+                    # torch.cuda.empty_cache()
 
         # Log one representative image to keep overhead minimal (post cold-start only)
         if getattr(self.model, "_train_centroid_cache_enabled", False):
@@ -192,30 +202,33 @@ class FeaturePipeline(VanillaPipeline):
             if rep_spread_prob_rgb is not None:
                 writer.put_image(name="Train Cache Images/centroid_spread_prob", image=rep_spread_prob_rgb, step=step)
 
-    def _render_full_image_images_for_camera(self, camera_index: int, render_features: bool = True, render_centroid: bool = True, render_foreground: bool = True) -> Optional[Dict[str, torch.Tensor]]:
+    def _render_full_image_images_for_camera(self, camera_index: int, render_features: bool = True, render_centroid: bool = True, render_foreground: bool = True, render_orientany: bool = True) -> Optional[Dict[str, torch.Tensor]]:
         cams = self.datamanager.train_ray_generator.cameras
         # camera_opt_to_camera transform for this camera; broadcasted inside generate_rays
         c_tensor = torch.tensor([camera_index], device=cams.device)
         camera_opt_to_camera = self.datamanager.train_camera_optimizer(c_tensor)
         camera_ray_bundle = cams.generate_rays(camera_indices=int(camera_index), camera_opt_to_camera=camera_opt_to_camera)
-        # Progress for single image render
-        if self._local_rank == 0:
-            with Progress(TextColumn("[progress.description]{task.description}"), BarColumn(), TimeElapsedColumn(), transient=True) as progress:
-                task = progress.add_task("Rendering full image", total=1)
+        # Progress for single image render (cache rendering doesn't need gradients)
+        with torch.no_grad():
+            if self._local_rank == 0:
+                with Progress(TextColumn("[progress.description]{task.description}"), BarColumn(), TimeElapsedColumn(), transient=True) as progress:
+                    task = progress.add_task("Rendering full image", total=1)
+                    outputs = self.model.get_outputs_for_camera_ray_bundle(
+                        camera_ray_bundle,
+                        render_features=render_features,
+                        render_centroid=render_centroid,
+                        render_foreground=render_foreground,
+                        render_orientany=render_orientany,
+                    )
+                    progress.advance(task)
+            else:
                 outputs = self.model.get_outputs_for_camera_ray_bundle(
                     camera_ray_bundle,
                     render_features=render_features,
                     render_centroid=render_centroid,
                     render_foreground=render_foreground,
+                    render_orientany=render_orientany,
                 )
-                progress.advance(task)
-        else:
-            outputs = self.model.get_outputs_for_camera_ray_bundle(
-                camera_ray_bundle,
-                render_features=render_features,
-                render_centroid=render_centroid,
-                render_foreground=render_foreground,
-            )
         if "rgb" not in outputs or "accumulation" not in outputs or "depth" not in outputs:
             return None
         rgb = outputs["rgb"]
@@ -236,6 +249,9 @@ class FeaturePipeline(VanillaPipeline):
         # Append foreground viz
         if "foreground_prob_rgb" in outputs:
             images["foreground_prob"] = outputs["foreground_prob_rgb"]
+        # Append OrientAny viz
+        if "orientany_rgb" in outputs:
+            images["orientany_rgb"] = outputs["orientany_rgb"]
         return images
 
     def _compute_centroid_and_spread_gt_for_camera(self, camera_index: int, images: Dict[str, torch.Tensor], is_eval: bool = False, allow_blend: bool = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -382,14 +398,15 @@ class FeaturePipeline(VanillaPipeline):
         c_tensor = torch.tensor([ci], device=cams.device)
         camera_opt_to_camera = self.datamanager.train_camera_optimizer(c_tensor)
         camera_ray_bundle = cams.generate_rays(camera_indices=ci, camera_opt_to_camera=camera_opt_to_camera)
-        # Render outputs with a small progress bar
-        if self._local_rank == 0:
-            with Progress(TextColumn("[progress.description]{task.description}"), BarColumn(), TimeElapsedColumn(), transient=True) as progress:
-                task = progress.add_task("Rendering train image", total=1)
-                outputs = self.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle, render_features=True, render_centroid=True, render_foreground=self.model.config.foreground_enable)
-                progress.advance(task)
-        else:
-            outputs = self.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle, render_features=True, render_centroid=True, render_foreground=self.model.config.foreground_enable)
+        # Render outputs with a small progress bar (use no_grad for memory efficiency)
+        with torch.no_grad():
+            if self._local_rank == 0:
+                with Progress(TextColumn("[progress.description]{task.description}"), BarColumn(), TimeElapsedColumn(), transient=True) as progress:
+                    task = progress.add_task("Rendering train image", total=1)
+                    outputs = self.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle, render_features=True, render_centroid=True, render_foreground=self.model.config.foreground_enable, render_orientany=self.model.config.orientany_enable)
+                    progress.advance(task)
+            else:
+                outputs = self.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle, render_features=True, render_centroid=True, render_foreground=self.model.config.foreground_enable, render_orientany=self.model.config.orientany_enable)
         # Construct a batch with the full GT image to mirror eval flow
         full_batch = self.datamanager.train_dataset.get_data(ci)
         # Reuse model's image/metrics helper for identical formatting (GT|Pred concat)
@@ -408,6 +425,32 @@ class FeaturePipeline(VanillaPipeline):
 
             images_dict["foreground_prob_gt"] = fg_gt_rgb
             images_dict["foreground_prob_vs_gt"] = torch.cat([outputs["foreground_prob_rgb"], fg_gt_rgb], dim=1)
+
+        # Add OrientAny pred vs GT side-by-side using full-image GT from datamanager
+        if self.model.config.orientany_enable and ("orientany_rgb" in outputs):
+            # Get full OrientAny GT tensor (memory efficient, no gradients needed)
+            with torch.no_grad():
+                ci_global = ci  # train split uses train indices directly
+                orientany_gt_np = self.datamanager.orientany_maps[ci_global]  # (H, W, 10) numpy array
+                orientany_gt = torch.from_numpy(orientany_gt_np).float()  # Keep on CPU
+
+                # Convert GT distribution means to RGB (vectorized operations on CPU)
+                ax_mean_gt = orientany_gt[..., 0]  # azimuth mean
+                pl_mean_gt = orientany_gt[..., 2]  # polar mean
+                ro_mean_gt = orientany_gt[..., 4]  # roll mean
+                fg_gt = orientany_gt[..., 9] > 0.5  # foreground mask from GT
+
+                orientany_gt_rgb = torch.stack([
+                    torch.clamp(ax_mean_gt / 359.0, 0, 1),
+                    torch.clamp(pl_mean_gt / 179.0, 0, 1),
+                    torch.clamp(ro_mean_gt / 359.0, 0, 1)
+                ], dim=-1)
+
+                # Only show colors for foreground pixels (set background to black)
+                orientany_gt_rgb[~fg_gt] = 0.0
+
+                images_dict["orientany_gt_rgb"] = orientany_gt_rgb
+                images_dict["orientany_vs_gt"] = torch.cat([outputs["orientany_rgb"], orientany_gt_rgb], dim=1)
         for key, img in images_dict.items():
             writer.put_image(name=f"Train Images/{key}", image=img, step=step)
         # Also log centroid cache if present (after cold start)
@@ -430,13 +473,14 @@ class FeaturePipeline(VanillaPipeline):
     def get_eval_image_metrics_and_images(self, step: int):
         self.eval()
         image_idx, camera_ray_bundle, batch = self.datamanager.next_eval_image(step)
-        if self._local_rank == 0:
-            with Progress(TextColumn("[progress.description]{task.description}"), BarColumn(), TimeElapsedColumn(), transient=True) as progress:
-                task = progress.add_task("Rendering eval image", total=1)
-                outputs = self.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle, render_features=True, render_centroid=True, render_foreground=self.model.config.foreground_enable)
-                progress.advance(task)
-        else:
-            outputs = self.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle, render_features=True, render_centroid=True, render_foreground=self.model.config.foreground_enable)
+        with torch.no_grad():
+            if self._local_rank == 0:
+                with Progress(TextColumn("[progress.description]{task.description}"), BarColumn(), TimeElapsedColumn(), transient=True) as progress:
+                    task = progress.add_task("Rendering eval image", total=1)
+                    outputs = self.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle, render_features=True, render_centroid=True, render_foreground=self.model.config.foreground_enable, render_orientany=self.model.config.orientany_enable)
+                    progress.advance(task)
+            else:
+                outputs = self.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle, render_features=True, render_centroid=True, render_foreground=self.model.config.foreground_enable, render_orientany=self.model.config.orientany_enable)
         metrics_dict, images_dict = self.model.get_image_metrics_and_images(outputs, batch)
         # Append centroid GT visualization for eval only after cold-start (no blending in eval)
         if getattr(self.model, "_train_centroid_cache_enabled", False):
@@ -463,9 +507,90 @@ class FeaturePipeline(VanillaPipeline):
 
             images_dict["foreground_prob_gt"] = fg_gt_rgb
             images_dict["foreground_prob_vs_gt"] = torch.cat([outputs["foreground_prob_rgb"], fg_gt_rgb], dim=1)
+
+        # Add OrientAny pred vs GT side-by-side if available in eval batch
+        if self.model.config.orientany_enable and ("orientany_rgb" in outputs):
+            # Get full OrientAny GT tensor (memory efficient, no gradients needed)
+            with torch.no_grad():
+                ci_global = int(image_idx) + getattr(self.datamanager, "eval_offset", 0)
+                orientany_gt_np = self.datamanager.orientany_maps[ci_global]  # (H, W, 10) numpy array
+                orientany_gt = torch.from_numpy(orientany_gt_np).float()  # Keep on CPU
+
+                # Convert GT distribution means to RGB (vectorized operations on CPU)
+                ax_mean_gt = orientany_gt[..., 0]  # azimuth mean
+                pl_mean_gt = orientany_gt[..., 2]  # polar mean
+                ro_mean_gt = orientany_gt[..., 4]  # roll mean
+                fg_gt = orientany_gt[..., 9] > 0.5  # foreground mask from GT
+
+                orientany_gt_rgb = torch.stack([
+                    torch.clamp(ax_mean_gt / 359.0, 0, 1),
+                    torch.clamp(pl_mean_gt / 179.0, 0, 1),
+                    torch.clamp(ro_mean_gt / 359.0, 0, 1)
+                ], dim=-1)
+
+                # Only show colors for foreground pixels (set background to black)
+                orientany_gt_rgb[~fg_gt] = 0.0
+
+                images_dict["orientany_gt_rgb"] = orientany_gt_rgb
+                images_dict["orientany_vs_gt"] = torch.cat([outputs["orientany_rgb"], orientany_gt_rgb], dim=1)
         assert "image_idx" not in metrics_dict
         metrics_dict["image_idx"] = image_idx
         assert "num_rays" not in metrics_dict
         metrics_dict["num_rays"] = len(camera_ray_bundle)
         self.train()
         return metrics_dict, images_dict
+
+    @profiler.time_function
+    def get_average_eval_image_metrics(
+        self, step: Optional[int] = None, output_path: Optional[Path] = None, get_std: bool = False
+    ):
+        """Memory-efficient override: iterate eval images, render per image with no_grad, free tensors between images."""
+        self.eval()
+        metrics_dict_list = []
+        assert isinstance(self.datamanager, VanillaDataManager)
+        num_images = len(self.datamanager.fixed_indices_eval_dataloader)
+        with Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TimeElapsedColumn(),
+            transient=True,
+        ) as progress:
+            task = progress.add_task("[green]Evaluating all eval images...", total=num_images)
+            for camera_ray_bundle, batch in self.datamanager.fixed_indices_eval_dataloader:
+                inner_start = time()
+                height, width = camera_ray_bundle.shape
+                num_rays = height * width
+                with torch.no_grad():
+                    outputs = self.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle, render_features=True, render_centroid=True, render_foreground=self.model.config.foreground_enable, render_orientany=self.model.config.orientany_enable)
+                metrics_dict, images_dict = self.model.get_image_metrics_and_images(outputs, batch)
+
+                if output_path is not None:
+                    camera_indices = camera_ray_bundle.camera_indices
+                    assert camera_indices is not None
+                    for key, val in images_dict.items():
+                        Image.fromarray((val * 255).byte().cpu().numpy()).save(
+                            output_path / "{0:06d}-{1}.jpg".format(int(camera_indices[0, 0, 0]), key)
+                        )
+                metrics_dict["num_rays_per_sec"] = num_rays / (time() - inner_start)
+                metrics_dict["fps"] = metrics_dict["num_rays_per_sec"] / (height * width)
+                metrics_dict_list.append(metrics_dict)
+
+                # Aggressive cleanup between images
+                del outputs, images_dict
+                torch.cuda.empty_cache()
+                progress.advance(task)
+        # average the metrics list
+        metrics_dict = {}
+        for key in metrics_dict_list[0].keys():
+            if get_std:
+                key_std, key_mean = torch.std_mean(
+                    torch.tensor([metrics_dict[key] for metrics_dict in metrics_dict_list])
+                )
+                metrics_dict[key] = float(key_mean)
+                metrics_dict[f"{key}_std"] = float(key_std)
+            else:
+                metrics_dict[key] = float(
+                    torch.mean(torch.tensor([metrics_dict[key] for metrics_dict in metrics_dict_list]))
+                )
+        self.train()
+        return metrics_dict

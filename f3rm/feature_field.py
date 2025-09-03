@@ -16,6 +16,7 @@ class FeatureFieldHeadNames:
     CENTROID: str = "centroid"
     CENTROID_SPREAD: str = "centroid_spread"
     FOREGROUND: str = "foreground"
+    ORIENTANY: str = "orientany"
 
 
 class FeatureField(Field):
@@ -27,11 +28,13 @@ class FeatureField(Field):
         cond_on_density_feature: bool = True,
         cond_on_density_centroid: bool = True,
         cond_on_density_foreground: bool = True,
+        cond_on_density_orientany: bool = True,
         density_embedding_dim: int = 15,
         # Per-head grad flow controls for density embedding
         feat_grad_to_density: bool = False,
         centroid_grad_to_density: bool = False,
         foreground_grad_to_density: bool = False,
+        orientany_grad_to_density: bool = False,
         # Positional encoding
         use_pe: bool = True,
         pe_n_freq: int = 6,
@@ -50,9 +53,14 @@ class FeatureField(Field):
         # Foreground head MLP (binary classification with 2 logits)
         foreground_hidden_dim: int = 64,
         foreground_num_layers: int = 2,
+        # OrientAny head MLP (902 logits: 360 azimuth + 180 polar + 360 roll + 2 foreground)
+        orientany_hidden_dim: int = 128,
+        orientany_num_layers: int = 3,
         # Optional trunk tap from centroid-spread encoder
         centroid_spread_trunk_fg: int = 0,
         foreground_trunk_grad_to_spread: bool = False,
+        centroid_spread_trunk_orientany: int = 0,
+        orientany_trunk_grad_to_spread: bool = False,
     ):
         super().__init__()
         self.feature_dim = feature_dim
@@ -60,12 +68,16 @@ class FeatureField(Field):
         self.cond_on_density_feature = cond_on_density_feature
         self.cond_on_density_centroid = cond_on_density_centroid
         self.cond_on_density_foreground = cond_on_density_foreground
+        self.cond_on_density_orientany = cond_on_density_orientany
         self.feat_grad_to_density = feat_grad_to_density
         self.centroid_grad_to_density = centroid_grad_to_density
         self.foreground_grad_to_density = foreground_grad_to_density
+        self.orientany_grad_to_density = orientany_grad_to_density
         # Foreground head shares the same positional encoding as other heads (no direction encoding)
         self.centroid_spread_trunk_fg = int(centroid_spread_trunk_fg)
         self.foreground_trunk_grad_to_spread = bool(foreground_trunk_grad_to_spread)
+        self.centroid_spread_trunk_orientany = int(centroid_spread_trunk_orientany)
+        self.orientany_trunk_grad_to_spread = bool(orientany_trunk_grad_to_spread)
 
         # Feature field has its own hash grid
         growth_factor = np.exp((np.log(max_res) - np.log(start_res)) / (num_levels - 1))
@@ -124,7 +136,7 @@ class FeatureField(Field):
         mlp_in_dims_spread = self.encoding.n_output_dims + (density_embedding_dim if self.cond_on_density_centroid else 0)
         self.mlp_centroid_spread = tcnn.Network(
             n_input_dims=mlp_in_dims_spread,
-            n_output_dims=4 + (self.centroid_spread_trunk_fg if self.centroid_spread_trunk_fg > 0 else 0),
+            n_output_dims=4 + max(self.centroid_spread_trunk_fg, self.centroid_spread_trunk_orientany),
             network_config={
                 "otype": "FullyFusedMLP",
                 "activation": "ReLU",
@@ -145,6 +157,20 @@ class FeatureField(Field):
                 "output_activation": "None",
                 "n_neurons": foreground_hidden_dim,
                 "n_hidden_layers": foreground_num_layers,
+            },
+        )
+
+        # OrientAny head (902 logits: 360 azimuth + 180 polar + 360 roll + 2 foreground)
+        mlp_in_dims_orientany = self.encoding.n_output_dims + (density_embedding_dim if self.cond_on_density_orientany else 0) + (self.centroid_spread_trunk_orientany if self.centroid_spread_trunk_orientany > 0 else 0)
+        self.mlp_orientany = tcnn.Network(
+            n_input_dims=mlp_in_dims_orientany,
+            n_output_dims=902,
+            network_config={
+                "otype": "FullyFusedMLP",
+                "activation": "ReLU",
+                "output_activation": "None",
+                "n_neurons": orientany_hidden_dim,
+                "n_hidden_layers": orientany_num_layers,
             },
         )
 
@@ -218,17 +244,42 @@ class FeatureField(Field):
         logits = self.mlp_foreground(encoded_fg).view(*ray_samples.frustums.directions.shape[:-1], -1)
         return logits
 
+    def get_orientany(self, ray_samples: RaySamples, density_embedding: Optional[Tensor] = None) -> Tensor:
+        encoded_base = self._encode_positions(ray_samples)
+        parts = [encoded_base]
+        if self.cond_on_density_orientany and density_embedding is not None:
+            cond = density_embedding.view(-1, density_embedding.shape[-1]).to(encoded_base)
+            if not self.orientany_grad_to_density:
+                cond = cond.detach()
+            parts.append(cond)
+        # Append optional centroid-spread trunk features if enabled
+        if self.centroid_spread_trunk_orientany > 0:
+            # Get the full centroid spread output and extract trunk features
+            spread_full = self.get_centroid_spread(ray_samples, density_embedding=density_embedding, return_full=True)
+            # Trunk starts after 4 channels: [err, fg_logit, soft0_logit, soft1_logit]
+            trunk_feat = spread_full[..., 4:4 + self.centroid_spread_trunk_orientany]
+            # Flatten trunk features to match encoded_base shape for concatenation
+            trunk_feat = trunk_feat.view(-1, self.centroid_spread_trunk_orientany)
+            if not self.orientany_trunk_grad_to_spread:
+                trunk_feat = trunk_feat.detach()
+            parts.append(trunk_feat)
+        encoded_orientany = torch.cat(parts, dim=-1)
+        logits = self.mlp_orientany(encoded_orientany).view(*ray_samples.frustums.directions.shape[:-1], -1)
+        return logits
+
     def get_outputs(self, ray_samples: RaySamples, density_embedding: Optional[Tensor] = None) -> Dict[FieldHeadNames, Tensor]:
         """Backward-compatible method that computes both heads."""
         features = self.get_feature(ray_samples, density_embedding=density_embedding)
         centroid = self.get_centroid(ray_samples, density_embedding=density_embedding)
         centroid_spread = self.get_centroid_spread(ray_samples, density_embedding=density_embedding)
         foreground = self.get_foreground(ray_samples, density_embedding=density_embedding)
+        orientany = self.get_orientany(ray_samples, density_embedding=density_embedding)
         return {
             FeatureFieldHeadNames.FEATURE: features,
             FeatureFieldHeadNames.CENTROID: centroid,
             FeatureFieldHeadNames.CENTROID_SPREAD: centroid_spread,
             FeatureFieldHeadNames.FOREGROUND: foreground,
+            FeatureFieldHeadNames.ORIENTANY: orientany,
         }
 
     def forward(self, ray_samples: RaySamples, compute_normals: bool = False, density_embedding: Optional[Tensor] = None) -> Dict[FieldHeadNames, Tensor]:

@@ -7,6 +7,7 @@ import numpy as np
 import os
 import yaml
 import torch
+import torch.nn.functional as F
 from pathlib import Path
 
 from nerfstudio.cameras import camera_utils
@@ -20,6 +21,320 @@ def get_conf_temp_scaled_logits(logits, confidence, drop_exp_factor=6, eps=1e-8)
     x = torch.as_tensor(logits, dtype=torch.float32)
     T = 1.0 / max(float(confidence)**drop_exp_factor, eps)
     return x / T
+
+
+def probs_to_normal(
+    probs: torch.Tensor,
+    *,
+    n_bins: int,
+    angle_min_deg: float,
+    period_deg: float,                 # here: total span (e.g., 180.0)
+    bin_width_deg: Optional[float] = None,
+    min_std_deg: float = 1e-3,
+    window_deg: float = 30.0,          # fit window half-width
+    peak_frac: float = 0.2,            # keep bins >= peak_frac * p_max
+    gamma: float = 2.0,                # weights: w = p**gamma
+    ridge: float = 0.0,                # tiny L2 on LS (e.g., 1e-4) stabilizes
+    shrink_to_moment: float = 0.5,     # 0..1; blend LS σ toward moment σ
+    sigma_floor_deg: Optional[float] = 1.0,
+    sigma_ceil_deg: Optional[float] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Fit a single Gaussian N(mean_deg, std_deg) on a bounded linear range [angle_min, angle_min+period).
+    Mean: sub-bin peak via quadratic fit on log-probs (no wrap).
+    Std: weighted LS on log p ≈ -(x-μ)^2/(2σ^2), shrunk toward local moment.
+    """
+    p = probs.float()
+    assert p.ndim == 1 and p.numel() == n_bins, "probs must be 1D with length n_bins"
+    if bin_width_deg is None:
+        bin_width_deg = period_deg / n_bins
+    else:
+        if not float(abs(n_bins * bin_width_deg - period_deg)) < 1e-6:
+            raise ValueError("n_bins*bin_width_deg must equal period_deg")
+
+    eps = 1e-12
+    p = p + eps
+    n = n_bins
+
+    # ---- mode & sub-bin refinement (no wrapping at edges)
+    k = int(torch.argmax(p).item())
+    km = k - 1 if k - 1 >= 0 else k
+    kp = k + 1 if k + 1 < n else k
+    Lm, L0, Lp = torch.log(p[km]), torch.log(p[k]), torch.log(p[kp])
+    denom = (Lm - 2.0 * L0 + Lp)
+    concave = bool((denom < -1e-9).item() and km != k and kp != k)
+
+    if concave:
+        delta = 0.5 * (Lm - Lp) / denom
+        delta = torch.clamp(delta, -0.5, 0.5)
+        mean_bins = torch.tensor(float(k), dtype=p.dtype, device=p.device) + delta
+    else:
+        mean_bins = torch.tensor(float(k), dtype=p.dtype, device=p.device)
+
+    mean_deg = angle_min_deg + mean_bins * bin_width_deg
+
+    # ---- select local window (linear, clipped to range)
+    idx = torch.arange(n, device=p.device, dtype=p.dtype)
+    centers = angle_min_deg + idx * bin_width_deg
+    diff = centers - mean_deg
+    mask = (diff.abs() <= window_deg) & (p >= (peak_frac * p[k]))
+    if int(mask.sum().item()) < 3:
+        # fallback: curvature or minimal std
+        if concave:
+            # from denom ≈ -1/σ_bins^2  -> σ ≈ 1/sqrt(-denom) bins
+            sigma_bins = 1.0 / torch.sqrt(-denom)
+            std_deg = sigma_bins * bin_width_deg
+        else:
+            std_deg = torch.tensor(sigma_floor_deg or min_std_deg, device=p.device, dtype=p.dtype)
+        std_deg = torch.clamp(std_deg, min=min_std_deg)
+        if sigma_floor_deg is not None:
+            std_deg = torch.clamp(std_deg, min=sigma_floor_deg)
+        if sigma_ceil_deg is not None:
+            std_deg = torch.clamp(std_deg, max=sigma_ceil_deg)
+        return mean_deg, std_deg
+
+    # ---- weighted LS for σ using y = log p - log p(μ) ≈ -(x-μ)^2/(2σ^2)
+    x = diff[mask]                          # degrees
+    y = torch.log(p[mask]) - torch.log(p[k])
+    X = x * x
+    w = (p[mask] ** gamma)
+    denom_ls = (w * X * X).sum() + ridge + 1e-12
+    s = (w * X * y).sum() / denom_ls        # slope
+    sigma_ls = torch.sqrt(torch.clamp(-1.0 / (2.0 * s + 1e-12), min=min_std_deg**2))
+
+    # ---- moment-based σ (conservative)
+    mu_local = (w * x).sum() / w.sum()
+    var_local = torch.clamp((w * (x - mu_local) ** 2).sum() / w.sum(), min=min_std_deg**2)
+    sigma_mom = torch.sqrt(var_local)
+
+    # ---- shrink & clamp
+    alpha = float(torch.clamp(torch.tensor(shrink_to_moment), 0.0, 1.0))
+    std_deg = (1 - alpha) * sigma_ls + alpha * sigma_mom
+    if sigma_floor_deg is not None:
+        std_deg = torch.clamp(std_deg, min=sigma_floor_deg)
+    if sigma_ceil_deg is not None:
+        std_deg = torch.clamp(std_deg, max=sigma_ceil_deg)
+    std_deg = torch.clamp(std_deg, min=min_std_deg)
+
+    return mean_deg, std_deg
+
+
+def normal_to_probs(
+    mean_deg: torch.Tensor,
+    std_deg: torch.Tensor,
+    *,
+    n_bins: int,
+    angle_min_deg: float,
+    period_deg: float,
+    bin_width_deg: Optional[float] = None,
+    integrate_bins: bool = True,
+    subsamples_per_bin: int = 7,   # odd recommended (includes center)
+) -> torch.Tensor:
+    """
+    Expand (mean_deg, std_deg) to discrete probs over [angle_min, angle_min+period).
+    If integrate_bins=True, averages inside each bin to approximate bin mass.
+    """
+    if bin_width_deg is None:
+        bin_width_deg = period_deg / n_bins
+    else:
+        if not float(abs(n_bins * bin_width_deg - period_deg)) < 1e-6:
+            raise ValueError("n_bins*bin_width_deg must equal period_deg")
+
+    device, dtype = mean_deg.device, mean_deg.dtype
+    idx = torch.arange(n_bins, device=device, dtype=dtype)
+    centers = angle_min_deg + idx * bin_width_deg
+
+    mean = mean_deg[..., None]
+    std = torch.clamp(std_deg, min=1e-6)[..., None]
+
+    if (not integrate_bins) or subsamples_per_bin <= 1:
+        diff = centers - mean
+        logits = -0.5 * (diff / std) ** 2
+        logits = logits - logits.max(dim=-1, keepdim=True).values
+        probs = torch.exp(logits)
+        probs = probs / probs.sum(dim=-1, keepdim=True)
+        return probs
+
+    J = int(subsamples_per_bin)
+    if J % 2 == 0:
+        J += 1
+    offs = (torch.linspace(-0.5, 0.5, J, device=device, dtype=dtype) * bin_width_deg)  # (J,)
+
+    c = centers.view(1, 1, n_bins)     # (1,J,n)
+    o = offs.view(1, J, 1)             # (1,J,1)
+    m = mean[..., None]                # (...,1,1)
+    s = std[..., None]                 # (...,1,1)
+
+    samp = c + o                       # (...,J,n)
+    diff = samp - m
+    logits = -0.5 * (diff / s) ** 2
+    vals = torch.exp(logits)           # (...,J,n)
+    probs = vals.mean(dim=-2)          # (...,n)
+    probs = probs / probs.sum(dim=-1, keepdim=True)
+    return probs
+
+
+def _kappa_from_resultant(R: torch.Tensor) -> torch.Tensor:
+    # Approx inverse of A(kappa)=I1/I0 (Mardia & Jupp style piecewise)
+    eps = 1e-12
+    R = torch.clamp(R, 0.0, 0.999999)
+    k1 = 2 * R + R**3 + 5 * R**5 / 6
+    k2 = -0.4 + 1.39 * R + 0.43 / (1 - R + eps)
+    k3 = 1.0 / (R**3 - 4 * R**2 + 3 * R + eps)
+    return torch.where(R < 0.53, k1, torch.where(R < 0.85, k2, k3))
+
+
+def probs_to_von_mises(
+    probs: torch.Tensor,
+    *,
+    n_bins: int,
+    angle_min_deg: float,
+    period_deg: float,
+    bin_width_deg: Optional[float] = None,
+    min_kappa: float = 1e-3,
+    window_deg: float = 30.0,
+    peak_frac: float = 0.2,
+    gamma: float = 2.0,
+    ridge: float = 0.0,              # small L2 on LS fit (e.g., 1e-4) to tame κ
+    shrink_to_resultant: float = 0.5,  # 0..1; blend LS κ toward resultant-based κ
+    sigma_floor_deg: float = 2.0,    # don't fit narrower than this (deg)
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Fit (mean_deg, kappa) from a discrete circular distribution.
+    - sub-bin peak via quadratic on log p around argmax
+    - κ via weighted LS on log p ≈ -(κ/2) δ^2, shrunk toward resultant-based κ
+    - κ capped so std >= sigma_floor_deg
+    """
+    p = probs.float()
+    assert p.ndim == 1 and p.numel() == n_bins, "probs must be 1D with length n_bins"
+
+    if bin_width_deg is None:
+        bin_width_deg = period_deg / n_bins
+    else:
+        if not float(abs(n_bins * bin_width_deg - period_deg)) < 1e-6:
+            raise ValueError("n_bins*bin_width_deg must equal period_deg")
+
+    eps = 1e-12
+    p = p + eps
+    n = n_bins
+
+    # ---- sub-bin peak
+    k = int(torch.argmax(p).item())
+    km, kp = (k - 1) % n, (k + 1) % n
+    Lm, L0, Lp = torch.log(p[km]), torch.log(p[k]), torch.log(p[kp])
+    denom = (Lm - 2.0 * L0 + Lp)
+    concave = bool((denom < -1e-9).item())
+
+    if concave:
+        delta = 0.5 * (Lm - Lp) / denom
+        delta = torch.clamp(delta, -0.5, 0.5)
+        mean_bins = (torch.tensor(float(k), dtype=p.dtype, device=p.device) + delta) % n
+    else:
+        mean_bins = torch.tensor(float(k), dtype=p.dtype, device=p.device)
+
+    mean_deg = (angle_min_deg + mean_bins * bin_width_deg - angle_min_deg) % period_deg + angle_min_deg
+
+    # ---- local window
+    idx = torch.arange(n, device=p.device, dtype=p.dtype)
+    centers = angle_min_deg + idx * bin_width_deg
+    half = period_deg / 2.0
+    diff_deg = ((centers - mean_deg + half) % period_deg) - half
+
+    peak = p[k]
+    mask = (diff_deg.abs() <= window_deg) & (p >= peak_frac * peak)
+    if int(mask.sum().item()) < 3:
+        # fallback to curvature or minimum
+        if concave:
+            dtheta = torch.deg2rad(torch.tensor(bin_width_deg, device=p.device, dtype=p.dtype))
+            kappa_ls = torch.clamp((-denom) / (dtheta * dtheta), min=min_kappa)
+        else:
+            kappa_ls = torch.tensor(min_kappa, device=p.device, dtype=p.dtype)
+    else:
+        x = torch.deg2rad(diff_deg[mask])                        # δ (rad)
+        y = torch.log(p[mask]) - torch.log(peak)                 # log ratio
+        X = x * x
+        w = (p[mask] ** gamma)
+        # weighted LS through origin with optional ridge
+        denom_ls = (w * X * X).sum() + ridge + 1e-12
+        s = (w * X * y).sum() / denom_ls                         # slope
+        kappa_ls = torch.clamp(-2.0 * s, min=min_kappa)
+
+    # ---- shrink κ toward resultant-based estimate (more conservative)
+    if int(mask.sum().item()) >= 3:
+        x = torch.deg2rad(diff_deg[mask])
+        w = (p[mask] ** gamma)
+        C = (w * torch.cos(x)).sum()
+        S = (w * torch.sin(x)).sum()
+        R = torch.sqrt(C * C + S * S) / (w.sum() + 1e-12)
+        kappa_R = torch.clamp(_kappa_from_resultant(R), min=min_kappa)
+        alpha = float(torch.clamp(torch.tensor(shrink_to_resultant), 0.0, 1.0))
+        kappa = (1 - alpha) * kappa_ls + alpha * kappa_R
+    else:
+        kappa = kappa_ls
+
+    # ---- cap κ so fitted std doesn't go below sigma_floor_deg
+    sigma_floor_rad = torch.deg2rad(torch.tensor(sigma_floor_deg, device=p.device, dtype=p.dtype))
+    kappa_cap = 1.0 / (sigma_floor_rad * sigma_floor_rad + 1e-12)
+    kappa = torch.clamp(kappa, min=min_kappa, max=kappa_cap)
+
+    return mean_deg, kappa
+
+
+def von_mises_to_probs(
+    mean_deg: torch.Tensor,
+    kappa: torch.Tensor,
+    *,
+    n_bins: int,
+    angle_min_deg: float,
+    period_deg: float,
+    bin_width_deg: Optional[float] = None,
+    integrate_bins: bool = True,
+    subsamples_per_bin: int = 7,
+) -> torch.Tensor:
+    """
+    Expand (mean_deg, kappa) to discrete probs. With integrate_bins, approximate bin mass
+    by averaging inside each bin (reduces peak overshoot for large κ).
+    """
+    if bin_width_deg is None:
+        bin_width_deg = period_deg / n_bins
+    else:
+        if not float(abs(n_bins * bin_width_deg - period_deg)) < 1e-6:
+            raise ValueError("n_bins*bin_width_deg must equal period_deg")
+
+    device, dtype = mean_deg.device, mean_deg.dtype
+    idx = torch.arange(n_bins, device=device, dtype=dtype)
+    centers = angle_min_deg + idx * bin_width_deg
+    half = period_deg / 2.0
+
+    mean = mean_deg[..., None]
+    kap = torch.clamp(kappa, min=1e-6)[..., None]
+
+    if (not integrate_bins) or subsamples_per_bin <= 1:
+        diff_deg = ((centers - mean + half) % period_deg) - half
+        diff_rad = torch.deg2rad(diff_deg)
+        logits = kap * torch.cos(diff_rad)
+        logits = logits - logits.max(dim=-1, keepdim=True).values
+        probs = torch.exp(logits)
+        probs = probs / probs.sum(dim=-1, keepdim=True)
+        return probs
+
+    J = int(subsamples_per_bin)
+    if J % 2 == 0:
+        J += 1
+    offs = (torch.linspace(-0.5, 0.5, J, device=device, dtype=dtype) * bin_width_deg)
+
+    c = centers.view(1, 1, n_bins)
+    o = offs.view(1, J, 1)
+    m = mean[..., None]
+
+    samp = c + o
+    diff_deg = ((samp - m + half) % period_deg) - half
+    diff_rad = torch.deg2rad(diff_deg)
+
+    vals = torch.exp(kap[..., None] * torch.cos(diff_rad))      # (..., J, n_bins)
+    probs = vals.mean(dim=-2)                                   # (..., n_bins)
+    probs = probs / probs.sum(dim=-1, keepdim=True)
+    return probs
 
 
 def build_transform_lookup(frames):
@@ -462,51 +777,100 @@ def pack_batch_auto_masks(batch_masks: List[List[dict]]) -> dict:
 
 
 class ORIENTANYLazyFeatures(BaseLazyShards):
-    """Lazy loading for ORIENTANY features stored as separate pixel data and instance features."""
+    """Optimized lazy loading for ORIENTANY features with aggressive caching and memory mapping."""
 
     def __init__(self, pixel_shard_paths: List[Path], instance_shard_paths: List[Path]):
-        super().__init__(pixel_shard_paths)  # Use pixel shards for indexing
         self.instance_shard_paths = instance_shard_paths
         assert len(pixel_shard_paths) == len(instance_shard_paths), "Pixel and instance shards must match"
+
+        # Initialize caching attributes BEFORE calling super().__init__()
+        self.pixel_mmaps = [None] * len(pixel_shard_paths)  # Memory mapped pixel data
+        self.instance_cache = [None] * len(instance_shard_paths)  # Cached JSON data
+        self.full_image_cache = {}  # LRU-style cache for full reconstructed images
+        self.max_image_cache = 50  # Cache up to 50 full images in memory
+
+        super().__init__(pixel_shard_paths)  # Use pixel shards for indexing
 
     def _setup_lengths(self):
         """Count total number of images across all pixel shards."""
         for p in self.paths:
-            # Load just shape info without loading full data
+            # Use memory mapping for instant access to shape info
             arr = np.load(p, mmap_mode="r")
             self.lengths.append(arr.shape[0])
-            del arr  # Explicitly free memory after getting shape info
+            # Keep first mmap for dimensions
+            if self.pixel_mmaps[0] is None:
+                self.pixel_mmaps[0] = arr
+                self.H, self.W = arr.shape[1:3]
+            elif arr is not self.pixel_mmaps[0]:
+                del arr
+
+    def _get_pixel_shard(self, shard_idx: int):
+        """Get memory-mapped pixel shard."""
+        if self.pixel_mmaps[shard_idx] is None:
+            self.pixel_mmaps[shard_idx] = np.load(self.paths[shard_idx], mmap_mode="r")
+        return self.pixel_mmaps[shard_idx]
+
+    def _get_instance_shard(self, shard_idx: int):
+        """Get cached instance features shard."""
+        if self.instance_cache[shard_idx] is None:
+            with open(self.instance_shard_paths[shard_idx], 'r') as f:
+                self.instance_cache[shard_idx] = json.load(f)
+        return self.instance_cache[shard_idx]
 
     def __len__(self) -> int:
         return int(self.cum[-1])
 
-    def __getitem__(self, idx: int) -> np.ndarray:
-        """Get ORIENTANY features for a single image as (H, W, 904) array."""
+    def __getitem__(self, idx) -> np.ndarray:
+        """Optimized ORIENTANY feature access with aggressive caching.
+
+        For single image access: feat[idx_img] → returns (H, W, 10) array
+        """
+        if not isinstance(idx, int):
+            raise ValueError("Only single image access supported: feat[idx_img]")
+
+        # Check cache first
+        if idx in self.full_image_cache:
+            return self.full_image_cache[idx]
+
         shard_idx, local_idx = self._loc(idx)
 
-        # Load pixel data (H, W, 3) - [fg_one_hot, instance_id]
-        pixel_data = np.load(self.paths[shard_idx])[local_idx]  # (H, W, 3)
+        # Use memory-mapped pixel data
+        pixel_data = self._get_pixel_shard(shard_idx)[local_idx]  # (H, W, 3)
 
-        # Load instance features mapping
-        with open(self.instance_shard_paths[shard_idx], 'r') as f:
-            instance_features_list = json.load(f)
-        instance_features = instance_features_list[local_idx]  # {instance_id: 902D_features}
+        # Use cached instance features
+        instance_features = self._get_instance_shard(shard_idx)[local_idx]  # {instance_id: 8D_mixed_distribution_params}
 
-        # Reconstruct full feature array (H, W, 904)
+        # Reconstruct efficiently using vectorized operations
         h, w, _ = pixel_data.shape
-        full_features = np.zeros((h, w, 904), dtype=np.float32)
+        full_features = np.zeros((h, w, 10), dtype=np.float32)
 
-        # Set foreground one-hot at the end
-        full_features[..., 902:904] = pixel_data[..., :2]  # foreground one-hot
+        # Set foreground one-hot (vectorized)
+        full_features[..., 8:10] = pixel_data[..., :2]
 
-        # For each foreground pixel, get its instance features
-        for instance_id, instance_feat in instance_features.items():
-            instance_id = int(instance_id)
-            mask = (pixel_data[..., 2] == instance_id)
-            if np.any(mask):
-                # Convert list back to numpy array if needed
+        # Vectorized instance feature assignment
+        instance_ids = pixel_data[..., 2]
+        unique_ids = np.unique(instance_ids)
+
+        for instance_id in unique_ids:
+            if instance_id == 0:  # Skip background
+                continue
+            instance_id_str = str(int(instance_id))
+            if instance_id_str in instance_features:
+                mask = (instance_ids == instance_id)
+                instance_feat = instance_features[instance_id_str]
                 if isinstance(instance_feat, list):
                     instance_feat = np.array(instance_feat, dtype=np.float32)
-                full_features[mask, :902] = instance_feat
+                full_features[mask, :8] = instance_feat
 
+        # Cache the result (with simple LRU eviction)
+        if len(self.full_image_cache) >= self.max_image_cache:
+            # Remove oldest entry (simple FIFO for speed)
+            oldest_key = next(iter(self.full_image_cache))
+            del self.full_image_cache[oldest_key]
+
+        self.full_image_cache[idx] = full_features
         return full_features
+
+    def clear_cache(self):
+        """Clear only the full image cache to manage memory, keep shard caches for speed."""
+        self.full_image_cache.clear()

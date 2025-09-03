@@ -24,7 +24,11 @@ from f3rm.features.utils import (
     build_transform_lookup,
     get_nerf_ccs_to_orig_nerf_world,
     get_orig_to_final_nerf_world_transform_scale,
-    get_conf_temp_scaled_logits
+    get_conf_temp_scaled_logits,
+    probs_to_von_mises,
+    von_mises_to_probs,
+    probs_to_normal,
+    normal_to_probs
 )
 from f3rm.features.sam2_extract import SAM2Args
 from f3rm.features.orientany.orientany_main import OrientAny
@@ -37,7 +41,7 @@ class ORIENTANYArgs:
     sim_thresh: float = 0.7
     min_instance_percent: float = 1.0
     batch_size_per_gpu: int = 4
-    conf_exp_scaling: float = 6
+    conf_exp_scaling: float = 4
     batch_phi: int = 32
     batch_theta: int = 32
 
@@ -109,7 +113,7 @@ class ORIENTANYWorker:
         else:
             raise ValueError("transforms.json not found")
 
-    async def compute_orientany_for_image_async(self, image_path: str) -> Dict[str, Any]:
+    async def compute_orientany_for_image_async(self, image_path: str, debug: bool = False) -> Dict[str, Any]:
         # map image → index
         try:
             idx = self.feat_image_fnames.index(str(image_path))
@@ -300,13 +304,20 @@ class ORIENTANYWorker:
                 show_progress=True
             )
 
-            # Store propagated probabilities: 902D vector
-            instance_feat = np.concatenate([
-                probs_ax_world.cpu().numpy(),  # 360D
-                probs_pl_world.cpu().numpy(),  # 180D
-                probs_ro_world.cpu().numpy(),  # 360D
-                conf_logits.cpu().numpy()      # 2D
-            ]).astype(np.float32)
+            # Fit appropriate distributions to propagated distributions and store compact params
+            # Azimuth and roll: von Mises (circular, 0-360°)
+            ax_mean, ax_kappa = probs_to_von_mises(probs_ax_world, n_bins=360, angle_min_deg=0.0, period_deg=360.0)
+            ro_mean, ro_kappa = probs_to_von_mises(probs_ro_world, n_bins=360, angle_min_deg=0.0, period_deg=360.0)
+            # Polar: normal (linear, 0-180°)
+            pl_mean, pl_std = probs_to_normal(probs_pl_world, n_bins=180, angle_min_deg=0.0, period_deg=180.0)
+
+            # Store compact representation: 8D vector (2 von Mises means, 2 von Mises kappas, 1 normal mean, 1 normal std, 2 confidence)
+            instance_feat = np.array([
+                ax_mean.cpu().item(), ax_kappa.cpu().item(),  # azimuth von Mises params
+                pl_mean.cpu().item(), pl_std.cpu().item(),    # polar normal params
+                ro_mean.cpu().item(), ro_kappa.cpu().item(),  # roll von Mises params
+                conf_logits[0].cpu().item(), conf_logits[1].cpu().item()  # confidence logits
+            ], dtype=np.float32)
 
             instance_features[next_instance_id] = instance_feat.tolist()  # Convert to list for JSON serialization
 
@@ -314,16 +325,31 @@ class ORIENTANYWorker:
             pixel_data[seg, 2] = float(next_instance_id)
             next_instance_id += 1
 
+            # Store debug info if requested
+            if debug:
+                if 'debug_distributions' not in locals():
+                    debug_distributions = {}
+                debug_distributions[next_instance_id - 1] = {
+                    'probs_ax_world': probs_ax_world.cpu().numpy(),
+                    'probs_pl_world': probs_pl_world.cpu().numpy(),
+                    'probs_ro_world': probs_ro_world.cpu().numpy()
+                }
+
             # Clean up instance-specific memory
             del instance_img, rm_bkg_img, outs, gaus_ax_logits, gaus_pl_logits, gaus_ro_logits, conf_logits
             del conf_scaled_ax_logits, conf_scaled_pl_logits, conf_scaled_ro_logits
             del probs_ax, probs_pl, probs_ro
             del probs_ax_world, probs_pl_world, probs_ro_world
 
-        return {
+        result = {
             'pixel_data': pixel_data,  # (H, W, 3) - [fg_one_hot, instance_id]
-            'instance_features': instance_features  # {instance_id: 902D_features}
+            'instance_features': instance_features  # {instance_id: 8D_mixed_distribution_params}
         }
+
+        if debug and 'debug_distributions' in locals():
+            result['debug_distributions'] = debug_distributions
+
+        return result
 
 
 class ORIENTANYExtractor:
@@ -357,11 +383,11 @@ class ORIENTANYExtractor:
         self.client = AsyncMultiWrapper(ORIENTANYWorker, num_objects=num_workers, devices=devices_param, data_dir=self.data_dir, text_prompts=self.text_prompts)
         self.num_workers = num_workers
 
-    async def extract_batch_async(self, image_paths: List[str]) -> List[Dict[str, Any]]:
+    async def extract_batch_async(self, image_paths: List[str], debug: bool = False) -> List[Dict[str, Any]]:
         results: List[Dict[str, Any]] = []
         for i in tqdm(range(0, len(image_paths), self.num_workers), desc="Extracting ORIENTANY features", leave=False):
             batch_paths = image_paths[i:i + self.num_workers]
-            tasks = [process_single_image_orientany_async(path, self.client) for path in batch_paths]
+            tasks = [process_single_image_orientany_async(path, self.client, debug=debug) for path in batch_paths]
             batch_results = await AsyncMultiWrapper.async_run_tasks(tasks, desc="ORIENTANY", leave=False)
             results.extend(batch_results)
             gc.collect()
@@ -374,41 +400,41 @@ def make_orientany_extractor(device: torch.device, verbose: bool = False, data_d
     return ORIENTANYExtractor(device=device, data_dir=data_dir, text_prompts=text_prompts, verbose=verbose)
 
 
-async def extract_orientany_batch(image_paths: List[str], device: torch.device, data_dir: Path, verbose: bool = False, text_prompts: Optional[List[str]] = None):
+async def extract_orientany_batch(image_paths: List[str], device: torch.device, data_dir: Path, verbose: bool = False, text_prompts: Optional[List[str]] = None, debug: bool = False):
     extractor = make_orientany_extractor(device=device, verbose=verbose, data_dir=data_dir, text_prompts=text_prompts)
-    return await extractor.extract_batch_async(image_paths)
+    return await extractor.extract_batch_async(image_paths, debug=debug)
 
 
-async def process_single_image_orientany_async(image_path: str, orientany_client: AsyncMultiWrapper) -> Dict[str, Any]:
-    return await orientany_client.compute_orientany_for_image_async(image_path)
+async def process_single_image_orientany_async(image_path: str, orientany_client: AsyncMultiWrapper, debug: bool = False) -> Dict[str, Any]:
+    return await orientany_client.compute_orientany_for_image_async(image_path, debug=debug)
 
 
 if __name__ == "__main__":
-    data_root = Path("datasets/f3rm/custom/betabook/small")
+    data_root = Path("datasets/f3rm/panda_demos/caterpillar")
     image_dir = data_root / "images"
     image_paths = sorted(list(image_dir.glob("*.jpg")) + list(image_dir.glob("*.png")))
     image_paths = [str(p) for p in image_paths[:3]]  # Just 3 for demo
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Extract orientation features using global prompts
-    extractor = make_orientany_extractor(device=device, data_dir=data_root, text_prompts=["book", "table"], verbose=True)
-    features_data = run_async_in_any_context(lambda: extractor.extract_batch_async(image_paths))
+    # Extract orientation features using global prompts (with debug info)
+    extractor = make_orientany_extractor(device=device, data_dir=data_root, text_prompts=["toy"], verbose=True)
+    features_data = run_async_in_any_context(lambda: extractor.extract_batch_async(image_paths, debug=True))
     print(f"Extracted {len(features_data)} feature maps")
 
     # Convert to full feature arrays for visualization
     features = []
     for data in features_data:
         pixel_data = data['pixel_data']  # (H, W, 3)
-        instance_features = data['instance_features']  # {instance_id: 902D_features}
+        instance_features = data['instance_features']  # {instance_id: 8D_mixed_distribution_params}
 
-        # Reconstruct full feature array (H, W, 904)
+        # Reconstruct full feature array (H, W, 10) - compact representation
         h, w, _ = pixel_data.shape
-        full_features = np.zeros((h, w, 904), dtype=np.float32)
+        full_features = np.zeros((h, w, 10), dtype=np.float32)
 
         # Set foreground one-hot at the end
-        full_features[..., 902:904] = pixel_data[..., :2]  # foreground one-hot
+        full_features[..., 8:10] = pixel_data[..., :2]  # foreground one-hot
 
-        # For each foreground pixel, get its instance features
+        # For each foreground pixel, get its instance features (8D mixed distribution params)
         for instance_id, instance_feat in instance_features.items():
             instance_id = int(instance_id)
             mask = (pixel_data[..., 2] == instance_id)
@@ -416,7 +442,7 @@ if __name__ == "__main__":
                 # Convert list back to numpy array if needed
                 if isinstance(instance_feat, list):
                     instance_feat = np.array(instance_feat, dtype=np.float32)
-                full_features[mask, :902] = instance_feat
+                full_features[mask, :8] = instance_feat
 
         features.append(full_features)
 
@@ -444,22 +470,101 @@ if __name__ == "__main__":
 
         # Orientation RGB
         if fg is not None:
-            # Get argmax predictions for the three angles (now from propagated probabilities)
-            gaus_ax_pred = np.argmax(features[i][..., 0:360], axis=-1)  # 0-359
-            gaus_pl_pred = np.argmax(features[i][..., 360:540], axis=-1)  # 0-179
-            gaus_ro_pred = np.argmax(features[i][..., 540:900], axis=-1)  # 0-359
+            # Get distribution means for the three angles (from compact representation)
+            ax_mean = features[i][..., 0]  # azimuth mean
+            pl_mean = features[i][..., 2]  # polar mean
+            ro_mean = features[i][..., 4]  # roll mean
 
             # Convert to RGB: azimuth->R, polar->G, roll->B
             orient_rgb = np.zeros((*fg.shape, 3), dtype=np.uint8)
-            orient_rgb[..., 0] = (gaus_ax_pred / 359.0 * 255).astype(np.uint8)  # R: azimuth
-            orient_rgb[..., 1] = (gaus_pl_pred / 179.0 * 255).astype(np.uint8)  # G: polar
-            orient_rgb[..., 2] = (gaus_ro_pred / 359.0 * 255).astype(np.uint8)  # B: roll
+            orient_rgb[..., 0] = np.clip(ax_mean / 359.0 * 255, 0, 255).astype(np.uint8)  # R: azimuth
+            orient_rgb[..., 1] = np.clip(pl_mean / 179.0 * 255, 0, 255).astype(np.uint8)  # G: polar
+            orient_rgb[..., 2] = np.clip(ro_mean / 359.0 * 255, 0, 255).astype(np.uint8)  # B: roll
 
             # Only show colors for foreground pixels
             orient_rgb[~fg.astype(bool)] = 0
             axes[2, i].imshow(orient_rgb)
-            axes[2, i].set_title("Orientation RGB (World-Propagated)")
+            axes[2, i].set_title("Orientation RGB (Distribution Means)")
         axes[2, i].axis('off')
 
     plt.tight_layout()
     plt.show()
+
+    # Demo: Distribution comparison using debug info
+    if features_data and features_data[0].get('debug_distributions'):
+        print("\n=== Distribution Comparison Demo ===")
+
+        # Get first instance from first image
+        first_img_data = features_data[0]
+        first_instance_id = next(iter(first_img_data['instance_features'].keys()))
+        first_instance_feat = first_img_data['instance_features'][first_instance_id]
+        debug_distributions = first_img_data['debug_distributions'][int(first_instance_id)]
+
+        print(f"Analyzing instance {first_instance_id} from first image")
+        print(f"Stored distribution params: {first_instance_feat}")
+
+        # Get original world-propagated distributions (from debug info)
+        probs_ax_world_orig = debug_distributions['probs_ax_world']
+        probs_pl_world_orig = debug_distributions['probs_pl_world']
+        probs_ro_world_orig = debug_distributions['probs_ro_world']
+
+        # Extract stored distribution parameters
+        ax_mean_stored, ax_kappa_stored = first_instance_feat[0], first_instance_feat[1]
+        pl_mean_stored, pl_std_stored = first_instance_feat[2], first_instance_feat[3]
+        ro_mean_stored, ro_kappa_stored = first_instance_feat[4], first_instance_feat[5]
+
+        # Expand stored parameters back to distributions (EXACT same logic as loss)
+        ax_mean_tensor = torch.tensor(ax_mean_stored, dtype=torch.float32)
+        ax_kappa_tensor = torch.tensor(ax_kappa_stored, dtype=torch.float32)
+        pl_mean_tensor = torch.tensor(pl_mean_stored, dtype=torch.float32)
+        pl_std_tensor = torch.tensor(pl_std_stored, dtype=torch.float32)
+        ro_mean_tensor = torch.tensor(ro_mean_stored, dtype=torch.float32)
+        ro_kappa_tensor = torch.tensor(ro_kappa_stored, dtype=torch.float32)
+
+        ax_expanded = von_mises_to_probs(ax_mean_tensor, ax_kappa_tensor, n_bins=360, angle_min_deg=0.0, period_deg=360.0).squeeze().cpu().numpy()
+        pl_expanded = normal_to_probs(pl_mean_tensor, pl_std_tensor, n_bins=180, angle_min_deg=0.0, period_deg=180.0).squeeze().cpu().numpy()
+        ro_expanded = von_mises_to_probs(ro_mean_tensor, ro_kappa_tensor, n_bins=360, angle_min_deg=0.0, period_deg=360.0).squeeze().cpu().numpy()
+
+        # Create comparison plots
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+        # Azimuth comparison
+        x_ax = np.arange(360)
+        axes[0].plot(x_ax, probs_ax_world_orig, 'k-', label='Original World-Propagated', linewidth=2)
+        axes[0].plot(x_ax, ax_expanded, 'g-', label='Expanded von Mises (for loss)', linewidth=1.5)
+        axes[0].axvline(ax_mean_stored, color='r', linestyle='--', label=f'Stored von Mises (μ={ax_mean_stored:.1f}, κ={ax_kappa_stored:.2f})')
+        axes[0].set_title('Azimuth Distribution')
+        axes[0].set_xlabel('Degrees')
+        axes[0].set_ylabel('Probability')
+        axes[0].legend()
+        axes[0].grid(True, alpha=0.3)
+
+        # Polar comparison
+        x_pl = np.arange(180)
+        axes[1].plot(x_pl, probs_pl_world_orig, 'k-', label='Original World-Propagated', linewidth=2)
+        axes[1].plot(x_pl, pl_expanded, 'g-', label='Expanded Normal (for loss)', linewidth=1.5)
+        axes[1].axvline(pl_mean_stored, color='r', linestyle='--', label=f'Stored Normal (μ={pl_mean_stored:.1f}, σ={pl_std_stored:.2f})')
+        axes[1].set_title('Polar Distribution')
+        axes[1].set_xlabel('Degrees')
+        axes[1].set_ylabel('Probability')
+        axes[1].legend()
+        axes[1].grid(True, alpha=0.3)
+
+        # Roll comparison
+        x_ro = np.arange(360)
+        axes[2].plot(x_ro, probs_ro_world_orig, 'k-', label='Original World-Propagated', linewidth=2)
+        axes[2].plot(x_ro, ro_expanded, 'g-', label='Expanded von Mises (for loss)', linewidth=1.5)
+        axes[2].axvline(ro_mean_stored, color='r', linestyle='--', label=f'Stored von Mises (μ={ro_mean_stored:.1f}, κ={ro_kappa_stored:.2f})')
+        axes[2].set_title('Roll Distribution')
+        axes[2].set_xlabel('Degrees')
+        axes[2].set_ylabel('Probability')
+        axes[2].legend()
+        axes[2].grid(True, alpha=0.3)
+
+        plt.suptitle('OrientAny Distribution Compression/Expansion Demo', fontsize=14)
+        plt.tight_layout()
+        plt.show()
+
+        print("Distribution comparison complete!")
+    else:
+        print("No debug distributions available for demo")

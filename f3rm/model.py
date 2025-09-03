@@ -28,6 +28,7 @@ from f3rm.pca_colormap import apply_pca_colormap_return_proj
 from f3rm.renderer import FeatureRenderer, CentroidRenderer, ScalarRenderer, ClassProbRenderer
 from f3rm.features.clip_extract import CLIPArgs
 from f3rm.shaders import CentroidShader, ScalarShader, ProbShader, ProbFromProbsShader
+from f3rm.features.utils import von_mises_to_probs, normal_to_probs
 
 
 @dataclass
@@ -80,6 +81,19 @@ class FeatureFieldModelConfig(NerfactoModelConfig):
     # Optional: feed centroid-spread trunk features into foreground head for better calibration
     centroid_spread_trunk_fg: int = 16  # 0 disables
     foreground_trunk_grad_to_spread: bool = False  # allow grads from fg head into spread trunk
+
+    # OrientAny head controls (separate orientation classifier with 902 logits; supervised via ORIENTANY_* shards)
+    orientany_enable: bool = True  # Enable separate OrientAny head (train + render)
+    orientany_loss_weight: float = 1e-3  # Loss weight for OrientAny classification
+    orientany_condition_on_density: bool = True  # Condition OrientAny head on NeRF density embedding
+    orientany_condition_density_grad_to_nerf: bool = False  # Allow OrientAny head gradients into NeRF density embedding
+    orientany_hidden_dim: int = 128  # OrientAny head hidden dim (larger due to 902 output dims)
+    orientany_num_layers: int = 3  # OrientAny head num layers (deeper due to complexity)
+    # OrientAny head uses same xyz-based encoding as feature head (no direction input)
+    # Optional: feed centroid-spread trunk features into OrientAny head for better calibration
+    centroid_spread_trunk_orientany: int = 16  # 0 disables
+    orientany_trunk_grad_to_spread: bool = False  # Allow OrientAny head gradients into centroid-spread trunk
+
     # Camera-pose refinement control: if False, cut gradient from all custom heads to camera optimizer (via detached weights)
     enable_campose_refine_feature_field: bool = True
 
@@ -171,10 +185,12 @@ class FeatureFieldModel(NerfactoModel):
             cond_on_density_feature=self.config.feat_condition_on_density,
             cond_on_density_centroid=self.config.centroid_condition_on_density,
             cond_on_density_foreground=self.config.foreground_condition_on_density,
+            cond_on_density_orientany=self.config.orientany_condition_on_density,
             density_embedding_dim=getattr(self.field, "geo_feat_dim", 15),
             feat_grad_to_density=self.config.feat_condition_density_grad_to_nerf,
             centroid_grad_to_density=self.config.centroid_condition_density_grad_to_nerf,
             foreground_grad_to_density=self.config.foreground_condition_density_grad_to_nerf,
+            orientany_grad_to_density=self.config.orientany_condition_density_grad_to_nerf,
             use_pe=self.config.feat_use_pe,
             pe_n_freq=self.config.feat_pe_n_freq,
             num_levels=self.config.feat_num_levels,
@@ -188,8 +204,12 @@ class FeatureFieldModel(NerfactoModel):
             centroid_num_layers=self.config.centroid_num_layers,
             foreground_hidden_dim=self.config.foreground_hidden_dim,
             foreground_num_layers=self.config.foreground_num_layers,
+            orientany_hidden_dim=self.config.orientany_hidden_dim,
+            orientany_num_layers=self.config.orientany_num_layers,
             centroid_spread_trunk_fg=self.config.centroid_spread_trunk_fg,
             foreground_trunk_grad_to_spread=self.config.foreground_trunk_grad_to_spread,
+            centroid_spread_trunk_orientany=self.config.centroid_spread_trunk_orientany,
+            orientany_trunk_grad_to_spread=self.config.orientany_trunk_grad_to_spread,
         )
 
         self.renderer_feature = FeatureRenderer()
@@ -232,7 +252,7 @@ class FeatureFieldModel(NerfactoModel):
         param_groups["feature_field"] = list(self.feature_field.parameters())
         return param_groups
 
-    def _get_outputs_internal(self, ray_bundle: RayBundle, render_features: bool, render_centroid: bool, render_spread: bool = False, render_foreground: bool = True):
+    def _get_outputs_internal(self, ray_bundle: RayBundle, render_features: bool, render_centroid: bool, render_spread: bool = False, render_foreground: bool = True, render_orientany: bool = True):
         """Core rendering that can optionally skip feature-field computation."""
         ray_samples: RaySamples
         ray_samples, weights_list, ray_samples_list = self.proposal_sampler(ray_bundle, density_fns=self.density_fns)
@@ -253,12 +273,16 @@ class FeatureFieldModel(NerfactoModel):
         # Feature/Centroid/Spread/Foreground outputs (optionally conditioned on density embedding from NeRF)
         # If foreground trunk tap is enabled, we need to compute centroid spread even if not explicitly requested
         need_spread_for_fg = (render_foreground and self.config.foreground_enable and self.config.centroid_spread_trunk_fg > 0)
+        # If OrientAny trunk tap is enabled, we need to compute centroid spread even if not explicitly requested
+        need_spread_for_orientany = (render_orientany and self.config.orientany_enable and self.config.centroid_spread_trunk_orientany > 0)
         if (
             render_features
             or (render_centroid and self.config.centroid_enable)
             or (render_spread and self.config.centroid_enable)
             or (render_foreground and self.config.foreground_enable)
+            or (render_orientany and self.config.orientany_enable)
             or need_spread_for_fg
+            or need_spread_for_orientany
         ):
             cut_cam_refine: bool = not getattr(self.config, "enable_campose_refine_feature_field", True)
             need_density = (
@@ -267,6 +291,7 @@ class FeatureFieldModel(NerfactoModel):
                 or (render_spread and self.config.centroid_enable and self.config.centroid_condition_on_density)
                 or (need_spread_for_fg and self.config.centroid_condition_on_density)
                 or (render_foreground and self.config.foreground_condition_on_density)
+                or (render_orientany and self.config.orientany_enable and self.config.orientany_condition_on_density)
             )
             density_embedding = None
             if need_density:
@@ -278,6 +303,8 @@ class FeatureFieldModel(NerfactoModel):
                     allow_grad = True
                 if render_foreground and self.config.foreground_condition_on_density and self.config.foreground_condition_density_grad_to_nerf:
                     allow_grad = True
+                if render_orientany and self.config.orientany_condition_on_density and self.config.orientany_condition_density_grad_to_nerf:
+                    allow_grad = True
                 # If camera-pose refinement from custom heads is disabled, force-detach embedding to cut grads back to NeRF/cameras
                 if cut_cam_refine:
                     density_embedding = density_embed_raw.detach()
@@ -288,17 +315,34 @@ class FeatureFieldModel(NerfactoModel):
             if render_features:
                 feat_vals = self.feature_field.get_feature(ray_samples, density_embedding=density_embedding)
                 features = self.renderer_feature(features=feat_vals, weights=custom_weights)
+                del feat_vals
             if render_centroid and self.config.centroid_enable:
                 cent_vals = self.feature_field.get_centroid(ray_samples, density_embedding=density_embedding)
                 centroid_pred = self.renderer_centroid(values=cent_vals, weights=custom_weights)
+                del cent_vals
             if (render_spread or need_spread_for_fg) and self.config.centroid_enable:
                 # Four-channel spread head: [error, foreground_logit, soft0_logit, soft1_logit]
                 spread_vals = self.feature_field.get_centroid_spread(ray_samples, density_embedding=density_embedding)
                 centroid_spread_2ch = self.renderer_spread(values=spread_vals, weights=custom_weights)
+                del spread_vals
             if render_foreground and self.config.foreground_enable:
                 fg_vals = self.feature_field.get_foreground(ray_samples, density_embedding=density_embedding)
                 # Port rendering logic: aggregate logits along ray, then softmax for viz/loss
                 foreground_logits = self.renderer_spread(values=fg_vals, weights=custom_weights)
+                del fg_vals
+            if render_orientany and self.config.orientany_enable:
+                orientany_vals = self.feature_field.get_orientany(ray_samples, density_embedding=density_embedding)
+                if not self.training:  # High-dimensional OrientAny (902D)
+                    with torch.no_grad():
+                        orientany_vals_cpu = orientany_vals.detach().cpu()
+                        weights_cpu = custom_weights.detach().cpu()
+                        orientany_logits_cpu = self.renderer_spread(values=orientany_vals_cpu, weights=weights_cpu)
+                        orientany_logits = orientany_logits_cpu.to(orientany_vals.device, non_blocking=True)
+                        del orientany_vals_cpu, weights_cpu, orientany_logits_cpu
+                else:
+                    # Port rendering logic: aggregate logits along ray, then softmax for viz/loss
+                    orientany_logits = self.renderer_spread(values=orientany_vals, weights=custom_weights)
+                del orientany_vals
 
         outputs = {
             "rgb": rgb,
@@ -314,6 +358,8 @@ class FeatureFieldModel(NerfactoModel):
             outputs["centroid_spread"] = centroid_spread_2ch
         if render_foreground and self.config.foreground_enable:
             outputs["foreground_logits"] = foreground_logits
+        if render_orientany and self.config.orientany_enable:
+            outputs["orientany_logits"] = orientany_logits
 
         if self.config.predict_normals:
             normals = self.renderer_normals(normals=field_outputs[FieldHeadNames.NORMALS], weights=weights)
@@ -346,7 +392,7 @@ class FeatureFieldModel(NerfactoModel):
 
     def get_outputs(self, ray_bundle: RayBundle):
         """Modified from nerfacto.get_outputs to include feature field outputs."""
-        return self._get_outputs_internal(ray_bundle, render_features=True, render_centroid=True, render_spread=True, render_foreground=True)
+        return self._get_outputs_internal(ray_bundle, render_features=True, render_centroid=True, render_spread=True, render_foreground=True, render_orientany=True)
 
     def get_metrics_dict(self, outputs, batch):
         metrics_dict = super().get_metrics_dict(outputs, batch)
@@ -356,9 +402,11 @@ class FeatureFieldModel(NerfactoModel):
         if self.config.foreground_enable and ("foreground_logits" in outputs) and ("foreground" in batch):
             probs = torch.softmax(outputs["foreground_logits"], dim=-1)
             fg_target = batch["foreground"].to(self.device)
-            pred = probs.argmax(dim=-1)
-            targ = fg_target.argmax(dim=-1)
-            metrics_dict["foreground_acc"] = (pred == targ).float().mean()
+            if fg_target.numel() > 0 and fg_target.shape[-1] >= 2:
+                pred = probs.argmax(dim=-1)
+                targ = fg_target.argmax(dim=-1)
+                metrics_dict["foreground_acc"] = (pred == targ).float().mean()
+
         return metrics_dict
 
     def get_loss_dict(self, outputs, batch, metrics_dict=None):
@@ -372,6 +420,90 @@ class FeatureFieldModel(NerfactoModel):
             fg_target_idx = fg_target.argmax(dim=-1).view(-1)
             ce = F.cross_entropy(fg_logits, fg_target_idx)
             loss_dict["foreground_loss"] = self.config.foreground_loss_weight * ce
+
+        # OrientAny classification loss (2 von Mises + 1 normal + 1 foreground loss)
+        if self.config.orientany_enable and ("orientany_logits" in outputs) and ("orientany" in batch):
+            orientany_logits = outputs["orientany_logits"].view(-1, 902)  # (N, 902)
+            orientany_target = batch["orientany"].to(self.device, non_blocking=True)  # (N, 10) - compact GT
+
+            # Split logits into components
+            gaus_ax_logits = orientany_logits[:, 0:360]      # azimuth logits
+            gaus_pl_logits = orientany_logits[:, 360:540]    # polar logits
+            gaus_ro_logits = orientany_logits[:, 540:900]    # roll logits
+            fg_logits = orientany_logits[:, 900:902]         # foreground logits
+
+            # Extract GT parameters
+            fg_target = orientany_target[:, 8:10]  # foreground one-hot
+            fg_mask = fg_target[:, 1] > 0.5  # GT foreground pixels
+
+            # Foreground loss: supervise all pixels (always computed)
+            ce_fg = F.cross_entropy(fg_logits, fg_target.argmax(dim=-1))
+
+            # Orientation losses: only for GT foreground pixels
+            if fg_mask.any():
+                # Extract distribution parameters for GT foreground pixels
+                fg_indices = fg_mask.nonzero(as_tuple=True)[0]
+                ax_mean_fg = orientany_target[fg_indices, 0]    # azimuth mean
+                ax_kappa_fg = orientany_target[fg_indices, 1]   # azimuth kappa
+                pl_mean_fg = orientany_target[fg_indices, 2]    # polar mean
+                pl_std_fg = orientany_target[fg_indices, 3]     # polar std
+                ro_mean_fg = orientany_target[fg_indices, 4]    # roll mean
+                ro_kappa_fg = orientany_target[fg_indices, 5]   # roll kappa
+
+                # Clamp distribution parameters to valid ranges to prevent NaN
+                ax_kappa_fg = torch.clamp(ax_kappa_fg, min=1e-6, max=100.0)
+                pl_std_fg = torch.clamp(pl_std_fg, min=1e-6, max=180.0)
+                ro_kappa_fg = torch.clamp(ro_kappa_fg, min=1e-6, max=100.0)
+
+                # Generate target distributions
+                ax_target_probs = von_mises_to_probs(ax_mean_fg, ax_kappa_fg, n_bins=360, angle_min_deg=0.0, period_deg=360.0)
+                pl_target_probs = normal_to_probs(pl_mean_fg, pl_std_fg, n_bins=180, angle_min_deg=0.0, period_deg=180.0)
+                ro_target_probs = von_mises_to_probs(ro_mean_fg, ro_kappa_fg, n_bins=360, angle_min_deg=0.0, period_deg=360.0)
+
+                # Ensure target probabilities are valid (sum to 1, no NaN/inf)
+                ax_target_probs = ax_target_probs / (ax_target_probs.sum(dim=-1, keepdim=True) + 1e-8)
+                pl_target_probs = pl_target_probs / (pl_target_probs.sum(dim=-1, keepdim=True) + 1e-8)
+                ro_target_probs = ro_target_probs / (ro_target_probs.sum(dim=-1, keepdim=True) + 1e-8)
+
+                # Model probabilities for GT foreground pixels only
+                ax_probs = F.softmax(gaus_ax_logits[fg_mask], dim=-1)
+                pl_probs = F.softmax(gaus_pl_logits[fg_mask], dim=-1)
+                ro_probs = F.softmax(gaus_ro_logits[fg_mask], dim=-1)
+
+                # Add small epsilon to prevent log(0) in KL divergence
+                ax_probs = ax_probs + 1e-8
+                pl_probs = pl_probs + 1e-8
+                ro_probs = ro_probs + 1e-8
+                ax_target_probs = ax_target_probs + 1e-8
+                pl_target_probs = pl_target_probs + 1e-8
+                ro_target_probs = ro_target_probs + 1e-8
+
+                # KL divergence losses
+                kl_azimuth = F.kl_div(ax_probs.log(), ax_target_probs, reduction='batchmean')
+                kl_polar = F.kl_div(pl_probs.log(), pl_target_probs, reduction='batchmean')
+                kl_roll = F.kl_div(ro_probs.log(), ro_target_probs, reduction='batchmean')
+
+                # Check for NaN in individual losses and replace with zero if found
+                if torch.isnan(kl_azimuth):
+                    kl_azimuth = torch.zeros_like(kl_azimuth)
+                if torch.isnan(kl_polar):
+                    kl_polar = torch.zeros_like(kl_polar)
+                if torch.isnan(kl_roll):
+                    kl_roll = torch.zeros_like(kl_roll)
+            else:
+                # No GT foreground pixels - orientation losses are zero but keep gradients
+                kl_azimuth = torch.zeros(1, device=self.device, requires_grad=True).sum()
+                kl_polar = torch.zeros(1, device=self.device, requires_grad=True).sum()
+                kl_roll = torch.zeros(1, device=self.device, requires_grad=True).sum()
+
+            # Combine losses
+            orientany_loss = kl_azimuth + kl_polar + kl_roll + ce_fg
+
+            # Final NaN check and replacement
+            if torch.isnan(orientany_loss):
+                orientany_loss = torch.zeros_like(orientany_loss)
+
+            loss_dict["orientany_loss"] = self.config.orientany_loss_weight * orientany_loss
         # Centroid loss (supervision via cache).
         if self.training and self.config.centroid_enable and getattr(self, "_train_centroid_cache_enabled", False):
             full_cache = self._get_train_centroid_cache()  # type: ignore[attr-defined]
@@ -459,40 +591,41 @@ class FeatureFieldModel(NerfactoModel):
             pass
         return loss_dict
 
-    def get_outputs_for_camera_ray_bundle(self, camera_ray_bundle: RayBundle, render_features: bool = True, render_centroid: bool = True, render_foreground: bool = True) -> Dict[str, torch.Tensor]:
+    def get_outputs_for_camera_ray_bundle(self, camera_ray_bundle: RayBundle, render_features: bool = True, render_centroid: bool = True, render_foreground: bool = True, render_orientany: bool = True) -> Dict[str, torch.Tensor]:
         """Full-image render with optional feature computation.
 
         render_features=False will skip feature-field computation for speed (used by cache renders).
+        render_orientany=False will skip OrientAny computation for speed.
         """
-        with torch.no_grad():
-            num_rays_per_chunk = self.config.eval_num_rays_per_chunk
-            image_height, image_width = camera_ray_bundle.origins.shape[:2]
-            num_rays = len(camera_ray_bundle)
-            outputs_lists = defaultdict(list)
-            for i in range(0, num_rays, num_rays_per_chunk):
-                start_idx = i
-                end_idx = i + num_rays_per_chunk
-                ray_bundle = camera_ray_bundle.get_row_major_sliced_ray_bundle(start_idx, end_idx)
-                if self.collider is not None:
-                    ray_bundle = self.collider(ray_bundle)
-                # If caller asked only for features, do not force centroid; and vice-versa
-                outputs_chunk = self._get_outputs_internal(ray_bundle, render_features=render_features, render_centroid=render_centroid, render_spread=render_centroid, render_foreground=render_foreground)
-                for output_name, output in outputs_chunk.items():
-                    if not torch.is_tensor(output):
-                        continue
-                    if output_name.startswith("feature"):
-                        outputs_lists[output_name].append(output.cpu())
-                    else:
-                        outputs_lists[output_name].append(output)
-                    del output
-                if (i // num_rays_per_chunk) % 20 == 0:
-                    torch.cuda.empty_cache()
-            outputs: Dict[str, torch.Tensor] = {}
-            for output_name, outputs_list in outputs_lists.items():
-                outputs[output_name] = torch.cat(outputs_list).view(image_height, image_width, -1)
+        num_rays_per_chunk = self.config.eval_num_rays_per_chunk
+        image_height, image_width = camera_ray_bundle.origins.shape[:2]
+        num_rays = len(camera_ray_bundle)
+        outputs_lists = defaultdict(list)
+        for i in range(0, num_rays, num_rays_per_chunk):
+            start_idx = i
+            end_idx = i + num_rays_per_chunk
+            ray_bundle = camera_ray_bundle.get_row_major_sliced_ray_bundle(start_idx, end_idx)
+            if self.collider is not None:
+                ray_bundle = self.collider(ray_bundle)
+            # If caller asked only for features, do not force centroid; and vice-versa
+            # OrientAny rendering is controlled by render_orientany parameter
+            outputs_chunk = self._get_outputs_internal(ray_bundle, render_features=render_features, render_centroid=render_centroid, render_spread=render_centroid, render_foreground=render_foreground, render_orientany=render_orientany)
+            for output_name, output in outputs_chunk.items():
+                if not torch.is_tensor(output):
+                    continue
+                if output_name.startswith("feature") or output_name.startswith("orientany"):
+                    outputs_lists[output_name].append(output.cpu())
+                else:
+                    outputs_lists[output_name].append(output)
+                del output
+            if (i // num_rays_per_chunk) % 20 == 0:
+                torch.cuda.empty_cache()
+        outputs: Dict[str, torch.Tensor] = {}
+        for output_name, outputs_list in outputs_lists.items():
+            outputs[output_name] = torch.cat(outputs_list).view(image_height, image_width, -1)
 
         # If requested depth-only render, exit early
-        if not render_features and not render_centroid:
+        if not render_features and not render_centroid and not render_orientany:
             return outputs
 
         # Compute PCA of features separately, so we can reuse the same projection matrix
@@ -525,6 +658,32 @@ class FeatureFieldModel(NerfactoModel):
         if self.config.foreground_enable and ("foreground_logits" in outputs):
             probs = torch.softmax(outputs["foreground_logits"], dim=-1)[..., 1:2]
             outputs["foreground_prob_rgb"] = self.prob_from_probs_shader(probs)
+
+        # OrientAny visualization: convert orientation predictions to RGB (foreground only)
+        if self.config.orientany_enable and ("orientany_logits" in outputs):
+            orientany_logits = outputs["orientany_logits"]  # (H, W, 902) - already on CPU
+
+            # Get argmax predictions for the three angles
+            gaus_ax_pred = orientany_logits[..., 0:360].argmax(dim=-1)      # 0-359 (azimuth logits)
+            gaus_pl_pred = orientany_logits[..., 360:540].argmax(dim=-1)    # 0-179 (polar logits)
+            gaus_ro_pred = orientany_logits[..., 540:900].argmax(dim=-1)    # 0-359 (roll logits)
+            fg_logits = orientany_logits[..., 900:902]                      # foreground logits
+
+            # Get foreground mask from predictions
+            fg_probs = torch.softmax(fg_logits, dim=-1)
+            fg_mask = fg_probs[..., 1] > 0.5  # foreground pixels
+
+            # Convert to RGB: azimuth->R, polar->G, roll->B (on CPU)
+            orient_rgb = torch.zeros((*orientany_logits.shape[:-1], 3), dtype=torch.float32)
+            orient_rgb[..., 0] = gaus_ax_pred.float() / 359.0  # R: azimuth
+            orient_rgb[..., 1] = gaus_pl_pred.float() / 179.0  # G: polar
+            orient_rgb[..., 2] = gaus_ro_pred.float() / 359.0  # B: roll
+
+            # Only show colors for foreground pixels (set background to black)
+            orient_rgb[~fg_mask] = 0.0
+
+            # Keep on CPU for memory efficiency
+            outputs["orientany_rgb"] = orient_rgb
         # Visualize softmax-base centroid-spread probability if present
         if self.config.centroid_enable and ("centroid_spread" in outputs):
             soft_logits = outputs["centroid_spread"][..., 2:4]
@@ -566,6 +725,10 @@ class FeatureFieldModel(NerfactoModel):
         return outputs
 
     def get_image_metrics_and_images(self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]):
+        # Ensure RGB values are in [0, 1] range for LPIPS and handle NaN
+        if "rgb" in outputs:
+            outputs["rgb"] = torch.nan_to_num(outputs["rgb"], nan=0.0, posinf=1.0, neginf=0.0)
+            outputs["rgb"] = torch.clamp(outputs["rgb"], 0.0, 1.0)
         metrics_dict, images_dict = super().get_image_metrics_and_images(outputs, batch)
         if "feature_pca" in outputs:
             images_dict["feature_pca"] = outputs["feature_pca"]
@@ -585,6 +748,8 @@ class FeatureFieldModel(NerfactoModel):
             images_dict["centroid_spread_prob_soft_vs_gt"] = torch.cat([images_dict["centroid_spread_prob_soft_rgb"], images_dict["centroid_spread_prob_gt_rgb"]], dim=1)
         if "foreground_prob_rgb" in outputs:
             images_dict["foreground_prob_rgb"] = outputs["foreground_prob_rgb"]
+        if "orientany_rgb" in outputs:
+            images_dict["orientany_rgb"] = outputs["orientany_rgb"]
 
         # Foreground GT and side-by-side viz
         if self.config.foreground_enable and ("foreground" in batch) and ("foreground_prob_rgb" in outputs):
@@ -599,6 +764,31 @@ class FeatureFieldModel(NerfactoModel):
 
             images_dict["foreground_prob_gt"] = fg_gt_rgb
             images_dict["foreground_prob_vs_gt"] = torch.cat([outputs["foreground_prob_rgb"], fg_gt_rgb], dim=1)
+
+        # OrientAny GT and side-by-side viz
+        if self.config.orientany_enable and ("orientany" in batch) and ("orientany_rgb" in outputs):
+            orientany_gt = batch["orientany"].to(self.device)
+            if orientany_gt.ndim == 4 and orientany_gt.shape[0] == 1:
+                orientany_gt = orientany_gt.squeeze(0)
+            if orientany_gt.ndim == 3 and orientany_gt.shape[0] == 10:
+                orientany_gt = orientany_gt.permute(1, 2, 0)
+
+            # Convert GT distribution means to RGB on CPU to match predicted RGB
+            ax_mean_gt = orientany_gt[..., 0].cpu()  # azimuth mean
+            pl_mean_gt = orientany_gt[..., 2].cpu()  # polar mean
+            ro_mean_gt = orientany_gt[..., 4].cpu()  # roll mean
+            fg_gt = orientany_gt[..., 9].cpu() > 0.5  # foreground mask from GT
+
+            orientany_gt_rgb = torch.zeros((*orientany_gt.shape[:-1], 3), device="cpu")
+            orientany_gt_rgb[..., 0] = torch.clamp(ax_mean_gt / 359.0, 0, 1)
+            orientany_gt_rgb[..., 1] = torch.clamp(pl_mean_gt / 179.0, 0, 1)
+            orientany_gt_rgb[..., 2] = torch.clamp(ro_mean_gt / 359.0, 0, 1)
+
+            # Only show colors for foreground pixels (set background to black)
+            orientany_gt_rgb[~fg_gt] = 0.0
+
+            images_dict["orientany_gt_rgb"] = orientany_gt_rgb
+            images_dict["orientany_vs_gt"] = torch.cat([outputs["orientany_rgb"], orientany_gt_rgb], dim=1)
 
         # Centroid spread: side-by-side preds vs GTs
         if ("centroid_spread_prob_rgb" in images_dict) and ("centroid_spread_prob_gt_rgb" in outputs):

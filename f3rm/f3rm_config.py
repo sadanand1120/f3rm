@@ -15,6 +15,7 @@ from f3rm.pipeline import FeaturePipelineConfig
 # TODO: optimize code by calling super().bla at places (e.g. super().get_train_loss_dict() in pipeline.py)
 # TODO: reduce training time, look at original feature loading (.pt based) in f3rm, maybe thats the issue?
 # TODO: do model compression so training time is reduced as well, instead of having separate entire MLPs, just have a larger common trunk where possible, and have separate output heads
+# TODO: hardcoded model config in orientany, then later after you unstash orientany, add asserts for these assumed model config in pipeline etc
 f3rm_method = MethodSpecification(
     config=F3RMTrainerConfig(
         method_name="f3rm",
@@ -33,6 +34,7 @@ f3rm_method = MethodSpecification(
                 feature_type="CLIP",
                 sam2_feature_type="SAM2",
                 foreground_feature_type="FOREGROUND_",
+                orientany_feature_type="ORIENTANY_",
                 dataparser=NerfstudioDataParserConfig(train_split_fraction=0.95),
                 train_num_rays_per_batch=8192,
                 eval_num_rays_per_batch=4096,
@@ -50,7 +52,7 @@ f3rm_method = MethodSpecification(
                 feat_condition_on_density=False,  # degraded performance
                 feat_condition_density_grad_to_nerf=False,   # degraded performance
                 # Centroid head controls
-                centroid_enable=False,
+                centroid_enable=True,
                 centroid_loss_weight=2e-3,
                 centroid_condition_on_density=False,
                 centroid_condition_density_grad_to_nerf=False,
@@ -65,10 +67,20 @@ f3rm_method = MethodSpecification(
                 enable_campose_refine_feature_field=False,
                 foreground_loss_weight=2e-3,
                 foreground_hidden_dim=64,
-                foreground_num_layers=2,
+                foreground_num_layers=1,
                 # spread-fg sharing trunk
-                centroid_spread_trunk_fg=0,
+                centroid_spread_trunk_fg=64,
                 foreground_trunk_grad_to_spread=False,
+                # OrientAny head controls
+                orientany_enable=True,
+                orientany_condition_on_density=False,
+                orientany_condition_density_grad_to_nerf=False,
+                orientany_loss_weight=8e-3,
+                orientany_hidden_dim=64,
+                orientany_num_layers=2,
+                # spread-orientany sharing trunk
+                centroid_spread_trunk_orientany=0,
+                orientany_trunk_grad_to_spread=False,
             ),
             steps_per_train_cache_update=0,
             train_cache_cold_start_skip_steps=0,
