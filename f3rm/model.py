@@ -76,23 +76,17 @@ class FeatureFieldModelConfig(NerfactoModelConfig):
     foreground_condition_on_density: bool = True  # Condition foreground head on NeRF density embedding
     foreground_condition_density_grad_to_nerf: bool = False  # Allow foreground head gradients into NeRF density embedding
     foreground_hidden_dim: int = 64  # Foreground head hidden dim
-    foreground_num_layers: int = 2  # Foreground head num layers
-    # Foreground head uses same xyz-based encoding as feature head (no direction input)
-    # Optional: feed centroid-spread trunk features into foreground head for better calibration
-    centroid_spread_trunk_fg: int = 16  # 0 disables
-    foreground_trunk_grad_to_spread: bool = False  # allow grads from fg head into spread trunk
-
+    foreground_num_layers: int = 1  # Foreground head num layers
     # OrientAny head controls (4 separate heads: azimuth, polar, roll, foreground; supervised via ORIENTANY_* shards)
     orientany_enable: bool = True  # Enable separate OrientAny head (train + render)
     orientany_loss_weight: float = 1e-3  # Loss weight for OrientAny classification
     orientany_condition_on_density: bool = True  # Condition OrientAny head on NeRF density embedding
     orientany_condition_density_grad_to_nerf: bool = False  # Allow OrientAny head gradients into NeRF density embedding
     orientany_hidden_dim: int = 64  # OrientAny head hidden dim
-    orientany_num_layers: int = 3  # OrientAny head num layers (deeper due to complexity)
-    # OrientAny input controls: xyz encoding and/or spread trunk
+    orientany_num_layers: int = 1  # OrientAny head num layers
+    # OrientAny input controls: xyz encoding
     orientany_use_xyz_encoding: bool = True  # Use xyz positional encoding as input
-    centroid_spread_trunk_orientany: int = 16  # 0 disables spread trunk input
-    orientany_trunk_grad_to_spread: bool = False  # Allow OrientAny head gradients into centroid-spread trunk
+    orientany_use_centroid_penultimate: bool = False  # Use centroid penultimate layer features as input
 
     # Camera-pose refinement control: if False, cut gradient from all custom heads to camera optimizer (via detached weights)
     enable_campose_refine_feature_field: bool = True
@@ -207,10 +201,7 @@ class FeatureFieldModel(NerfactoModel):
             orientany_hidden_dim=self.config.orientany_hidden_dim,
             orientany_num_layers=self.config.orientany_num_layers,
             orientany_use_xyz_encoding=self.config.orientany_use_xyz_encoding,
-            centroid_spread_trunk_fg=self.config.centroid_spread_trunk_fg,
-            foreground_trunk_grad_to_spread=self.config.foreground_trunk_grad_to_spread,
-            centroid_spread_trunk_orientany=self.config.centroid_spread_trunk_orientany,
-            orientany_trunk_grad_to_spread=self.config.orientany_trunk_grad_to_spread,
+            orientany_use_centroid_penultimate=self.config.orientany_use_centroid_penultimate,
         )
 
         self.renderer_feature = FeatureRenderer()
@@ -272,25 +263,18 @@ class FeatureFieldModel(NerfactoModel):
             accumulation = self.renderer_accumulation(weights=weights)
 
         # Feature/Centroid/Spread/Foreground outputs (optionally conditioned on density embedding from NeRF)
-        # If foreground trunk tap is enabled, we need to compute centroid spread even if not explicitly requested
-        need_spread_for_fg = (render_foreground and self.config.foreground_enable and self.config.centroid_spread_trunk_fg > 0)
-        # If OrientAny trunk tap is enabled, we need to compute centroid spread even if not explicitly requested
-        need_spread_for_orientany = (render_orientany and self.config.orientany_enable and self.config.centroid_spread_trunk_orientany > 0)
         if (
             render_features
             or (render_centroid and self.config.centroid_enable)
             or (render_spread and self.config.centroid_enable)
             or (render_foreground and self.config.foreground_enable)
             or (render_orientany and self.config.orientany_enable)
-            or need_spread_for_fg
-            or need_spread_for_orientany
         ):
             cut_cam_refine: bool = not getattr(self.config, "enable_campose_refine_feature_field", True)
             need_density = (
                 (render_features and self.config.feat_condition_on_density)
                 or (render_centroid and self.config.centroid_enable and self.config.centroid_condition_on_density)
                 or (render_spread and self.config.centroid_enable and self.config.centroid_condition_on_density)
-                or (need_spread_for_fg and self.config.centroid_condition_on_density)
                 or (render_foreground and self.config.foreground_condition_on_density)
                 or (render_orientany and self.config.orientany_enable and self.config.orientany_condition_on_density)
             )
@@ -300,7 +284,7 @@ class FeatureFieldModel(NerfactoModel):
                 allow_grad = False
                 if render_features and self.config.feat_condition_on_density and self.config.feat_condition_density_grad_to_nerf:
                     allow_grad = True
-                if (render_centroid or render_spread or need_spread_for_fg) and self.config.centroid_enable and self.config.centroid_condition_on_density and self.config.centroid_condition_density_grad_to_nerf:
+                if (render_centroid or render_spread) and self.config.centroid_enable and self.config.centroid_condition_on_density and self.config.centroid_condition_density_grad_to_nerf:
                     allow_grad = True
                 if render_foreground and self.config.foreground_condition_on_density and self.config.foreground_condition_density_grad_to_nerf:
                     allow_grad = True
@@ -321,7 +305,7 @@ class FeatureFieldModel(NerfactoModel):
                 cent_vals = self.feature_field.get_centroid(ray_samples, density_embedding=density_embedding)
                 centroid_pred = self.renderer_centroid(values=cent_vals, weights=custom_weights)
                 del cent_vals
-            if (render_spread or need_spread_for_fg) and self.config.centroid_enable:
+            if render_spread and self.config.centroid_enable:
                 # Four-channel spread head: [error, foreground_logit, soft0_logit, soft1_logit]
                 spread_vals = self.feature_field.get_centroid_spread(ray_samples, density_embedding=density_embedding)
                 centroid_spread_2ch = self.renderer_spread(values=spread_vals, weights=custom_weights)
@@ -340,17 +324,17 @@ class FeatureFieldModel(NerfactoModel):
                 orientany_foreground_vals = self.feature_field.get_orientany_foreground(ray_samples, density_embedding=density_embedding)
 
                 if not self.training:  # Eval: render on CPU for memory efficiency
-                    orientany_azimuth_logits_cpu = self.renderer_spread(values=orientany_azimuth_vals.cpu(), weights=custom_weights.cpu())
-                    orientany_polar_logits_cpu = self.renderer_spread(values=orientany_polar_vals.cpu(), weights=custom_weights.cpu())
-                    orientany_roll_logits_cpu = self.renderer_spread(values=orientany_roll_vals.cpu(), weights=custom_weights.cpu())
-                    orientany_foreground_logits_cpu = self.renderer_spread(values=orientany_foreground_vals.cpu(), weights=custom_weights.cpu())
+                    with torch.no_grad():
+                        orientany_azimuth_logits_cpu = self.renderer_spread(values=orientany_azimuth_vals.detach().cpu(), weights=custom_weights.detach().cpu())
+                        orientany_polar_logits_cpu = self.renderer_spread(values=orientany_polar_vals.detach().cpu(), weights=custom_weights.detach().cpu())
+                        orientany_roll_logits_cpu = self.renderer_spread(values=orientany_roll_vals.detach().cpu(), weights=custom_weights.detach().cpu())
+                        orientany_foreground_logits_cpu = self.renderer_spread(values=orientany_foreground_vals.detach().cpu(), weights=custom_weights.detach().cpu())
 
-                    # Concatenate on CPU for backward compatibility
-                    orientany_logits = torch.cat([orientany_azimuth_logits_cpu, orientany_polar_logits_cpu, orientany_roll_logits_cpu, orientany_foreground_logits_cpu], dim=-1)
-                    orientany_logits = orientany_logits.to(orientany_azimuth_vals.device, non_blocking=True)
+                        # Concatenate on CPU for backward compatibility
+                        orientany_logits = torch.cat([orientany_azimuth_logits_cpu, orientany_polar_logits_cpu, orientany_roll_logits_cpu, orientany_foreground_logits_cpu], dim=-1)
 
-                    # Clean up CPU intermediates
-                    del orientany_azimuth_logits_cpu, orientany_polar_logits_cpu, orientany_roll_logits_cpu, orientany_foreground_logits_cpu
+                        # Clean up CPU intermediates
+                        del orientany_azimuth_logits_cpu, orientany_polar_logits_cpu, orientany_roll_logits_cpu, orientany_foreground_logits_cpu
                 else:
                     # Training: render each component separately on GPU
                     orientany_azimuth_logits = self.renderer_spread(values=orientany_azimuth_vals, weights=custom_weights)
@@ -381,7 +365,7 @@ class FeatureFieldModel(NerfactoModel):
             outputs["feature"] = features
         if render_centroid and self.config.centroid_enable:
             outputs["centroid"] = centroid_pred
-        if (render_spread or need_spread_for_fg) and self.config.centroid_enable:
+        if render_spread and self.config.centroid_enable:
             outputs["centroid_spread"] = centroid_spread_2ch
         if render_foreground and self.config.foreground_enable:
             outputs["foreground_logits"] = foreground_logits

@@ -11,6 +11,54 @@ from nerfstudio.fields.base_field import Field
 from torch import Tensor
 
 
+class CustomCentroidNetwork(torch.nn.Module):
+    """Custom network for centroid head that provides access to penultimate layer features."""
+
+    def __init__(self, n_input_dims: int, n_output_dims: int, n_penultimate_dims: int,
+                 n_neurons: int, n_hidden_layers: int):
+        super().__init__()
+        self.n_input_dims = n_input_dims
+        self.n_output_dims = n_output_dims
+        self.n_penultimate_dims = n_penultimate_dims
+        self.n_neurons = n_neurons
+        self.n_hidden_layers = n_hidden_layers
+
+        # Build the network layers
+        layers = []
+        in_dims = n_input_dims
+
+        # Hidden layers
+        for i in range(n_hidden_layers):
+            layers.append(torch.nn.Linear(in_dims, n_neurons))
+            layers.append(torch.nn.ReLU())
+            in_dims = n_neurons
+
+        # Penultimate layer (this will be the last hidden layer)
+        self.penultimate_layer = torch.nn.Linear(in_dims, n_penultimate_dims)
+        self.penultimate_activation = torch.nn.ReLU()
+
+        # Output layer
+        self.output_layer = torch.nn.Linear(n_penultimate_dims, n_output_dims)
+
+        # Store the sequential layers for the main path
+        self.hidden_layers = torch.nn.Sequential(*layers)
+
+    def forward(self, x):
+        # Ensure input dtype matches network parameters
+        x = x.to(self.penultimate_layer.weight.dtype)
+
+        # Pass through hidden layers
+        x = self.hidden_layers(x)
+
+        # Get penultimate features
+        penultimate_features = self.penultimate_activation(self.penultimate_layer(x))
+
+        # Get output
+        output = self.output_layer(penultimate_features)
+
+        return output, penultimate_features
+
+
 class FeatureFieldHeadNames:
     FEATURE: str = "feature"
     CENTROID: str = "centroid"
@@ -52,17 +100,13 @@ class FeatureField(Field):
         centroid_num_layers: int = 2,
         # Foreground head MLP (binary classification with 2 logits)
         foreground_hidden_dim: int = 64,
-        foreground_num_layers: int = 2,
+        foreground_num_layers: int = 1,
         # OrientAny head MLP (4 separate heads: 360 azimuth + 180 polar + 360 roll + 2 foreground)
         orientany_hidden_dim: int = 64,
-        orientany_num_layers: int = 3,
-        # Optional trunk tap from centroid-spread encoder
-        centroid_spread_trunk_fg: int = 0,
-        foreground_trunk_grad_to_spread: bool = False,
-        # OrientAny input controls: xyz encoding and/or spread trunk
+        orientany_num_layers: int = 1,
+        # OrientAny input controls: xyz encoding and/or centroid penultimate layer
         orientany_use_xyz_encoding: bool = True,
-        centroid_spread_trunk_orientany: int = 0,
-        orientany_trunk_grad_to_spread: bool = False,
+        orientany_use_centroid_penultimate: bool = False,
     ):
         super().__init__()
         self.feature_dim = feature_dim
@@ -75,15 +119,11 @@ class FeatureField(Field):
         self.centroid_grad_to_density = centroid_grad_to_density
         self.foreground_grad_to_density = foreground_grad_to_density
         self.orientany_grad_to_density = orientany_grad_to_density
-        # Foreground head shares the same positional encoding as other heads (no direction encoding)
-        self.centroid_spread_trunk_fg = int(centroid_spread_trunk_fg)
-        self.foreground_trunk_grad_to_spread = bool(foreground_trunk_grad_to_spread)
         self.orientany_use_xyz_encoding = bool(orientany_use_xyz_encoding)
-        self.centroid_spread_trunk_orientany = int(centroid_spread_trunk_orientany)
-        self.orientany_trunk_grad_to_spread = bool(orientany_trunk_grad_to_spread)
+        self.orientany_use_centroid_penultimate = bool(orientany_use_centroid_penultimate)
 
         # Assert that OrientAny heads have at least one input source
-        assert orientany_use_xyz_encoding or centroid_spread_trunk_orientany > 0, "OrientAny heads must have at least one input source: xyz encoding or spread trunk"
+        assert orientany_use_xyz_encoding or orientany_use_centroid_penultimate, "OrientAny heads must have at least one input source: xyz encoding or centroid penultimate layer"
 
         # Feature field has its own hash grid
         growth_factor = np.exp((np.log(max_res) - np.log(start_res)) / (num_levels - 1))
@@ -126,23 +166,39 @@ class FeatureField(Field):
         )
 
         mlp_in_dims_centroid = self.encoding.n_output_dims + (density_embedding_dim if self.cond_on_density_centroid else 0)
-        self.mlp_centroid = tcnn.Network(
-            n_input_dims=mlp_in_dims_centroid,
-            n_output_dims=3,
-            network_config={
-                "otype": "FullyFusedMLP",
-                "activation": "ReLU",
-                "output_activation": "None",
-                "n_neurons": centroid_hidden_dim,
-                "n_hidden_layers": centroid_num_layers,
-            },
-        )
 
-        # Centroid spread head (scalar) - outputs spread preds (2), softmax logits (2), and optional trunk features
+        # Use custom network for centroid to access penultimate layer when needed
+        if self.orientany_use_centroid_penultimate:
+            # Custom network with access to penultimate layer
+            # Use centroid_num_layers - 1 to maintain equivalence with standard mode
+            # Standard: n_hidden_layers + 1 output = total layers
+            # Custom: (n_hidden_layers - 1) + 1 penultimate + 1 output = total layers
+            self.mlp_centroid = CustomCentroidNetwork(
+                n_input_dims=mlp_in_dims_centroid,
+                n_output_dims=3,
+                n_penultimate_dims=centroid_hidden_dim,
+                n_neurons=centroid_hidden_dim,
+                n_hidden_layers=centroid_num_layers - 1,
+            )
+        else:
+            # Standard network
+            self.mlp_centroid = tcnn.Network(
+                n_input_dims=mlp_in_dims_centroid,
+                n_output_dims=3,
+                network_config={
+                    "otype": "FullyFusedMLP",
+                    "activation": "ReLU",
+                    "output_activation": "None",
+                    "n_neurons": centroid_hidden_dim,
+                    "n_hidden_layers": centroid_num_layers,
+                },
+            )
+
+        # Centroid spread head (scalar) - outputs spread preds (2), softmax logits (2)
         mlp_in_dims_spread = self.encoding.n_output_dims + (density_embedding_dim if self.cond_on_density_centroid else 0)
         self.mlp_centroid_spread = tcnn.Network(
             n_input_dims=mlp_in_dims_spread,
-            n_output_dims=4 + max(self.centroid_spread_trunk_fg, self.centroid_spread_trunk_orientany),
+            n_output_dims=4,
             network_config={
                 "otype": "FullyFusedMLP",
                 "activation": "ReLU",
@@ -152,8 +208,8 @@ class FeatureField(Field):
             },
         )
 
-        # Foreground classification head (2 logits with optional direction + density conditioning)
-        mlp_in_dims_foreground = self.encoding.n_output_dims + (density_embedding_dim if self.cond_on_density_foreground else 0) + (self.centroid_spread_trunk_fg if self.centroid_spread_trunk_fg > 0 else 0)
+        # Foreground classification head (2 logits with density conditioning)
+        mlp_in_dims_foreground = self.encoding.n_output_dims + (density_embedding_dim if self.cond_on_density_foreground else 0)
         self.mlp_foreground = tcnn.Network(
             n_input_dims=mlp_in_dims_foreground,
             n_output_dims=2,
@@ -167,7 +223,7 @@ class FeatureField(Field):
         )
 
         # OrientAny heads (4 separate MLPs: azimuth, polar, roll, foreground)
-        mlp_in_dims_orientany = (self.encoding.n_output_dims if self.orientany_use_xyz_encoding else 0) + (density_embedding_dim if self.cond_on_density_orientany else 0) + (self.centroid_spread_trunk_orientany if self.centroid_spread_trunk_orientany > 0 else 0)
+        mlp_in_dims_orientany = (self.encoding.n_output_dims if self.orientany_use_xyz_encoding else 0) + (density_embedding_dim if self.cond_on_density_orientany else 0) + (centroid_hidden_dim if self.orientany_use_centroid_penultimate else 0)
 
         # Azimuth head (360 logits for 0-359 degrees)
         self.mlp_orientany_azimuth = tcnn.Network(
@@ -253,10 +309,20 @@ class FeatureField(Field):
             if not self.centroid_grad_to_density:
                 cond = cond.detach()
             encoded_cent = torch.cat([encoded_cent, cond], dim=-1)
-        centroid = self.mlp_centroid(encoded_cent).view(*ray_samples.frustums.directions.shape[:-1], -1)
+
+        if self.orientany_use_centroid_penultimate:
+            # Custom network returns both output and penultimate features
+            centroid_output, penultimate_features = self.mlp_centroid(encoded_cent)
+            centroid = centroid_output.view(*ray_samples.frustums.directions.shape[:-1], -1)
+            # Store penultimate features for OrientAny heads (no gradients back to centroid)
+            self._centroid_penultimate_features = penultimate_features.detach().view(*ray_samples.frustums.directions.shape[:-1], -1)
+        else:
+            # Standard network
+            centroid = self.mlp_centroid(encoded_cent).view(*ray_samples.frustums.directions.shape[:-1], -1)
+
         return centroid
 
-    def get_centroid_spread(self, ray_samples: RaySamples, density_embedding: Optional[Tensor] = None, return_full: bool = False) -> Tensor:
+    def get_centroid_spread(self, ray_samples: RaySamples, density_embedding: Optional[Tensor] = None) -> Tensor:
         encoded_base = self._encode_positions(ray_samples)
         encoded_spread = encoded_base
         if self.cond_on_density_centroid and density_embedding is not None:
@@ -264,9 +330,8 @@ class FeatureField(Field):
             if not self.centroid_grad_to_density:
                 cond = cond.detach()
             encoded_spread = torch.cat([encoded_spread, cond], dim=-1)
-        spread_full = self.mlp_centroid_spread(encoded_spread).view(*ray_samples.frustums.directions.shape[:-1], -1)
-        # Return full output (4 + trunk) only when requested (foreground trunk); default returns first 4 channels
-        return spread_full if return_full else spread_full[..., :4]
+        spread = self.mlp_centroid_spread(encoded_spread).view(*ray_samples.frustums.directions.shape[:-1], -1)
+        return spread
 
     def get_foreground(self, ray_samples: RaySamples, density_embedding: Optional[Tensor] = None) -> Tensor:
         encoded_base = self._encode_positions(ray_samples)
@@ -276,17 +341,7 @@ class FeatureField(Field):
             if not self.foreground_grad_to_density:
                 cond = cond.detach()
             parts.append(cond)
-        # Append optional centroid-spread trunk features if enabled
-        if self.centroid_spread_trunk_fg > 0:
-            # Get the full centroid spread output and extract trunk features
-            spread_full = self.get_centroid_spread(ray_samples, density_embedding=density_embedding, return_full=True)
-            # Trunk starts after 4 channels: [err, fg_logit, soft0_logit, soft1_logit]
-            trunk_feat = spread_full[..., 4:4 + self.centroid_spread_trunk_fg]
-            # Flatten trunk features to match encoded_base shape for concatenation
-            trunk_feat = trunk_feat.view(-1, self.centroid_spread_trunk_fg)
-            if not self.foreground_trunk_grad_to_spread:
-                trunk_feat = trunk_feat.detach()
-            parts.append(trunk_feat)
+
         encoded_fg = torch.cat(parts, dim=-1)
         logits = self.mlp_foreground(encoded_fg).view(*ray_samples.frustums.directions.shape[:-1], -1)
         return logits
@@ -301,17 +356,14 @@ class FeatureField(Field):
             if not self.orientany_grad_to_density:
                 cond = cond.detach()
             parts.append(cond)
-        # Append optional centroid-spread trunk features if enabled
-        if self.centroid_spread_trunk_orientany > 0:
-            # Get the full centroid spread output and extract trunk features
-            spread_full = self.get_centroid_spread(ray_samples, density_embedding=density_embedding, return_full=True)
-            # Trunk starts after 4 channels: [err, fg_logit, soft0_logit, soft1_logit]
-            trunk_feat = spread_full[..., 4:4 + self.centroid_spread_trunk_orientany]
-            # Flatten trunk features to match encoded_base shape for concatenation
-            trunk_feat = trunk_feat.view(-1, self.centroid_spread_trunk_orientany)
-            if not self.orientany_trunk_grad_to_spread:
-                trunk_feat = trunk_feat.detach()
-            parts.append(trunk_feat)
+        # Append centroid penultimate features if enabled
+        if self.orientany_use_centroid_penultimate:
+            if hasattr(self, '_centroid_penultimate_features'):
+                parts.append(self._centroid_penultimate_features.view(-1, self._centroid_penultimate_features.shape[-1]))
+            else:
+                # Fallback: compute centroid to get penultimate features
+                _ = self.get_centroid(ray_samples, density_embedding)
+                parts.append(self._centroid_penultimate_features.view(-1, self._centroid_penultimate_features.shape[-1]))
         encoded_orientany = torch.cat(parts, dim=-1)
         logits = self.mlp_orientany_azimuth(encoded_orientany).view(*ray_samples.frustums.directions.shape[:-1], -1)
         return logits
@@ -326,17 +378,14 @@ class FeatureField(Field):
             if not self.orientany_grad_to_density:
                 cond = cond.detach()
             parts.append(cond)
-        # Append optional centroid-spread trunk features if enabled
-        if self.centroid_spread_trunk_orientany > 0:
-            # Get the full centroid spread output and extract trunk features
-            spread_full = self.get_centroid_spread(ray_samples, density_embedding=density_embedding, return_full=True)
-            # Trunk starts after 4 channels: [err, fg_logit, soft0_logit, soft1_logit]
-            trunk_feat = spread_full[..., 4:4 + self.centroid_spread_trunk_orientany]
-            # Flatten trunk features to match encoded_base shape for concatenation
-            trunk_feat = trunk_feat.view(-1, self.centroid_spread_trunk_orientany)
-            if not self.orientany_trunk_grad_to_spread:
-                trunk_feat = trunk_feat.detach()
-            parts.append(trunk_feat)
+        # Append centroid penultimate features if enabled
+        if self.orientany_use_centroid_penultimate:
+            if hasattr(self, '_centroid_penultimate_features'):
+                parts.append(self._centroid_penultimate_features.view(-1, self._centroid_penultimate_features.shape[-1]))
+            else:
+                # Fallback: compute centroid to get penultimate features
+                _ = self.get_centroid(ray_samples, density_embedding)
+                parts.append(self._centroid_penultimate_features.view(-1, self._centroid_penultimate_features.shape[-1]))
         encoded_orientany = torch.cat(parts, dim=-1)
         logits = self.mlp_orientany_polar(encoded_orientany).view(*ray_samples.frustums.directions.shape[:-1], -1)
         return logits
@@ -351,17 +400,14 @@ class FeatureField(Field):
             if not self.orientany_grad_to_density:
                 cond = cond.detach()
             parts.append(cond)
-        # Append optional centroid-spread trunk features if enabled
-        if self.centroid_spread_trunk_orientany > 0:
-            # Get the full centroid spread output and extract trunk features
-            spread_full = self.get_centroid_spread(ray_samples, density_embedding=density_embedding, return_full=True)
-            # Trunk starts after 4 channels: [err, fg_logit, soft0_logit, soft1_logit]
-            trunk_feat = spread_full[..., 4:4 + self.centroid_spread_trunk_orientany]
-            # Flatten trunk features to match encoded_base shape for concatenation
-            trunk_feat = trunk_feat.view(-1, self.centroid_spread_trunk_orientany)
-            if not self.orientany_trunk_grad_to_spread:
-                trunk_feat = trunk_feat.detach()
-            parts.append(trunk_feat)
+        # Append centroid penultimate features if enabled
+        if self.orientany_use_centroid_penultimate:
+            if hasattr(self, '_centroid_penultimate_features'):
+                parts.append(self._centroid_penultimate_features.view(-1, self._centroid_penultimate_features.shape[-1]))
+            else:
+                # Fallback: compute centroid to get penultimate features
+                _ = self.get_centroid(ray_samples, density_embedding)
+                parts.append(self._centroid_penultimate_features.view(-1, self._centroid_penultimate_features.shape[-1]))
         encoded_orientany = torch.cat(parts, dim=-1)
         logits = self.mlp_orientany_roll(encoded_orientany).view(*ray_samples.frustums.directions.shape[:-1], -1)
         return logits
@@ -376,17 +422,14 @@ class FeatureField(Field):
             if not self.orientany_grad_to_density:
                 cond = cond.detach()
             parts.append(cond)
-        # Append optional centroid-spread trunk features if enabled
-        if self.centroid_spread_trunk_orientany > 0:
-            # Get the full centroid spread output and extract trunk features
-            spread_full = self.get_centroid_spread(ray_samples, density_embedding=density_embedding, return_full=True)
-            # Trunk starts after 4 channels: [err, fg_logit, soft0_logit, soft1_logit]
-            trunk_feat = spread_full[..., 4:4 + self.centroid_spread_trunk_orientany]
-            # Flatten trunk features to match encoded_base shape for concatenation
-            trunk_feat = trunk_feat.view(-1, self.centroid_spread_trunk_orientany)
-            if not self.orientany_trunk_grad_to_spread:
-                trunk_feat = trunk_feat.detach()
-            parts.append(trunk_feat)
+        # Append centroid penultimate features if enabled
+        if self.orientany_use_centroid_penultimate:
+            if hasattr(self, '_centroid_penultimate_features'):
+                parts.append(self._centroid_penultimate_features.view(-1, self._centroid_penultimate_features.shape[-1]))
+            else:
+                # Fallback: compute centroid to get penultimate features
+                _ = self.get_centroid(ray_samples, density_embedding)
+                parts.append(self._centroid_penultimate_features.view(-1, self._centroid_penultimate_features.shape[-1]))
         encoded_orientany = torch.cat(parts, dim=-1)
         logits = self.mlp_orientany_foreground(encoded_orientany).view(*ray_samples.frustums.directions.shape[:-1], -1)
         return logits
@@ -404,6 +447,10 @@ class FeatureField(Field):
         roll = self.get_orientany_roll(ray_samples, density_embedding)
         orientany_fg = self.get_orientany_foreground(ray_samples, density_embedding)
         orientany = torch.cat([azimuth, polar, roll, orientany_fg], dim=-1)
+
+        # Clear stored penultimate features after use
+        if hasattr(self, '_centroid_penultimate_features'):
+            delattr(self, '_centroid_penultimate_features')
 
         return {
             FeatureFieldHeadNames.FEATURE: features,

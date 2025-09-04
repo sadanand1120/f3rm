@@ -68,21 +68,17 @@ f3rm_method = MethodSpecification(
                 enable_campose_refine_feature_field=False,
                 foreground_loss_weight=2e-3,
                 foreground_hidden_dim=64,
-                foreground_num_layers=1,
-                # spread-fg sharing trunk
-                centroid_spread_trunk_fg=64,
-                foreground_trunk_grad_to_spread=False,
+                foreground_num_layers=2,
                 # OrientAny head controls
                 orientany_enable=True,
                 orientany_condition_on_density=False,
                 orientany_condition_density_grad_to_nerf=False,
                 orientany_loss_weight=2e-3,
                 orientany_hidden_dim=64,
-                orientany_num_layers=1,
-                # OrientAny input controls: xyz encoding and/or spread trunk
-                orientany_use_xyz_encoding=True,
-                centroid_spread_trunk_orientany=64,
-                orientany_trunk_grad_to_spread=False,
+                orientany_num_layers=2,
+                # OrientAny input controls: xyz encoding and/or centroid penultimate layer
+                orientany_use_xyz_encoding=False,
+                orientany_use_centroid_penultimate=True,
             ),
             steps_per_train_cache_update=0,
             train_cache_cold_start_skip_steps=0,
