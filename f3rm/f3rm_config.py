@@ -21,6 +21,8 @@ f3rm_method = MethodSpecification(
     config=F3RMTrainerConfig(
         method_name="f3rm",
         steps_per_eval_batch=500,
+        steps_per_eval_image=100000,   # HACK TODO: for rapid testing, since its too slow
+        steps_per_eval_all_images=100000,  # HACK TODO: for rapid testing, since its too slow
         steps_per_save=5000,
         max_num_iterations=30000,
         mixed_precision=True,
@@ -76,9 +78,8 @@ f3rm_method = MethodSpecification(
                 orientany_loss_weight=2e-3,
                 orientany_hidden_dim=64,
                 orientany_num_layers=2,
-                # OrientAny input controls: xyz encoding and/or centroid penultimate layer
+                # OrientAny input controls: xyz encoding (True) or encoded centroid prediction (False)
                 orientany_use_xyz_encoding=False,
-                orientany_use_centroid_penultimate=True,
             ),
             steps_per_train_cache_update=0,
             train_cache_cold_start_skip_steps=0,
@@ -86,15 +87,15 @@ f3rm_method = MethodSpecification(
         ),
         optimizers={
             "proposal_networks": {
-                "optimizer": AdamOptimizerConfig(lr=1e-2, eps=1e-15),
+                "optimizer": AdamOptimizerConfig(lr=1e-2, eps=1e-15, max_norm=1.0),
                 "scheduler": ExponentialDecaySchedulerConfig(lr_final=0.0001, max_steps=200000),
             },
             "fields": {
-                "optimizer": AdamOptimizerConfig(lr=1e-2, eps=1e-15),
+                "optimizer": AdamOptimizerConfig(lr=1e-2, eps=1e-15, max_norm=1.0),
                 "scheduler": ExponentialDecaySchedulerConfig(lr_final=0.0001, max_steps=200000),
             },
             "feature_field": {
-                "optimizer": AdamOptimizerConfig(lr=1e-2, eps=1e-15),
+                "optimizer": AdamOptimizerConfig(lr=1e-2, eps=1e-15, max_norm=1.0),
                 "scheduler": ExponentialDecaySchedulerConfig(lr_final=0.0001, max_steps=200000),
             },
         },

@@ -84,9 +84,8 @@ class FeatureFieldModelConfig(NerfactoModelConfig):
     orientany_condition_density_grad_to_nerf: bool = False  # Allow OrientAny head gradients into NeRF density embedding
     orientany_hidden_dim: int = 64  # OrientAny head hidden dim
     orientany_num_layers: int = 1  # OrientAny head num layers
-    # OrientAny input controls: xyz encoding
-    orientany_use_xyz_encoding: bool = True  # Use xyz positional encoding as input
-    orientany_use_centroid_penultimate: bool = False  # Use centroid penultimate layer features as input
+    # OrientAny input controls: xyz encoding (True) or encoded centroid prediction (False)
+    orientany_use_xyz_encoding: bool = True
 
     # Camera-pose refinement control: if False, cut gradient from all custom heads to camera optimizer (via detached weights)
     enable_campose_refine_feature_field: bool = True
@@ -201,7 +200,6 @@ class FeatureFieldModel(NerfactoModel):
             orientany_hidden_dim=self.config.orientany_hidden_dim,
             orientany_num_layers=self.config.orientany_num_layers,
             orientany_use_xyz_encoding=self.config.orientany_use_xyz_encoding,
-            orientany_use_centroid_penultimate=self.config.orientany_use_centroid_penultimate,
         )
 
         self.renderer_feature = FeatureRenderer()
@@ -461,10 +459,22 @@ class FeatureFieldModel(NerfactoModel):
                 pl_idx = torch.clamp(torch.round(orientany_target[fg_indices, 2]), 0, 179).long()
                 ro_idx = torch.clamp(torch.round(orientany_target[fg_indices, 4]), 0, 359).long()
 
-                # Cross-entropy losses (more stable)
-                ce_ax = F.cross_entropy(gaus_ax_logits[fg_indices], ax_idx)
-                ce_pl = F.cross_entropy(gaus_pl_logits[fg_indices], pl_idx)
-                ce_ro = F.cross_entropy(gaus_ro_logits[fg_indices], ro_idx)
+                # Variance-aware weighting: higher variance => lower weight (stable 1/(1+var) scheme)
+                eps = 1e-6
+                var_ax = torch.nan_to_num(torch.clamp(orientany_target[fg_indices, 1], min=0.0), nan=0.0, posinf=1e6, neginf=0.0)
+                var_pl = torch.nan_to_num(torch.clamp(orientany_target[fg_indices, 3], min=0.0), nan=0.0, posinf=1e6, neginf=0.0)
+                var_ro = torch.nan_to_num(torch.clamp(orientany_target[fg_indices, 5], min=0.0), nan=0.0, posinf=1e6, neginf=0.0)
+                w_ax = torch.clamp(1.0 / (1.0 + var_ax + eps), 0.05, 1.0)
+                w_pl = torch.clamp(1.0 / (1.0 + var_pl + eps), 0.05, 1.0)
+                w_ro = torch.clamp(1.0 / (1.0 + var_ro + eps), 0.05, 1.0)
+
+                # Cross-entropy with per-sample weights
+                ce_ax_all = F.cross_entropy(gaus_ax_logits[fg_indices], ax_idx, reduction="none")
+                ce_pl_all = F.cross_entropy(gaus_pl_logits[fg_indices], pl_idx, reduction="none")
+                ce_ro_all = F.cross_entropy(gaus_ro_logits[fg_indices], ro_idx, reduction="none")
+                ce_ax = (ce_ax_all * w_ax).mean()
+                ce_pl = (ce_pl_all * w_pl).mean()
+                ce_ro = (ce_ro_all * w_ro).mean()
 
                 # Store separate losses (don't add them)
                 loss_dict["orientany_azimuth_loss"] = self.config.orientany_loss_weight * ce_ax
