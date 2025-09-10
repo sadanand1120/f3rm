@@ -13,7 +13,8 @@ from sam2.features.utils import SAM2utils
 from sam2.features.clip_main import CLIPfeatures
 from sam2.features.utils import AsyncMultiWrapper
 
-from f3rm.features.utils import LazyFeatures, SAM2LazyAutoMasks, TextLazyFeatures, run_async_in_any_context, resolve_devices_and_workers
+from f3rm.features.utils import run_async_in_any_context, resolve_devices_and_workers
+from f3rm.features.utils import BatchFeatureLoader
 from f3rm.features.sam2_extract import SAM2Args
 
 
@@ -60,21 +61,14 @@ class FOREGROUNDWorker:
         clip_meta = torch.load(clip_root / "meta.pt")
         self.feat_image_fnames = [str(p) for p in clip_meta["image_fnames"]]
 
-        # Load caches
-        clip_shards = sorted(clip_root.glob("chunk_*.npy"))
-        assert clip_shards, f"No CLIP shards under {clip_root}"
-        self.clip_features = LazyFeatures(clip_shards)
-
-        sam2_shards = sorted(sam2_root.glob("chunk_*.npz"))
-        assert sam2_shards, f"No SAM2 shards under {sam2_root}"
-        self.sam2_masks = SAM2LazyAutoMasks(sam2_shards)
+        # Create batch feature loaders for the new per-image system
+        self.clip_loader = BatchFeatureLoader(self.data_dir, "CLIP", self.feat_image_fnames, device)
+        self.sam2_loader = BatchFeatureLoader(self.data_dir, "SAM2", self.feat_image_fnames, device)
 
         if self.text_prompts is None:
-            text_shards = sorted(text_root.glob("chunk_*.json"))
-            assert text_shards, f"No TEXT shards under {text_root}"
-            self.text_features = TextLazyFeatures(text_shards)
+            self.text_loader = BatchFeatureLoader(self.data_dir, "TEXT", self.feat_image_fnames, device)
         else:
-            self.text_features = None
+            self.text_loader = None
 
         self.clip_model = CLIPfeatures(device=self.device)
 
@@ -85,12 +79,12 @@ class FOREGROUNDWorker:
         except ValueError:
             raise ValueError(f"Image path not found in CLIP meta order: {image_path}")
 
-        clip_patch_feats = self.clip_features[idx].to(self.device)
-        raw_auto_masks = self.sam2_masks[idx]
+        clip_patch_feats = self.clip_loader[idx]
+        raw_auto_masks = self.sam2_loader[idx]
 
         # prompts
         if self.text_prompts is None:
-            text_prompts = self.text_features[idx]
+            text_prompts = self.text_loader[idx]
         else:
             text_prompts = self.text_prompts
 
@@ -98,7 +92,7 @@ class FOREGROUNDWorker:
             # Return all background
             h, w = (raw_auto_masks[0]['segmentation'].shape if raw_auto_masks else (Image.open(image_path).size[1], Image.open(image_path).size[0]))
             fg = np.zeros((h, w), dtype=bool)
-            one_hot = np.stack([~fg, fg], axis=-1).astype(np.float32)
+            one_hot = np.stack([~fg, fg], axis=-1).astype(np.float16)  # Use fp16 for VRAM efficiency
             return one_hot
 
         # Instance mask from SAM2
@@ -142,14 +136,14 @@ class FOREGROUNDWorker:
             auto_masks.append({
                 "segmentation": seg,
                 "bbox": bbox,
-                "predicted_iou": float("inf"),
-                "area": float("inf"),
+                "predicted_iou": np.float16("inf"),  # Use fp16 for VRAM efficiency
+                "area": np.float16("inf"),           # Use fp16 for VRAM efficiency
             })
 
         if not auto_masks:
             h, w = inst_mask.shape
             fg = np.zeros((h, w), dtype=bool)
-            one_hot = np.stack([~fg, fg], axis=-1).astype(np.float32)
+            one_hot = np.stack([~fg, fg], axis=-1).astype(np.float16)  # Use fp16 for VRAM efficiency
             return one_hot
 
         h, w = auto_masks[0]["segmentation"].shape
@@ -157,8 +151,8 @@ class FOREGROUNDWorker:
         # Per-prompt sim maps and combine
         segment_sim_maps: List[np.ndarray] = []
         for text in text_prompts:
-            text_emb = self.clip_model.encode_text(text)
-            neg_text_embs = torch.stack([self.clip_model.encode_text(neg) for neg in FOREGROUNDArgs.negative_texts], dim=0)
+            text_emb = self.clip_model.encode_text(text).half()
+            neg_text_embs = torch.stack([self.clip_model.encode_text(neg).half() for neg in FOREGROUNDArgs.negative_texts], dim=0)
             sim_map = self.clip_model.compute_similarity(
                 clip_patch_feats,
                 text_emb,
@@ -166,7 +160,7 @@ class FOREGROUNDWorker:
                 softmax_temp=FOREGROUNDArgs.softmax_temp,
                 normalize=True,
             )
-            sim_map_up = np.array(Image.fromarray(sim_map.cpu().numpy()).resize((w, h), Image.BILINEAR))
+            sim_map_up = np.array(Image.fromarray(sim_map.cpu().float().numpy()).resize((w, h), Image.BILINEAR)).astype(np.float16)
 
             seg_map = np.zeros_like(sim_map_up)
             for m in auto_masks:
@@ -189,7 +183,7 @@ class FOREGROUNDWorker:
             if np.any(combined_sim[seg] > FOREGROUNDArgs.sim_thresh):
                 fg_mask |= seg
 
-        one_hot = np.stack([~fg_mask, fg_mask], axis=-1).astype(np.float32)
+        one_hot = np.stack([~fg_mask, fg_mask], axis=-1).astype(np.float16)  # Use fp16 for VRAM efficiency
         return one_hot
 
 
@@ -211,12 +205,12 @@ class FOREGROUNDExtractor:
 
         if not (clip_root / "meta.pt").exists():
             raise FileNotFoundError(f"Missing CLIP meta: {clip_root / 'meta.pt'}")
-        if not list(clip_root.glob("chunk_*.npy")):
-            raise FileNotFoundError(f"Missing CLIP shards under {clip_root}")
-        if not list(sam2_root.glob("chunk_*.npz")):
-            raise FileNotFoundError(f"Missing SAM2 shards under {sam2_root}")
-        if text_prompts is None and not list(text_root.glob("chunk_*.json")):
-            raise FileNotFoundError(f"Missing TEXT shards under {text_root} (required when using per-image text prompts)")
+        if not list(clip_root.glob("image_*.npy")):
+            raise FileNotFoundError(f"Missing CLIP per-image features under {clip_root}")
+        if not list(sam2_root.glob("image_*.npz")):
+            raise FileNotFoundError(f"Missing SAM2 per-image features under {sam2_root}")
+        if text_prompts is None and not list(text_root.glob("image_*.json")):
+            raise FileNotFoundError(f"Missing TEXT per-image features under {text_root} (required when using per-image text prompts)")
 
         devices_param, num_workers = resolve_devices_and_workers(device, FOREGROUNDArgs.batch_size_per_gpu)
         if verbose:
@@ -235,14 +229,8 @@ class FOREGROUNDExtractor:
         return results
 
 
-def make_foreground_extractor(device: torch.device, verbose: bool = False, data_dir: Optional[Path] = None, text_prompts: Optional[List[str]] = None) -> "FOREGROUNDExtractor":
-    if data_dir is None:
-        raise ValueError("make_foreground_extractor requires data_dir")
-    return FOREGROUNDExtractor(device=device, data_dir=data_dir, text_prompts=text_prompts, verbose=verbose)
-
-
 async def extract_foreground_batch(image_paths: List[str], device: torch.device, data_dir: Path, verbose: bool = False, text_prompts: Optional[List[str]] = None):
-    extractor = make_foreground_extractor(device=device, verbose=verbose, data_dir=data_dir, text_prompts=text_prompts)
+    extractor = FOREGROUNDExtractor(device=device, data_dir=data_dir, text_prompts=text_prompts, verbose=verbose)
     return await extractor.extract_batch_async(image_paths)
 
 
@@ -251,19 +239,19 @@ async def process_single_image_foreground_async(image_path: str, fg_client: Asyn
 
 
 if __name__ == "__main__":
-    data_root = Path("datasets/f3rm/custom/betabook/small")
+    data_root = Path("datasets/f3rm/opt/betaipad/small")
     image_dir = data_root / "images"
     image_paths = sorted(list(image_dir.glob("*.jpg")) + list(image_dir.glob("*.png")))
     image_paths = [str(p) for p in image_paths[:8]]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Mode 1: use TEXT shards (FOREGROUND_)
-    extractor = make_foreground_extractor(device=device, data_dir=data_root, text_prompts=None, verbose=True)
+    extractor = FOREGROUNDExtractor(device=device, data_dir=data_root, text_prompts=None, verbose=True)
     maps = run_async_in_any_context(lambda: extractor.extract_batch_async(image_paths))
     print(f"Mode 1 (TEXT shards): Extracted {len(maps)} maps, sample shape: {maps[0].shape if maps else None}")
 
     # Mode 2: use global prompts (e.g., FOREGROUND_book)
-    extractor2 = make_foreground_extractor(device=device, data_dir=data_root, text_prompts=["book"], verbose=True)
+    extractor2 = FOREGROUNDExtractor(device=device, data_dir=data_root, text_prompts=["laptop"], verbose=True)
     maps2 = run_async_in_any_context(lambda: extractor2.extract_batch_async(image_paths))
     print(f"Mode 2 (global prompts): Extracted {len(maps2)} maps, sample shape: {maps2[0].shape if maps2 else None}")
 

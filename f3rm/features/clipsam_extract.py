@@ -14,7 +14,7 @@ from tqdm.auto import tqdm
 
 from sam2.features.utils import SAM2utils
 from sam2.features.clip_main import CLIPfeatures
-from f3rm.features.utils import LazyFeatures, SAM2LazyAutoMasks, TextLazyFeatures, pack_batch_auto_masks, run_async_in_any_context, resolve_devices_and_workers
+from f3rm.features.utils import run_async_in_any_context, resolve_devices_and_workers, visualize_auto_masks_demo, pack_auto_masks, unpack_auto_masks, BatchFeatureLoader
 from f3rm.features.sam2_extract import SAM2Args
 from sam2.features.utils import AsyncMultiWrapper
 
@@ -77,22 +77,15 @@ class CLIPSAMWorker:
         self.feat_image_fnames = [str(p) for p in clip_meta["image_fnames"]]
 
         # Load CLIP features
-        clip_shards = sorted(clip_root.glob("chunk_*.npy"))
-        assert clip_shards, f"No CLIP shards found in {clip_root}"
-        self.clip_features = LazyFeatures(clip_shards)
-
-        # Load SAM2 masks
-        sam2_shards = sorted(sam2_root.glob("chunk_*.npz"))
-        assert sam2_shards, f"No SAM2 shards found in {sam2_root}"
-        self.sam2_masks = SAM2LazyAutoMasks(sam2_shards)
+        # Create batch feature loaders for the new per-image system
+        self.clip_loader = BatchFeatureLoader(self.data_dir, "CLIP", self.feat_image_fnames, device)
+        self.sam2_loader = BatchFeatureLoader(self.data_dir, "SAM2", self.feat_image_fnames, device)
 
         # Load TEXT features only if we'll use them (when text_prompts is None)
         if self.text_prompts is None:
-            text_shards = sorted(text_root.glob("chunk_*.json"))
-            assert text_shards, f"No TEXT shards found in {text_root}"
-            self.text_features = TextLazyFeatures(text_shards)
+            self.text_loader = BatchFeatureLoader(self.data_dir, "TEXT", self.feat_image_fnames, device)
         else:
-            self.text_features = None
+            self.text_loader = None
 
         self.clip_model = CLIPfeatures(device=self.device)
 
@@ -122,8 +115,8 @@ class CLIPSAMWorker:
             packed.append({
                 "segmentation": seg,
                 "bbox": bbox,
-                "predicted_iou": float("inf"),
-                "area": float("inf"),
+                "predicted_iou": np.float16("inf"),  # Use fp16 for VRAM efficiency
+                "area": np.float16("inf"),           # Use fp16 for VRAM efficiency
             })
         return packed
 
@@ -135,13 +128,13 @@ class CLIPSAMWorker:
         except ValueError:
             raise ValueError(f"Image path not found in CLIP meta order: {image_path}")
 
-        clip_patch_feats = self.clip_features[feat_image_index].to(self.device)
-        raw_auto_masks = self.sam2_masks[feat_image_index]
+        clip_patch_feats = self.clip_loader[feat_image_index]
+        raw_auto_masks = self.sam2_loader[feat_image_index]
 
-        # Get text prompts - either from TEXT shards (per-image) or from global list
+        # Get text prompts - either from TEXT per-image files or from global list
         if self.text_prompts is None:
             # Load text prompts from pre-extracted TEXT features (per-image)
-            text_prompts = self.text_features[feat_image_index]
+            text_prompts = self.text_loader[feat_image_index]
         else:
             # Use globally supplied text prompts
             text_prompts = self.text_prompts
@@ -176,8 +169,8 @@ class CLIPSAMWorker:
         # Per-prompt segment similarity maps (mean of top-K% pixels per mask)
         segment_sim_maps: List[np.ndarray] = []
         for text in text_prompts:
-            text_emb = self.clip_model.encode_text(text)
-            neg_text_embs = torch.stack([self.clip_model.encode_text(neg) for neg in CLIPSAMArgs.negative_texts], dim=0)
+            text_emb = self.clip_model.encode_text(text).half()
+            neg_text_embs = torch.stack([self.clip_model.encode_text(neg).half() for neg in CLIPSAMArgs.negative_texts], dim=0)
             sim_map = self.clip_model.compute_similarity(
                 clip_patch_feats,
                 text_emb,
@@ -185,7 +178,7 @@ class CLIPSAMWorker:
                 softmax_temp=CLIPSAMArgs.softmax_temp,
                 normalize=True,
             )
-            sim_map_up = np.array(Image.fromarray(sim_map.cpu().numpy()).resize((w, h), Image.BILINEAR))
+            sim_map_up = np.array(Image.fromarray(sim_map.cpu().float().numpy()).resize((w, h), Image.BILINEAR)).astype(np.float16)
 
             seg_map = np.zeros_like(sim_map_up)
             for m in auto_masks:
@@ -209,8 +202,8 @@ class CLIPSAMWorker:
                 filtered.append({
                     "segmentation": seg,
                     "bbox": m["bbox"],
-                    "predicted_iou": m.get("predicted_iou", float("inf")),
-                    "area": m.get("area", float("inf")),
+                    "predicted_iou": np.float16(m.get("predicted_iou", float("inf"))),  # Use fp16 for VRAM efficiency
+                    "area": np.float16(m.get("area", float("inf"))),                   # Use fp16 for VRAM efficiency
                 })
 
         return filtered
@@ -235,14 +228,14 @@ class CLIPSAMExtractor:
         clip_meta_path = clip_root / "meta.pt"
         if not clip_meta_path.exists():
             raise FileNotFoundError(f"Missing CLIP meta: {clip_meta_path}")
-        if not list(clip_root.glob("chunk_*.npy")):
-            raise FileNotFoundError(f"Missing CLIP shards under {clip_root}")
-        if not list(sam2_root.glob("chunk_*.npz")):
-            raise FileNotFoundError(f"Missing SAM2 shards under {sam2_root}")
+        if not list(clip_root.glob("image_*.npy")):
+            raise FileNotFoundError(f"Missing CLIP per-image features under {clip_root}")
+        if not list(sam2_root.glob("image_*.npz")):
+            raise FileNotFoundError(f"Missing SAM2 per-image features under {sam2_root}")
 
-        # TEXT shards only required when using per-image text prompts (text_prompts is None)
-        if text_prompts is None and not list(text_root.glob("chunk_*.json")):
-            raise FileNotFoundError(f"Missing TEXT shards under {text_root} (required when using per-image text prompts)")
+        # TEXT per-image files only required when using per-image text prompts (text_prompts is None)
+        if text_prompts is None and not list(text_root.glob("image_*.json")):
+            raise FileNotFoundError(f"Missing TEXT per-image features under {text_root} (required when using per-image text prompts)")
 
         # Multi-GPU setup
         devices_param, num_workers = resolve_devices_and_workers(device, CLIPSAMArgs.batch_size_per_gpu)
@@ -276,20 +269,9 @@ class CLIPSAMExtractor:
         return results
 
 
-def make_clipsam_extractor(device: torch.device, verbose: bool = False, data_dir: Optional[Path] = None, text_prompts: Optional[List[str]] = None) -> "CLIPSAMExtractor":
-    if data_dir is None:
-        raise ValueError("make_clipsam_extractor requires data_dir")
-    return CLIPSAMExtractor(device=device, data_dir=data_dir, text_prompts=text_prompts, verbose=verbose)
-
-
 async def extract_clipsam_batch(image_paths: List[str], device: torch.device, data_dir: Path, verbose: bool = False, text_prompts: Optional[List[str]] = None):
-    extractor = make_clipsam_extractor(device=device, verbose=verbose, data_dir=data_dir, text_prompts=text_prompts)
+    extractor = CLIPSAMExtractor(device=device, data_dir=data_dir, text_prompts=text_prompts, verbose=verbose)
     return await extractor.extract_batch_async(image_paths)
-
-
-def pack_clipsam_batch(batch_masks: List[List[dict]]) -> dict:
-    # Pack in the exact same format used by SAM2 shards
-    return pack_batch_auto_masks(batch_masks)
 
 
 async def process_single_image_clipsam_async(image_path: str, clipsam_client: AsyncMultiWrapper) -> List[dict]:
@@ -299,7 +281,7 @@ async def process_single_image_clipsam_async(image_path: str, clipsam_client: As
 
 if __name__ == "__main__":
     # Demo: Full pipeline (extract -> save -> load -> visualize) for CLIPSAM
-    data_root = Path("datasets/f3rm/custom/betabook/small")
+    data_root = Path("datasets/f3rm/opt/caterpillar")
     image_dir = data_root / "images"
     image_paths = sorted(glob.glob(str(image_dir / "*.jpg")) + glob.glob(str(image_dir / "*.png")))
     image_paths = image_paths[:10]
@@ -316,119 +298,72 @@ if __name__ == "__main__":
 
     # Mode 2: Use hardcoded prompts (CLIPSAM_book)
     print("Mode 2: Using hardcoded prompts")
-    extractor2 = CLIPSAMExtractor(device=device, data_dir=data_root, text_prompts=["book"], verbose=True)
+    extractor2 = CLIPSAMExtractor(device=device, data_dir=data_root, text_prompts=["toy"], verbose=True)
     batch_masks2 = run_async_in_any_context(lambda: extractor2.extract_batch_async(image_paths))
 
     # Use the first mode for visualization
-    batch_masks = batch_masks
+    batch_masks = batch_masks2
 
     print(f"Extracted CLIPSAM auto-masks for {len(batch_masks)} images. Visualizing results...")
-
-    # Visualize a few results
-    vis_count = min(4, len(batch_masks))
-    fig, axes = plt.subplots(2, vis_count, figsize=(4 * vis_count, 8))
-    if vis_count == 1:
-        axes = axes.reshape(2, 1)
-    for i, (auto_masks, img_path) in enumerate(zip(batch_masks[:vis_count], image_paths[:vis_count])):
-        rgb_img = Image.open(img_path).convert("RGB")
-        axes[0, i].imshow(rgb_img)
-        axes[0, i].set_title(f"RGB {i+1}")
-        axes[0, i].axis('off')
-
-        # Generate and display mask
-        inst_mask, _ = SAM2utils.auto_masks_to_instance_mask(
-            auto_masks,
-            min_iou=float(SAM2Args.pred_iou_thresh),
-            min_area=float(SAM2Args.min_mask_region_area),
-            assign_by="area",
-            start_from="low",
-        )
-        if inst_mask is None:
-            # No valid masks found, create empty instance mask
-            if auto_masks:
-                h, w = auto_masks[0]['segmentation'].shape
-            else:
-                # Use actual image dimensions as fallback
-                img = Image.open(img_path)
-                h, w = img.height, img.width
-            inst_mask = np.zeros((h, w), dtype=np.uint16)
-        viz_mask, cmap, norm = SAM2utils.make_viz_mask_and_cmap(inst_mask)
-        axes[1, i].imshow(viz_mask, cmap=cmap, norm=norm, interpolation='nearest')
-        axes[1, i].set_title(f"CLIPSAM Mask {i+1} ({len(np.unique(inst_mask)) - 1} inst)")
-        axes[1, i].axis('off')
-    plt.tight_layout()
-    plt.show()
+    visualize_auto_masks_demo(batch_masks, image_paths, "CLIPSAM", max_vis=4, pred_iou_thresh=SAM2Args.pred_iou_thresh, min_mask_region_area=SAM2Args.min_mask_region_area)
 
     # Demo 2: Test the full pipeline (extract -> save -> load -> visualize)
     print("\n" + "=" * 60)
     print("DEMO 2: Full pipeline test (extract -> save -> load -> visualize)")
     print("=" * 60)
 
-    # Save shards
+    # Setup paths
     test_dir = Path("test_clipsam_pipeline")
     test_dir.mkdir(exist_ok=True)
-    shard_size = 4
-    n_imgs = len(batch_masks)
-    n_shards = math.ceil(n_imgs / shard_size)
 
-    print("Saving CLIPSAM shards...")
-    for i in range(n_shards):
-        s, e = i * shard_size, min((i + 1) * shard_size, n_imgs)
-        packed_batch = pack_batch_auto_masks(batch_masks[s:e])
-        np.savez_compressed(test_dir / f"chunk_{i:04d}.npz", **packed_batch)
+    # Save per-image files (following new per-image system)
+    print("Saving per-image files...")
+    for i, auto_masks in enumerate(batch_masks):
+        # Pack data using consolidated function
+        packed_data = pack_auto_masks(auto_masks)
 
-    # Load shards with SAM2LazyAutoMasks and visualize a few
-    print("Loading shards with SAM2LazyAutoMasks...")
-    shard_paths = sorted(test_dir.glob("chunk_*.npz"))
-    lazy_shards = SAM2LazyAutoMasks(shard_paths)
-    print(f"Loaded {len(lazy_shards)} images from {len(shard_paths)} shards")
-
-    print("Visualizing loaded data...")
-    vis_count = min(3, len(lazy_shards))
-    fig, axes = plt.subplots(2, vis_count, figsize=(4 * vis_count, 8))
-    if vis_count == 1:
-        axes = axes.reshape(2, 1)
-    for i in range(vis_count):
-        rgb_img = Image.open(image_paths[i]).convert("RGB")
-        axes[0, i].imshow(rgb_img)
-        axes[0, i].set_title(f"RGB {i+1}")
-        axes[0, i].axis('off')
-
-        # Loaded masks
-        loaded_masks = lazy_shards[i]
-        inst_mask, _ = SAM2utils.auto_masks_to_instance_mask(
-            loaded_masks,
-            min_iou=float(SAM2Args.pred_iou_thresh),
-            min_area=float(SAM2Args.min_mask_region_area),
-            assign_by="area",
-            start_from="low",
+        # Save per-image file
+        np.savez_compressed(
+            test_dir / f"image_{i:06d}.npz",
+            **packed_data
         )
-        if inst_mask is None:
-            # No valid masks found, create empty instance mask
-            if loaded_masks:
-                h, w = loaded_masks[0]['segmentation'].shape
-            else:
-                # Use actual image dimensions as fallback
-                img = Image.open(image_paths[i])
-                h, w = img.height, img.width
-            inst_mask = np.zeros((h, w), dtype=np.uint16)
-        viz_mask, cmap, norm = SAM2utils.make_viz_mask_and_cmap(inst_mask)
-        axes[1, i].imshow(viz_mask, cmap=cmap, norm=norm, interpolation='nearest')
-        axes[1, i].set_title(f"Loaded CLIPSAM {i+1} ({len(loaded_masks)} masks, {len(np.unique(inst_mask)) - 1} inst)")
-        axes[1, i].axis('off')
-    plt.tight_layout()
-    plt.show()
 
-    # Print comparison
-    print("\nComparison:")
+    # Load per-image files using new system
+    print("Loading per-image files...")
+    loaded_masks = []
+    for i in range(len(batch_masks)):
+        image_file = test_dir / f"image_{i:06d}.npz"
+        if image_file.exists():
+            data = np.load(image_file)
+            # Use the same unpacking function as the main system
+            packed_data = {
+                "num_masks": int(data['num_masks']),
+                "mask_data": data['mask_data'],
+                "mask_shapes": data['mask_shapes'],
+                "bbox_data": data['bbox_data'],
+                "pred_iou_data": data['pred_iou_data'],
+                "area_data": data['area_data']
+            }
+            auto_masks = unpack_auto_masks(packed_data)
+            loaded_masks.append(auto_masks)
+        else:
+            loaded_masks.append([])
+
+    print(f"Loaded {len(loaded_masks)} images from per-image files")
+
+    # Visualize loaded data
+    print("Visualizing loaded data...")
+    visualize_auto_masks_demo(loaded_masks, image_paths, "Loaded CLIPSAM", max_vis=3, pred_iou_thresh=SAM2Args.pred_iou_thresh, min_mask_region_area=SAM2Args.min_mask_region_area)
+
+    # Print summary
+    print("\nExtracted auto-masks for demo:")
     for i in range(min(3, len(batch_masks))):
         original_count = len(batch_masks[i])
-        loaded_count = len(lazy_shards[i])
-        print(f"Image {i}: Original={original_count} masks, Loaded={loaded_count} masks")
+        loaded_count = len(loaded_masks[i]) if i < len(loaded_masks) else 0
+        print(f"Image {i}: {original_count} original masks, {loaded_count} loaded masks")
 
     # Cleanup
     plt.close('all')
-    del lazy_shards
     gc.collect()
-    shutil.rmtree(test_dir)
+    shutil.rmtree(test_dir, ignore_errors=True)
     print(f"Cleaned up test directory: {test_dir}")

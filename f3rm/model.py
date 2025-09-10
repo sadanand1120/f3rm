@@ -34,60 +34,42 @@ from f3rm.features.utils import von_mises_to_probs, normal_to_probs
 @dataclass
 class FeatureFieldModelConfig(NerfactoModelConfig):
     """Note: make sure to use naming that doesn't conflict with NerfactoModelConfig"""
-
     _target: Type = field(default_factory=lambda: FeatureFieldModel)
-    # Weighing for the feature loss
     feat_loss_weight: float = 1e-3
-    # Condition Feature Field on NeRF density embedding (geo features)
     feat_condition_on_density: bool = True
-    # Allow gradients from feature field to flow back into NeRF via density embedding
     feat_condition_density_grad_to_nerf: bool = False
-    # Feature Field Positional Encoding
     feat_use_pe: bool = True
     feat_pe_n_freq: int = 6
-    # Feature Field Hash Grid
     feat_num_levels: int = 12
     feat_log2_hashmap_size: int = 19
     feat_start_res: int = 16
     feat_max_res: int = 128
     feat_features_per_level: int = 8
-    # Feature Field MLP Head
     feat_hidden_dim: int = 64
     feat_num_layers: int = 2
-
-    # Centroid head controls (single knob)
-    centroid_enable: bool = True  # Enable centroid head (train + render + cache)
-    centroid_loss_weight: float = 1e-3  # Loss weight for centroid regression
-    centroid_condition_on_density: bool = True  # Condition centroid head on NeRF density embedding
-    centroid_condition_density_grad_to_nerf: bool = False  # Allow centroid head gradients into NeRF density embedding
-    centroid_hidden_dim: int = 64  # Centroid head hidden dim
-    centroid_num_layers: int = 2  # Centroid head num layers
-    # Exponential moving average weight for robust local-view centroid GT blending (0..1), 0.0 means no blending
+    centroid_enable: bool = True
+    centroid_loss_weight: float = 1e-3
+    centroid_condition_on_density: bool = True
+    centroid_condition_density_grad_to_nerf: bool = False
+    centroid_hidden_dim: int = 64
+    centroid_num_layers: int = 2
     centroid_gt_blend: float = 0.5
-    # Enable GT blending only after this many training steps (0 => blend from start)
     centroid_blend_after_steps: int = 0
-    # Centroid cache helpers (used in pipeline)
-    centroid_min_instance_percent: float = 1.0  # Filter small instances when building centroid GT
-    centroid_min_accum: float = 0.0  # Min accumulation to consider a pixel valid in centroid GT
-
-    # Foreground head controls (separate binary classifier with 2 logits; supervised via FOREGROUND_* shards)
-    foreground_enable: bool = True  # Enable separate foreground head (train + render)
-    foreground_loss_weight: float = 1e-3  # Loss weight for foreground classification
-    foreground_condition_on_density: bool = True  # Condition foreground head on NeRF density embedding
-    foreground_condition_density_grad_to_nerf: bool = False  # Allow foreground head gradients into NeRF density embedding
-    foreground_hidden_dim: int = 64  # Foreground head hidden dim
-    foreground_num_layers: int = 1  # Foreground head num layers
-    # OrientAny head controls (4 separate heads: azimuth, polar, roll, foreground; supervised via ORIENTANY_* shards)
-    orientany_enable: bool = True  # Enable separate OrientAny head (train + render)
-    orientany_loss_weight: float = 1e-3  # Loss weight for OrientAny classification
-    orientany_condition_on_density: bool = True  # Condition OrientAny head on NeRF density embedding
-    orientany_condition_density_grad_to_nerf: bool = False  # Allow OrientAny head gradients into NeRF density embedding
-    orientany_hidden_dim: int = 64  # OrientAny head hidden dim
-    orientany_num_layers: int = 1  # OrientAny head num layers
-    # OrientAny input controls: xyz encoding (True) or encoded centroid prediction (False)
+    centroid_min_instance_percent: float = 1.0
+    centroid_min_accum: float = 0.0
+    foreground_enable: bool = True
+    foreground_loss_weight: float = 1e-3
+    foreground_condition_on_density: bool = True
+    foreground_condition_density_grad_to_nerf: bool = False
+    foreground_hidden_dim: int = 64
+    foreground_num_layers: int = 1
+    orientany_enable: bool = True
+    orientany_loss_weight: float = 1e-3
+    orientany_condition_on_density: bool = True
+    orientany_condition_density_grad_to_nerf: bool = False
+    orientany_hidden_dim: int = 64
+    orientany_num_layers: int = 1
     orientany_use_xyz_encoding: bool = True
-
-    # Camera-pose refinement control: if False, cut gradient from all custom heads to camera optimizer (via detached weights)
     enable_campose_refine_feature_field: bool = True
 
 
@@ -119,7 +101,7 @@ class ViewerUtils:
         # Embed text queries
         tokenize = open_clip.get_tokenizer(CLIPArgs.model_name)
         tokens = tokenize(texts).to(self.device)
-        embed = self.clip.encode_text(tokens).float()
+        embed = self.clip.encode_text(tokens).half()
         if is_positive:
             self.positives = texts
             # Average embedding if we have multiple positives
@@ -313,7 +295,6 @@ class FeatureFieldModel(NerfactoModel):
                 # Port rendering logic: aggregate logits along ray, then softmax for viz/loss
                 foreground_logits = self.renderer_spread(values=fg_vals, weights=custom_weights)
                 del fg_vals
-
             if render_orientany and self.config.orientany_enable:
                 # Get separate OrientAny outputs (density_embedding might be None if not needed)
                 orientany_azimuth_vals = self.feature_field.get_orientany_azimuth(ray_samples, density_embedding=density_embedding)
@@ -321,18 +302,18 @@ class FeatureFieldModel(NerfactoModel):
                 orientany_roll_vals = self.feature_field.get_orientany_roll(ray_samples, density_embedding=density_embedding)
                 orientany_foreground_vals = self.feature_field.get_orientany_foreground(ray_samples, density_embedding=density_embedding)
 
-                if not self.training:  # Eval: render on CPU for memory efficiency
+                if not self.training:  # Eval: render on GPU for speed, move to CPU only for final output
                     with torch.no_grad():
-                        orientany_azimuth_logits_cpu = self.renderer_spread(values=orientany_azimuth_vals.detach().cpu(), weights=custom_weights.detach().cpu())
-                        orientany_polar_logits_cpu = self.renderer_spread(values=orientany_polar_vals.detach().cpu(), weights=custom_weights.detach().cpu())
-                        orientany_roll_logits_cpu = self.renderer_spread(values=orientany_roll_vals.detach().cpu(), weights=custom_weights.detach().cpu())
-                        orientany_foreground_logits_cpu = self.renderer_spread(values=orientany_foreground_vals.detach().cpu(), weights=custom_weights.detach().cpu())
+                        orientany_azimuth_logits = self.renderer_spread(values=orientany_azimuth_vals, weights=custom_weights)
+                        orientany_polar_logits = self.renderer_spread(values=orientany_polar_vals, weights=custom_weights)
+                        orientany_roll_logits = self.renderer_spread(values=orientany_roll_vals, weights=custom_weights)
+                        orientany_foreground_logits = self.renderer_spread(values=orientany_foreground_vals, weights=custom_weights)
 
-                        # Concatenate on CPU for backward compatibility
-                        orientany_logits = torch.cat([orientany_azimuth_logits_cpu, orientany_polar_logits_cpu, orientany_roll_logits_cpu, orientany_foreground_logits_cpu], dim=-1)
+                        # Concatenate on GPU first, then move to CPU
+                        orientany_logits = torch.cat([orientany_azimuth_logits, orientany_polar_logits, orientany_roll_logits, orientany_foreground_logits], dim=-1).cpu()
 
-                        # Clean up CPU intermediates
-                        del orientany_azimuth_logits_cpu, orientany_polar_logits_cpu, orientany_roll_logits_cpu, orientany_foreground_logits_cpu
+                        # Clean up GPU intermediates
+                        del orientany_azimuth_logits, orientany_polar_logits, orientany_roll_logits, orientany_foreground_logits
                 else:
                     # Training: render each component separately on GPU
                     orientany_azimuth_logits = self.renderer_spread(values=orientany_azimuth_vals, weights=custom_weights)
@@ -433,7 +414,7 @@ class FeatureFieldModel(NerfactoModel):
         # OrientAny classification loss (4 separate losses: azimuth, polar, roll, foreground)
         if self.config.orientany_enable and ("orientany_logits" in outputs) and ("orientany" in batch):
             orientany_logits = outputs["orientany_logits"].view(-1, 902).to(self.device)  # (N, 902) - ensure on correct device
-            orientany_target = batch["orientany"].to(self.device, non_blocking=True)  # (N, 10) - compact GT
+            orientany_target = batch["orientany"].to(self.device, non_blocking=True)  # (N, 8) - compact GT
 
             # Split logits into components
             gaus_ax_logits = orientany_logits[:, 0:360]      # azimuth logits
@@ -442,7 +423,7 @@ class FeatureFieldModel(NerfactoModel):
             orientany_fg_logits = orientany_logits[:, 900:902]  # OrientAny foreground logits
 
             # Extract GT parameters
-            orientany_fg_target = orientany_target[:, 8:10]  # OrientAny foreground one-hot
+            orientany_fg_target = orientany_target[:, 6:8]  # OrientAny foreground one-hot
             orientany_fg_mask = orientany_fg_target[:, 1] > 0.5  # GT foreground pixels
 
             # OrientAny foreground loss: supervise all pixels (use CE for stability)
@@ -459,22 +440,26 @@ class FeatureFieldModel(NerfactoModel):
                 pl_idx = torch.clamp(torch.round(orientany_target[fg_indices, 2]), 0, 179).long()
                 ro_idx = torch.clamp(torch.round(orientany_target[fg_indices, 4]), 0, 359).long()
 
-                # Variance-aware weighting: higher variance => lower weight (stable 1/(1+var) scheme)
-                eps = 1e-6
-                var_ax = torch.nan_to_num(torch.clamp(orientany_target[fg_indices, 1], min=0.0), nan=0.0, posinf=1e6, neginf=0.0)
-                var_pl = torch.nan_to_num(torch.clamp(orientany_target[fg_indices, 3], min=0.0), nan=0.0, posinf=1e6, neginf=0.0)
-                var_ro = torch.nan_to_num(torch.clamp(orientany_target[fg_indices, 5], min=0.0), nan=0.0, posinf=1e6, neginf=0.0)
-                w_ax = torch.clamp(1.0 / (1.0 + var_ax + eps), 0.05, 1.0)
-                w_pl = torch.clamp(1.0 / (1.0 + var_pl + eps), 0.05, 1.0)
-                w_ro = torch.clamp(1.0 / (1.0 + var_ro + eps), 0.05, 1.0)
+                # TODO: add back in variance-aware weighting later
+                # # Variance-aware weighting: higher variance => lower weight (stable 1/(1+var) scheme)
+                # eps = 1e-6
+                # var_ax = torch.nan_to_num(torch.clamp(orientany_target[fg_indices, 1], min=0.0), nan=0.0, posinf=1e6, neginf=0.0)
+                # var_pl = torch.nan_to_num(torch.clamp(orientany_target[fg_indices, 3], min=0.0), nan=0.0, posinf=1e6, neginf=0.0)
+                # var_ro = torch.nan_to_num(torch.clamp(orientany_target[fg_indices, 5], min=0.0), nan=0.0, posinf=1e6, neginf=0.0)
+                # w_ax = torch.clamp(1.0 / (1.0 + var_ax + eps), 0.05, 1.0)
+                # w_pl = torch.clamp(1.0 / (1.0 + var_pl + eps), 0.05, 1.0)
+                # w_ro = torch.clamp(1.0 / (1.0 + var_ro + eps), 0.05, 1.0)
 
                 # Cross-entropy with per-sample weights
                 ce_ax_all = F.cross_entropy(gaus_ax_logits[fg_indices], ax_idx, reduction="none")
                 ce_pl_all = F.cross_entropy(gaus_pl_logits[fg_indices], pl_idx, reduction="none")
                 ce_ro_all = F.cross_entropy(gaus_ro_logits[fg_indices], ro_idx, reduction="none")
-                ce_ax = (ce_ax_all * w_ax).mean()
-                ce_pl = (ce_pl_all * w_pl).mean()
-                ce_ro = (ce_ro_all * w_ro).mean()
+                # ce_ax = (ce_ax_all * w_ax).mean()
+                # ce_pl = (ce_pl_all * w_pl).mean()
+                # ce_ro = (ce_ro_all * w_ro).mean()
+                ce_ax = ce_ax_all.mean()
+                ce_pl = ce_pl_all.mean()
+                ce_ro = ce_ro_all.mean()
 
                 # Store separate losses (don't add them)
                 loss_dict["orientany_azimuth_loss"] = self.config.orientany_loss_weight * ce_ax
@@ -595,7 +580,7 @@ class FeatureFieldModel(NerfactoModel):
                 else:
                     outputs_lists[output_name].append(output)
                 del output
-            if (i // num_rays_per_chunk) % 20 == 0:
+            if (i // num_rays_per_chunk) % 50 == 0:
                 torch.cuda.empty_cache()
         outputs: Dict[str, torch.Tensor] = {}
         for output_name, outputs_list in outputs_lists.items():
@@ -654,10 +639,10 @@ class FeatureFieldModel(NerfactoModel):
             outputs["orientany_foreground_prob_rgb"] = self.prob_from_probs_shader(orientany_fg_probs[..., 1:2])
 
             # Convert to RGB: azimuth->R, polar->G, roll->B (on CPU)
-            orient_rgb = torch.zeros((*orientany_logits.shape[:-1], 3), dtype=torch.float32)
-            orient_rgb[..., 0] = gaus_ax_pred.float() / 359.0  # R: azimuth
-            orient_rgb[..., 1] = gaus_pl_pred.float() / 179.0  # G: polar
-            orient_rgb[..., 2] = gaus_ro_pred.float() / 359.0  # B: roll
+            orient_rgb = torch.zeros((*orientany_logits.shape[:-1], 3), dtype=torch.float16)
+            orient_rgb[..., 0] = gaus_ax_pred / 359.0  # R: azimuth
+            orient_rgb[..., 1] = gaus_pl_pred / 179.0  # G: polar
+            orient_rgb[..., 2] = gaus_ro_pred / 359.0  # B: roll
 
             # Only show colors for foreground pixels (set background to black)
             orient_rgb[~orientany_fg_mask] = 0.0
@@ -752,16 +737,16 @@ class FeatureFieldModel(NerfactoModel):
             orientany_gt = batch["orientany"].to(self.device)
             if orientany_gt.ndim == 4 and orientany_gt.shape[0] == 1:
                 orientany_gt = orientany_gt.squeeze(0)
-            if orientany_gt.ndim == 3 and orientany_gt.shape[0] == 10:
+            if orientany_gt.ndim == 3 and orientany_gt.shape[0] == 8:
                 orientany_gt = orientany_gt.permute(1, 2, 0)
 
             # Convert GT distribution means to RGB on CPU to match predicted RGB
             ax_mean_gt = orientany_gt[..., 0].cpu()  # azimuth mean
             pl_mean_gt = orientany_gt[..., 2].cpu()  # polar mean
             ro_mean_gt = orientany_gt[..., 4].cpu()  # roll mean
-            orientany_fg_gt = orientany_gt[..., 9].cpu() > 0.5  # OrientAny foreground mask from GT
+            orientany_fg_gt = orientany_gt[..., 7].cpu() > 0.5  # OrientAny foreground mask from GT
 
-            orientany_gt_rgb = torch.zeros((*orientany_gt.shape[:-1], 3), device="cpu")
+            orientany_gt_rgb = torch.zeros((*orientany_gt.shape[:-1], 3), device="cpu", dtype=torch.float16)
             orientany_gt_rgb[..., 0] = torch.clamp(ax_mean_gt / 359.0, 0, 1)
             orientany_gt_rgb[..., 1] = torch.clamp(pl_mean_gt / 179.0, 0, 1)
             orientany_gt_rgb[..., 2] = torch.clamp(ro_mean_gt / 359.0, 0, 1)
@@ -773,7 +758,7 @@ class FeatureFieldModel(NerfactoModel):
             images_dict["orientany_vs_gt"] = torch.cat([outputs["orientany_rgb"], orientany_gt_rgb], dim=1)
 
             # OrientAny foreground GT visualization
-            orientany_fg_gt_prob = orientany_gt[..., 9:10].cpu()  # OrientAny foreground probability from GT
+            orientany_fg_gt_prob = orientany_gt[..., 7:8].cpu()  # OrientAny foreground probability from GT
             orientany_fg_gt_rgb = self.prob_from_probs_shader(orientany_fg_gt_prob)
             images_dict["orientany_foreground_prob_gt"] = orientany_fg_gt_rgb
             if "orientany_foreground_prob_rgb" in outputs:

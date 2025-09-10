@@ -92,12 +92,8 @@ class CLIPExtractor:
         return torch.cat(batches, dim=0) if batches else torch.empty(0)
 
 
-def make_clip_extractor(device: torch.device, verbose: bool = False) -> CLIPExtractor:
-    return CLIPExtractor(device=device, verbose=verbose)
-
-
 def extract_clip_features(image_paths: List[str], device: torch.device, verbose=False) -> torch.Tensor:
-    extractor = make_clip_extractor(device, verbose=verbose)
+    extractor = CLIPExtractor(device=device, verbose=verbose)
     return run_async_in_any_context(lambda: extractor.extract_batch_async(image_paths))
 
 
@@ -108,12 +104,17 @@ if __name__ == "__main__":
     print(f"Found {len(image_paths)} images in {image_dir}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     feats = extract_clip_features(image_paths, device=device, verbose=True)
+    feats_half = feats.half().float()   # to demonstrate that half() and float() are ~equivalent
     print(f"CLIP features shape: {feats.shape}")
-    if feats.numel() > 0:
-        pca_img = apply_pca_colormap(feats[0], niter=5, q_min=0.01, q_max=0.99)
-        plt.figure(figsize=(6, 6))
-        plt.imshow(pca_img.cpu().numpy())
-        plt.title("CLIP PCA Visualization (first image)")
-        plt.axis("off")
-        plt.tight_layout()
-        plt.show()
+
+    # show side by side, after pca
+    pca_img = apply_pca_colormap(feats[0], niter=5, q_min=0.01, q_max=0.99)
+    pca_img_half = apply_pca_colormap(feats_half[0], niter=5, q_min=0.01, q_max=0.99)
+    plt.figure(figsize=(12, 6))
+    plt.subplot(1, 2, 1)
+    plt.imshow(pca_img.cpu().numpy())
+    plt.title("CLIP PCA Visualization (float)")
+    plt.subplot(1, 2, 2)
+    plt.imshow(pca_img_half.cpu().numpy())
+    plt.title("CLIP PCA Visualization (half)")
+    plt.show()

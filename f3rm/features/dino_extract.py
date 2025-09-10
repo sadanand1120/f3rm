@@ -87,12 +87,8 @@ class DINOExtractor:
         return torch.cat(batches, dim=0) if batches else torch.empty(0)
 
 
-def make_dino_extractor(device: torch.device, verbose: bool = False) -> DINOExtractor:
-    return DINOExtractor(device=device, verbose=verbose)
-
-
 def extract_dino_features(image_paths: List[str], device: torch.device, verbose=False) -> torch.Tensor:
-    extractor = make_dino_extractor(device, verbose=verbose)
+    extractor = DINOExtractor(device=device, verbose=verbose)
     return run_async_in_any_context(lambda: extractor.extract_batch_async(image_paths))
 
 

@@ -39,7 +39,7 @@ def apply_pca_colormap_return_proj(
     low_rank = torch.clamp(low_rank, 0, 1)
 
     colored_image = low_rank.reshape(image.shape[:-1] + (3,))
-    return colored_image, proj_V, low_rank_min, low_rank_max
+    return colored_image.to(torch.float16), proj_V, low_rank_min, low_rank_max  # Ensure fp16 consistency for RGB visualization
 
 
 def apply_pca_colormap(

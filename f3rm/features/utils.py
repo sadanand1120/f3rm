@@ -1,4 +1,5 @@
 from typing import Optional, Tuple, Callable, Any, List, Dict
+from collections import OrderedDict
 import json
 
 import asyncio
@@ -9,15 +10,15 @@ import yaml
 import torch
 import torch.nn.functional as F
 from pathlib import Path
+import matplotlib.pyplot as plt
+from PIL import Image
+from sam2.features.utils import SAM2utils
 
 from nerfstudio.cameras import camera_utils
 
 
 def get_conf_temp_scaled_logits(logits, confidence, drop_exp_factor=6, eps=1e-8):
-    """
-    Scale logits by confidence.
-    T = 1/max(confidence^drop_exp_factor, eps). Lower confidence -> higher T -> flatter probs.
-    """
+    """Scale logits by confidence. T = 1/max(confidence^drop_exp_factor, eps). Lower confidence -> higher T -> flatter probs."""
     x = torch.as_tensor(logits, dtype=torch.float32)
     T = 1.0 / max(float(confidence)**drop_exp_factor, eps)
     return x / T
@@ -28,22 +29,18 @@ def probs_to_normal(
     *,
     n_bins: int,
     angle_min_deg: float,
-    period_deg: float,                 # here: total span (e.g., 180.0)
+    period_deg: float,
     bin_width_deg: Optional[float] = None,
     min_std_deg: float = 1e-3,
-    window_deg: float = 30.0,          # fit window half-width
-    peak_frac: float = 0.2,            # keep bins >= peak_frac * p_max
-    gamma: float = 2.0,                # weights: w = p**gamma
-    ridge: float = 0.0,                # tiny L2 on LS (e.g., 1e-4) stabilizes
-    shrink_to_moment: float = 0.5,     # 0..1; blend LS σ toward moment σ
-    sigma_floor_deg: Optional[float] = 1.0,
+    window_deg: float = 60.0,  # Increased from 45.0 to capture even more of the distribution
+    peak_frac: float = 0.05,   # Reduced from 0.1 to include even more tail
+    gamma: float = 1.2,        # Reduced from 1.5 to be even less aggressive
+    ridge: float = 0.0,
+    shrink_to_moment: float = 0.2,  # Reduced from 0.3 to be even less conservative
+    sigma_floor_deg: Optional[float] = 0.3,  # Reduced from 0.5 to allow even narrower fits
     sigma_ceil_deg: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Fit a single Gaussian N(mean_deg, std_deg) on a bounded linear range [angle_min, angle_min+period).
-    Mean: sub-bin peak via quadratic fit on log-probs (no wrap).
-    Std: weighted LS on log p ≈ -(x-μ)^2/(2σ^2), shrunk toward local moment.
-    """
+    """Fit a single Gaussian N(mean_deg, std_deg) on a bounded linear range [angle_min, angle_min+period)."""
     p = probs.float()
     assert p.ndim == 1 and p.numel() == n_bins, "probs must be 1D with length n_bins"
     if bin_width_deg is None:
@@ -192,12 +189,12 @@ def probs_to_von_mises(
     period_deg: float,
     bin_width_deg: Optional[float] = None,
     min_kappa: float = 1e-3,
-    window_deg: float = 30.0,
-    peak_frac: float = 0.2,
-    gamma: float = 2.0,
+    window_deg: float = 60.0,        # Increased from 45.0 to capture even more of the distribution
+    peak_frac: float = 0.05,         # Reduced from 0.1 to include even more tail
+    gamma: float = 1.2,              # Reduced from 1.5 to be even less aggressive
     ridge: float = 0.0,              # small L2 on LS fit (e.g., 1e-4) to tame κ
-    shrink_to_resultant: float = 0.5,  # 0..1; blend LS κ toward resultant-based κ
-    sigma_floor_deg: float = 2.0,    # don't fit narrower than this (deg)
+    shrink_to_resultant: float = 0.2,  # Reduced from 0.3 to be even less conservative
+    sigma_floor_deg: float = 0.5,    # Reduced from 1.0 to allow even narrower fits
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Fit (mean_deg, kappa) from a discrete circular distribution.
@@ -448,212 +445,6 @@ def run_async_in_any_context(coro_fn: Callable[[], Any]) -> Any:
         return asyncio.run(coro_fn())
 
 
-class BaseLazyShards:
-    """Base class for lazy shard management."""
-
-    def __init__(self, shard_paths: List[Path]):
-        self.paths = shard_paths
-        self.lengths = []
-        self._setup_lengths()
-        self.cum = np.cumsum([0] + self.lengths)
-
-    def _setup_lengths(self):
-        """Override in subclasses to set up lengths based on data type."""
-        raise NotImplementedError
-
-    def _loc(self, idx_img: int) -> Tuple[int, int]:
-        sid = int(np.searchsorted(self.cum, idx_img, side="right") - 1)
-        return sid, idx_img - self.cum[sid]
-
-    def _get_shard(self, sid: int):
-        """Override in subclasses to implement shard loading."""
-        raise NotImplementedError
-
-
-class LazyFeatures(BaseLazyShards):
-    """Memory-mapped shards with O(1) random access.
-
-    Exposes `feat[idx_img, y, x] → torch.Tensor(C)` and keeps each shard
-    mapped only once (OS handles paging).  Nothing is ever `torch.cat`-ed.
-    """
-
-    def __init__(self, shard_paths: List[Path]):
-        self.mmaps = [None] * len(shard_paths)          # lazy mmap
-        super().__init__(shard_paths)
-
-    def _setup_lengths(self):
-        for p in self.paths:
-            # Load just shape info without loading full data
-            arr = np.load(p, mmap_mode="r")
-            self.lengths.append(arr.shape[0])
-            if self.mmaps[0] is None:                     # keep dims
-                self.H, self.W, self.C = arr.shape[1:]
-            del arr  # Explicitly free memory after getting shape info
-
-    def _get_shard(self, sid: int):
-        if self.mmaps[sid] is None:
-            self.mmaps[sid] = np.load(self.paths[sid], mmap_mode="r", allow_pickle=False)
-        return self.mmaps[sid]
-
-    # single triple access
-    def __getitem__(self, triple):
-        if isinstance(triple, int):
-            # Full image access: feat[idx_img] → torch.Tensor(H, W, C)
-            sid, loc = self._loc(int(triple))
-            shard_data = self._get_shard(sid)
-            return torch.from_numpy(shard_data[loc])
-        else:
-            # Pixel access: feat[idx_img, y, x] → torch.Tensor(C)
-            idx_img, y, x = triple
-            sid, loc = self._loc(int(idx_img))
-            feat = self._get_shard(sid)[loc, int(y), int(x)]
-            return torch.from_numpy(feat)
-
-
-class SAM2LazyAutoMasks(BaseLazyShards):
-    """Sharded loader for SAM2 auto-masks stored in memory-mappable .npz format.
-
-    - Mirrors the interface of `LazyFeatures` for consistency
-    - Each shard: .npz file with concatenated arrays and offsets for memory mapping
-    - Each element: List[Dict] of auto masks for an image
-    - Provides O(1) random access and on-demand shard loading with memory mapping
-    """
-
-    def __init__(self, shard_paths: List[Path]):
-        self._loaded = [None] * len(shard_paths)
-        super().__init__(shard_paths)
-
-    def _setup_lengths(self):
-        for p in self.paths:
-            # Load just shape info without loading full data
-            with np.load(p, mmap_mode='r') as data:
-                self.lengths.append(int(len(data['num_masks'])))
-
-    def _get_shard(self, sid: int):
-        if self._loaded[sid] is None:
-            # Load with memory mapping for concatenated arrays
-            self._loaded[sid] = np.load(self.paths[sid], mmap_mode='r')
-        return self._loaded[sid]
-
-    def __len__(self) -> int:
-        return int(self.cum[-1])
-
-    def __getitem__(self, idx_img: int) -> List[dict]:
-        sid, loc = self._loc(int(idx_img))
-        shard_data = self._get_shard(sid)
-
-        # Get per-image counts and offsets
-        num_masks = int(shard_data['num_masks'][loc])
-        image_start = int(shard_data['image_offsets'][loc])            # byte offset into mask_data
-        image_end = int(shard_data['image_offsets'][loc + 1])
-
-        # Compute per-mask index range for metadata arrays (shapes/bboxes/scores)
-        # Use cumulative sum of num_masks up to this image index
-        mask_start = int(np.sum(shard_data['num_masks'][:loc]))
-        mask_end = mask_start + num_masks
-
-        if num_masks == 0:
-            return []
-
-        # Extract data for this image using offsets
-        mask_data = shard_data['mask_data'][image_start:image_end]
-        mask_shapes = shard_data['mask_shapes'][mask_start:mask_end]
-        bbox_data = shard_data['bbox_data'][mask_start:mask_end]
-        pred_iou_data = shard_data['pred_iou_data'][mask_start:mask_end]
-        area_data = shard_data['area_data'][mask_start:mask_end]
-
-        packed_entry = {
-            "num_masks": num_masks,
-            "mask_data": mask_data,
-            "mask_shapes": mask_shapes,
-            "bbox_data": bbox_data,
-            "pred_iou_data": pred_iou_data,
-            "area_data": area_data
-        }
-
-        return self._unpack_auto_masks(packed_entry)
-
-    def _unpack_auto_masks(self, packed_data: dict) -> List[dict]:
-        """Unpack auto masks from memory-mappable format back to original format."""
-        if packed_data["num_masks"] == 0:
-            return []
-
-        decoded = []
-        mask_data = packed_data["mask_data"]
-        mask_shapes = packed_data["mask_shapes"]
-        bbox_data = packed_data["bbox_data"]
-        pred_iou_data = packed_data["pred_iou_data"]
-        area_data = packed_data["area_data"]
-
-        # Validate that we have data to unpack
-        if len(mask_data) == 0 or len(mask_shapes) == 0:
-            return []
-
-        start_idx = 0
-        for i in range(packed_data["num_masks"]):
-            h, w = mask_shapes[i]
-            bbox = bbox_data[i]
-            pred_iou = pred_iou_data[i]
-            area = area_data[i]
-
-            # Calculate packed size for this mask
-            packed_size = (h * w + 7) // 8  # Round up for packbits
-            end_idx = start_idx + packed_size
-
-            # Validate we have enough data
-            if end_idx > len(mask_data):
-                break
-
-            # Extract and unpack this mask's data
-            packed = mask_data[start_idx:end_idx]
-            flat = np.unpackbits(packed)[:h * w]
-            seg_arr = flat.reshape(h, w).astype(bool)
-
-            # Reconstruct original mask dict
-            mask_dict = {
-                "segmentation": seg_arr,
-                "bbox": bbox.tolist(),
-                "predicted_iou": float(pred_iou),
-                "area": float(area)
-            }
-            decoded.append(mask_dict)
-
-            start_idx = end_idx
-
-        return decoded
-
-
-class TextLazyFeatures(BaseLazyShards):
-    """Lazy loading for TEXT features from sharded .json files."""
-
-    def __init__(self, shard_paths: List[Path]):
-        super().__init__(shard_paths)
-
-    def _setup_lengths(self):
-        """Count total number of images across all shards."""
-        for p in self.paths:
-            with open(p, 'r') as f:
-                data = json.load(f)
-            self.lengths.append(len(data))
-
-    def _get_shard(self, sid: int):
-        """Load a specific shard."""
-        with open(self.paths[sid], 'r') as f:
-            return json.load(f)
-
-    def __len__(self) -> int:
-        return int(self.cum[-1])
-
-    def __getitem__(self, idx_img: int) -> List[str]:
-        """Get text objects for a specific image index."""
-        sid, loc = self._loc(int(idx_img))
-        shard_data = self._get_shard(sid)
-
-        # Get image path at this index and return its objects
-        image_paths = list(shard_data.keys())
-        return shard_data[image_paths[loc]]
-
-
 def pack_auto_masks(auto_masks: List[dict]) -> dict:
     """Pack auto masks into a memory-mappable format.
 
@@ -661,18 +452,18 @@ def pack_auto_masks(auto_masks: List[dict]) -> dict:
     - num_masks: number of masks per image
     - mask_data: packed binary data for all masks
     - mask_shapes: shapes of each mask
-    - bbox_data: bbox coordinates as float32 array
-    - pred_iou_data: predicted IoU scores as float32 array
-    - area_data: mask areas as float32 array
+    - bbox_data: bbox coordinates as float16 array
+    - pred_iou_data: predicted IoU scores as float16 array
+    - area_data: mask areas as float16 array
     """
     if not auto_masks:
         return {
             "num_masks": 0,
             "mask_data": np.array([], dtype=np.uint8),
             "mask_shapes": np.empty((0, 2), dtype=np.int32),
-            "bbox_data": np.empty((0, 4), dtype=np.float32),
-            "pred_iou_data": np.array([], dtype=np.float32),
-            "area_data": np.array([], dtype=np.float32)
+            "bbox_data": np.empty((0, 4), dtype=np.float16),      # Use fp16 for VRAM efficiency
+            "pred_iou_data": np.array([], dtype=np.float16),      # Use fp16 for VRAM efficiency
+            "area_data": np.array([], dtype=np.float16)           # Use fp16 for VRAM efficiency
         }
 
     # Collect all mask data
@@ -703,9 +494,9 @@ def pack_auto_masks(auto_masks: List[dict]) -> dict:
             "num_masks": 0,
             "mask_data": np.array([], dtype=np.uint8),
             "mask_shapes": np.empty((0, 2), dtype=np.int32),
-            "bbox_data": np.empty((0, 4), dtype=np.float32),
-            "pred_iou_data": np.array([], dtype=np.float32),
-            "area_data": np.array([], dtype=np.float32)
+            "bbox_data": np.empty((0, 4), dtype=np.float16),      # Use fp16 for VRAM efficiency
+            "pred_iou_data": np.array([], dtype=np.float16),      # Use fp16 for VRAM efficiency
+            "area_data": np.array([], dtype=np.float16)           # Use fp16 for VRAM efficiency
         }
 
     # Concatenate all packed data
@@ -722,155 +513,248 @@ def pack_auto_masks(auto_masks: List[dict]) -> dict:
         "num_masks": len(all_packed_data),  # Actual number of packed masks
         "mask_data": combined_data,
         "mask_shapes": np.array(all_shapes, dtype=np.int32),
-        "bbox_data": np.array(all_bboxes, dtype=np.float32),
-        "pred_iou_data": np.array(all_scores, dtype=np.float32),
-        "area_data": np.array(all_areas, dtype=np.float32)
+        "bbox_data": np.array(all_bboxes, dtype=np.float16),      # Use fp16 for VRAM efficiency
+        "pred_iou_data": np.array(all_scores, dtype=np.float16),  # Use fp16 for VRAM efficiency
+        "area_data": np.array(all_areas, dtype=np.float16)        # Use fp16 for VRAM efficiency
     }
 
 
-def pack_batch_auto_masks(batch_masks: List[List[dict]]) -> dict:
-    """Pack a batch of auto masks into shard format.
+def unpack_auto_masks(packed_data: dict) -> List[dict]:
+    """Unpack auto masks from memory-mappable format back to original format.
+
+    This is the standalone version of the unpacking logic used in BatchFeatureLoader.
+    """
+    if packed_data["num_masks"] == 0:
+        return []
+
+    decoded = []
+    mask_data = packed_data["mask_data"]
+    mask_shapes = packed_data["mask_shapes"]
+    bbox_data = packed_data["bbox_data"]
+    pred_iou_data = packed_data["pred_iou_data"]
+    area_data = packed_data["area_data"]
+
+    if len(mask_data) == 0 or len(mask_shapes) == 0:
+        return []
+
+    start_idx = 0
+    for i in range(packed_data["num_masks"]):
+        h, w = mask_shapes[i]
+        bbox = bbox_data[i]
+        pred_iou = pred_iou_data[i]
+        area = area_data[i]
+
+        # Calculate packed size for this mask
+        packed_size = (h * w + 7) // 8  # Round up for packbits
+        end_idx = start_idx + packed_size
+
+        if end_idx > len(mask_data):
+            break
+
+        # Extract and unpack this mask's data
+        packed = mask_data[start_idx:end_idx]
+        flat = np.unpackbits(packed)[:h * w]
+        seg_arr = flat.reshape(h, w).astype(bool)
+
+        # Reconstruct original mask dict with fp16 optimization
+        mask_dict = {
+            "segmentation": seg_arr,
+            "bbox": bbox.tolist(),
+            "predicted_iou": np.float16(pred_iou),  # Use fp16 for VRAM efficiency
+            "area": np.float16(area)                # Use fp16 for VRAM efficiency
+        }
+        decoded.append(mask_dict)
+        start_idx = end_idx
+
+    return decoded
+
+
+def visualize_auto_masks_demo(auto_masks_list: List[List[dict]], image_paths: List[str], title_prefix: str = "Mask", max_vis: int = 4, pred_iou_thresh: float = 0.8, min_mask_region_area: int = 0):
+    """Common visualization function for auto masks demos.
 
     Args:
-        batch_masks: List of auto mask lists, one per image
-
-    Returns:
-        dict with concatenated arrays ready for np.savez_compressed:
-        - num_masks: per-image mask counts
-        - mask_data: concatenated packed bytes
-        - mask_shapes: concatenated (H,W) per mask
-        - bbox_data: concatenated bbox coordinates
-        - pred_iou_data: concatenated predicted IoU scores
-        - area_data: concatenated mask areas
-        - image_offsets: byte offsets into mask_data per image
+        auto_masks_list: List of auto mask lists, one per image
+        image_paths: List of image file paths
+        title_prefix: Prefix for the mask titles (e.g., "SAM2", "CLIPSAM")
+        max_vis: Maximum number of images to visualize
+        pred_iou_thresh: IoU threshold for mask filtering
+        min_mask_region_area: Minimum mask area threshold
     """
-    all_num_masks = []
-    all_mask_data = []
-    all_mask_shapes = []
-    all_bbox_data = []
-    all_pred_iou_data = []
-    all_area_data = []
-    image_offsets = [0]
+    vis_count = min(max_vis, len(auto_masks_list))
+    fig, axes = plt.subplots(2, vis_count, figsize=(4 * vis_count, 8))
+    if vis_count == 1:
+        axes = axes.reshape(2, 1)
 
-    for image_masks in batch_masks:
-        packed = pack_auto_masks(image_masks)
-        all_num_masks.append(packed["num_masks"])
-        all_mask_data.append(packed["mask_data"])
-        # Ensure 2D (N,2) for shapes, 2D (N,4) for bboxes
-        ms = packed["mask_shapes"].reshape(-1, 2)
-        bb = packed["bbox_data"].reshape(-1, 4)
-        all_mask_shapes.append(ms)
-        all_bbox_data.append(bb)
-        all_pred_iou_data.append(packed["pred_iou_data"])
-        all_area_data.append(packed["area_data"])
-        image_offsets.append(image_offsets[-1] + len(packed["mask_data"]))
+    for i, (auto_masks, image_path) in enumerate(zip(auto_masks_list[:vis_count], image_paths[:vis_count])):
+        # Load and display RGB image
+        rgb_img = Image.open(image_path).convert("RGB")
+        axes[0, i].imshow(rgb_img)
+        axes[0, i].set_title(f"RGB {i+1}")
+        axes[0, i].axis('off')
 
-    return {
-        "num_masks": np.array(all_num_masks, dtype=np.int32),
-        "mask_data": np.concatenate(all_mask_data) if all_mask_data else np.array([], dtype=np.uint8),
-        "mask_shapes": np.concatenate(all_mask_shapes) if all_mask_shapes else np.array([], dtype=np.int32),
-        "bbox_data": np.concatenate(all_bbox_data) if all_bbox_data else np.array([], dtype=np.float32),
-        "pred_iou_data": np.concatenate(all_pred_iou_data) if all_pred_iou_data else np.array([], dtype=np.float32),
-        "area_data": np.concatenate(all_area_data) if all_area_data else np.array([], dtype=np.float32),
-        "image_offsets": np.array(image_offsets, dtype=np.int32)
-    }
+        # Generate and display mask
+        inst_mask, _ = SAM2utils.auto_masks_to_instance_mask(
+            auto_masks,
+            min_iou=float(pred_iou_thresh),
+            min_area=float(min_mask_region_area),
+            assign_by="area",
+            start_from="low",
+        )
+        if inst_mask is None:
+            # No valid masks found, create empty instance mask
+            if auto_masks:
+                h, w = auto_masks[0]['segmentation'].shape
+            else:
+                # Use actual image dimensions as fallback
+                img = Image.open(image_path)
+                h, w = img.height, img.width
+            inst_mask = np.zeros((h, w), dtype=np.uint16)
+        viz_mask, cmap, norm = SAM2utils.make_viz_mask_and_cmap(inst_mask)
+        axes[1, i].imshow(viz_mask, cmap=cmap, norm=norm, interpolation='nearest')
+        axes[1, i].set_title(f"{title_prefix} {i+1} ({len(np.unique(inst_mask)) - 1} inst)")
+        axes[1, i].axis('off')
+
+    plt.tight_layout()
+    plt.show()
 
 
-class ORIENTANYLazyFeatures(BaseLazyShards):
-    """Optimized lazy loading for ORIENTANY features with aggressive caching and memory mapping."""
+class BatchFeatureLoader:
+    """Simple batch feature loader for per-image stored features."""
 
-    def __init__(self, pixel_shard_paths: List[Path], instance_shard_paths: List[Path]):
-        self.instance_shard_paths = instance_shard_paths
-        assert len(pixel_shard_paths) == len(instance_shard_paths), "Pixel and instance shards must match"
+    def __init__(self, data_dir: Path, feature_type: str, image_fnames: List[str], device: torch.device,
+                 max_cpu_images: int = 128, max_gpu_images: int = 16):
+        self.data_dir = data_dir
+        self.feature_type = feature_type
+        self.image_fnames = image_fnames
+        self.device = device
+        self.root, _ = get_cache_paths(data_dir, feature_type)
+        # CPU/GPU LRU caches
+        self.max_cpu_images = int(max_cpu_images)
+        self.max_gpu_images = int(max_gpu_images)
+        self._cpu_cache: "OrderedDict[int, torch.Tensor]" = OrderedDict()
+        self._gpu_cache: "OrderedDict[int, torch.Tensor]" = OrderedDict()
+        self._use_pinned = torch.cuda.is_available()
+        # Prefetch stream for async H2D
+        self._stream = torch.cuda.Stream() if torch.cuda.is_available() else None
 
-        # Initialize caching attributes BEFORE calling super().__init__()
-        self.pixel_mmaps = [None] * len(pixel_shard_paths)  # Memory mapped pixel data
-        self.instance_cache = [None] * len(instance_shard_paths)  # Cached JSON data
-        self.full_image_cache = {}  # LRU-style cache for full reconstructed images
-        self.max_image_cache = 50  # Cache up to 50 full images in memory
+        sample_features = self._load_single_image_cpu(0)
+        if feature_type in ("CLIP", "DINO"):
+            self.H, self.W, self.C = sample_features.shape
+            self.dtype = sample_features.dtype
+        elif feature_type.startswith("FOREGROUND_"):
+            self.H, self.W, self.C = sample_features.shape
+            self.dtype = sample_features.dtype
+        elif feature_type.startswith("ORIENTANY_"):
+            self.H, self.W = sample_features.shape[:2]
+            self.dtype = sample_features.dtype
+        del sample_features
 
-        super().__init__(pixel_shard_paths)  # Use pixel shards for indexing
+    def _load_single_image_cpu(self, img_idx: int):
+        """Load features for a single image onto CPU (optionally pinned)."""
+        if self.feature_type in ("CLIP", "DINO"):
+            data = np.load(self.root / f"image_{img_idx:06d}.npy", mmap_mode="r")
+            t = torch.from_numpy(data)
+            return t.pin_memory() if self._use_pinned else t
+        elif self.feature_type.startswith("FOREGROUND_"):
+            data = np.load(self.root / f"image_{img_idx:06d}.npy", mmap_mode="r")
+            t = torch.from_numpy(data)
+            return t.pin_memory() if self._use_pinned else t
+        elif self.feature_type.startswith("ORIENTANY_"):
+            pixel_data = np.load(self.root / f"image_{img_idx:06d}_pixel.npy", mmap_mode="r")
+            with open(self.root / f"image_{img_idx:06d}_instances.json", 'r') as f:
+                instance_features = json.load(f)
 
-    def _setup_lengths(self):
-        """Count total number of images across all pixel shards."""
-        for p in self.paths:
-            # Use memory mapping for instant access to shape info
-            arr = np.load(p, mmap_mode="r")
-            self.lengths.append(arr.shape[0])
-            # Keep first mmap for dimensions
-            if self.pixel_mmaps[0] is None:
-                self.pixel_mmaps[0] = arr
-                self.H, self.W = arr.shape[1:3]
-            elif arr is not self.pixel_mmaps[0]:
-                del arr
+            h, w, _ = pixel_data.shape
+            full_features = np.zeros((h, w, 8), dtype=np.float16)
+            full_features[..., 6:8] = pixel_data[..., :2]
+            instance_ids = pixel_data[..., 2]
+            unique_ids = np.unique(instance_ids)
+            for instance_id in unique_ids:
+                if instance_id == 0:  # Skip background
+                    continue
+                instance_id_str = str(int(instance_id))
+                if instance_id_str in instance_features:
+                    mask = (instance_ids == instance_id)
+                    instance_feat = instance_features[instance_id_str]
+                    if isinstance(instance_feat, list):
+                        instance_feat = np.array(instance_feat, dtype=np.float16)
+                    full_features[mask, :6] = instance_feat
+            t = torch.from_numpy(full_features)
+            return t.pin_memory() if self._use_pinned else t
 
-    def _get_pixel_shard(self, shard_idx: int):
-        """Get memory-mapped pixel shard."""
-        if self.pixel_mmaps[shard_idx] is None:
-            self.pixel_mmaps[shard_idx] = np.load(self.paths[shard_idx], mmap_mode="r")
-        return self.pixel_mmaps[shard_idx]
+        elif self.feature_type.startswith("CLIPSAM_") or self.feature_type == "SAM2":
+            data = np.load(self.root / f"image_{img_idx:06d}.npz")
+            packed_data = {
+                "num_masks": int(data['num_masks']),
+                "mask_data": data['mask_data'],
+                "mask_shapes": data['mask_shapes'],
+                "bbox_data": data['bbox_data'],
+                "pred_iou_data": data['pred_iou_data'],
+                "area_data": data['area_data']
+            }
+            return unpack_auto_masks(packed_data)
+        elif self.feature_type == "TEXT":
+            with open(self.root / f"image_{img_idx:06d}.json", 'r') as f:
+                return json.load(f)
 
-    def _get_instance_shard(self, shard_idx: int):
-        """Get cached instance features shard."""
-        if self.instance_cache[shard_idx] is None:
-            with open(self.instance_shard_paths[shard_idx], 'r') as f:
-                self.instance_cache[shard_idx] = json.load(f)
-        return self.instance_cache[shard_idx]
+        raise ValueError(f"Unknown feature type: {self.feature_type}")
 
-    def __len__(self) -> int:
-        return int(self.cum[-1])
+    def _get_cpu_tensor(self, img_idx: int) -> torch.Tensor:
+        if img_idx in self._cpu_cache:
+            t = self._cpu_cache.pop(img_idx)
+            self._cpu_cache[img_idx] = t
+            return t
+        t = self._load_single_image_cpu(img_idx)
+        self._cpu_cache[img_idx] = t
+        if len(self._cpu_cache) > self.max_cpu_images:
+            self._cpu_cache.popitem(last=False)
+        return t
 
-    def __getitem__(self, idx) -> np.ndarray:
-        """Optimized ORIENTANY feature access with aggressive caching.
+    def _get_gpu_tensor(self, img_idx: int) -> torch.Tensor:
+        if img_idx in self._gpu_cache:
+            t = self._gpu_cache.pop(img_idx)
+            self._gpu_cache[img_idx] = t
+            return t
+        cpu_t = self._get_cpu_tensor(img_idx)
+        if self._stream:
+            with torch.cuda.stream(self._stream):
+                gpu_t = cpu_t.to(self.device, non_blocking=True)
+            torch.cuda.current_stream().wait_stream(self._stream)
+        else:
+            gpu_t = cpu_t.to(self.device, non_blocking=True)
+        self._gpu_cache[img_idx] = gpu_t
+        if len(self._gpu_cache) > self.max_gpu_images:
+            # Evict least-recently-used
+            old_idx, old_t = self._gpu_cache.popitem(last=False)
+            del old_t
+        return gpu_t
 
-        For single image access: feat[idx_img] → returns (H, W, 10) array
-        """
-        if not isinstance(idx, int):
-            raise ValueError("Only single image access supported: feat[idx_img]")
+    def load_batch_images(self, camera_indices: torch.Tensor) -> Dict[int, torch.Tensor]:
+        """Load features for a batch of camera indices using CPU/GPU LRU caches and async H2D."""
+        batch_features: Dict[int, torch.Tensor] = {}
+        unique_indices = camera_indices.unique()
+        for cam_idx in unique_indices:
+            cam_idx_int = int(cam_idx.item())
+            # Only tensor-backed features are cached on GPU. For list/JSON types we fall back to CPU read.
+            if self.feature_type in ("CLIP", "DINO") or self.feature_type.startswith("FOREGROUND_") or self.feature_type.startswith("ORIENTANY_"):
+                batch_features[cam_idx_int] = self._get_gpu_tensor(cam_idx_int)
+            else:
+                # SAM2/TEXT types
+                batch_features[cam_idx_int] = self._load_single_image_cpu(cam_idx_int)
+        return batch_features
 
-        # Check cache first
-        if idx in self.full_image_cache:
-            return self.full_image_cache[idx]
+    def __getitem__(self, index: int):
+        """Direct access by image index for pipeline compatibility."""
+        if self.feature_type in ("CLIP", "DINO") or self.feature_type.startswith("FOREGROUND_") or self.feature_type.startswith("ORIENTANY_"):
+            return self._get_gpu_tensor(index)
+        else:
+            return self._load_single_image_cpu(index)
 
-        shard_idx, local_idx = self._loc(idx)
 
-        # Use memory-mapped pixel data
-        pixel_data = self._get_pixel_shard(shard_idx)[local_idx]  # (H, W, 3)
-
-        # Use cached instance features
-        instance_features = self._get_instance_shard(shard_idx)[local_idx]  # {instance_id: 8D_mixed_distribution_params}
-
-        # Reconstruct efficiently using vectorized operations
-        h, w, _ = pixel_data.shape
-        full_features = np.zeros((h, w, 10), dtype=np.float32)
-
-        # Set foreground one-hot (vectorized)
-        full_features[..., 8:10] = pixel_data[..., :2]
-
-        # Vectorized instance feature assignment
-        instance_ids = pixel_data[..., 2]
-        unique_ids = np.unique(instance_ids)
-
-        for instance_id in unique_ids:
-            if instance_id == 0:  # Skip background
-                continue
-            instance_id_str = str(int(instance_id))
-            if instance_id_str in instance_features:
-                mask = (instance_ids == instance_id)
-                instance_feat = instance_features[instance_id_str]
-                if isinstance(instance_feat, list):
-                    instance_feat = np.array(instance_feat, dtype=np.float32)
-                full_features[mask, :8] = instance_feat
-
-        # Cache the result (with simple LRU eviction)
-        if len(self.full_image_cache) >= self.max_image_cache:
-            # Remove oldest entry (simple FIFO for speed)
-            oldest_key = next(iter(self.full_image_cache))
-            del self.full_image_cache[oldest_key]
-
-        self.full_image_cache[idx] = full_features
-        return full_features
-
-    def clear_cache(self):
-        """Clear only the full image cache to manage memory, keep shard caches for speed."""
-        self.full_image_cache.clear()
+def get_cache_paths(data_dir: Path, feature_type: str) -> Tuple[Path, Path]:
+    """Get cache directory and metadata paths for a feature type."""
+    if feature_type.startswith("CLIPSAM_") or feature_type.startswith("FOREGROUND_") or feature_type.startswith("ORIENTANY_"):
+        root = data_dir / "features" / feature_type.lower()
+    else:
+        root = data_dir / "features" / feature_type.lower()
+    return root, root / "meta.pt"

@@ -17,7 +17,6 @@ from sam2.features.clip_main import CLIPfeatures
 from sam2.features.utils import AsyncMultiWrapper
 
 from f3rm.features.utils import (
-    LazyFeatures, SAM2LazyAutoMasks, TextLazyFeatures,
     run_async_in_any_context,
     resolve_devices_and_workers,
     get_nerf_ccs_to_normal_ccs_T,
@@ -30,6 +29,7 @@ from f3rm.features.utils import (
     probs_to_normal,
     normal_to_probs
 )
+from f3rm.features.utils import BatchFeatureLoader
 from f3rm.features.sam2_extract import SAM2Args
 from f3rm.features.orientany.orientany_main import OrientAny
 
@@ -83,21 +83,14 @@ class ORIENTANYWorker:
         clip_meta = torch.load(clip_root / "meta.pt")
         self.feat_image_fnames = [str(p) for p in clip_meta["image_fnames"]]
 
-        # Load caches
-        clip_shards = sorted(clip_root.glob("chunk_*.npy"))
-        assert clip_shards, f"No CLIP shards under {clip_root}"
-        self.clip_features = LazyFeatures(clip_shards)
-
-        sam2_shards = sorted(sam2_root.glob("chunk_*.npz"))
-        assert sam2_shards, f"No SAM2 shards under {sam2_root}"
-        self.sam2_masks = SAM2LazyAutoMasks(sam2_shards)
+        # Create batch feature loaders for the new system
+        self.clip_loader = BatchFeatureLoader(self.data_dir, "CLIP", self.feat_image_fnames, device)
+        self.sam2_loader = BatchFeatureLoader(self.data_dir, "SAM2", self.feat_image_fnames, device)
 
         if self.text_prompts is None:
-            text_shards = sorted(text_root.glob("chunk_*.json"))
-            assert text_shards, f"No TEXT shards under {text_root}"
-            self.text_features = TextLazyFeatures(text_shards)
+            self.text_loader = BatchFeatureLoader(self.data_dir, "TEXT", self.feat_image_fnames, device)
         else:
-            self.text_features = None
+            self.text_loader = None
 
         self.clip_model = CLIPfeatures(device=self.device)
         self.orient_any = OrientAny("f3rm/features/orientany/ckpts", "ronormsigma1_dino_weight.pt")
@@ -120,12 +113,12 @@ class ORIENTANYWorker:
         except ValueError:
             raise ValueError(f"Image path not found in CLIP meta order: {image_path}")
 
-        clip_patch_feats = self.clip_features[idx].to(self.device)
-        raw_auto_masks = self.sam2_masks[idx]
+        clip_patch_feats = self.clip_loader[idx]
+        raw_auto_masks = self.sam2_loader[idx]
 
         # prompts
         if self.text_prompts is None:
-            text_prompts = self.text_features[idx]
+            text_prompts = self.text_loader[idx]
         else:
             text_prompts = self.text_prompts
 
@@ -134,8 +127,8 @@ class ORIENTANYWorker:
             h, w = (raw_auto_masks[0]['segmentation'].shape if raw_auto_masks else (Image.open(image_path).size[1], Image.open(image_path).size[0]))
             fg = np.zeros((h, w), dtype=bool)
             # Return new format: pixel_data + empty instance_features
-            pixel_data = np.zeros((h, w, 3), dtype=np.float32)
-            pixel_data[..., :2] = np.stack([~fg, fg], axis=-1).astype(np.float32)  # foreground one-hot
+            pixel_data = np.zeros((h, w, 3), dtype=np.float16)  # Use fp16 for VRAM efficiency
+            pixel_data[..., :2] = np.stack([~fg, fg], axis=-1).astype(np.float16)  # foreground one-hot
             return {
                 'pixel_data': pixel_data,
                 'instance_features': {}  # No instances
@@ -182,15 +175,15 @@ class ORIENTANYWorker:
             auto_masks.append({
                 "segmentation": seg,
                 "bbox": bbox,
-                "predicted_iou": float("inf"),
-                "area": float("inf"),
+                "predicted_iou": np.float16("inf"),  # Use fp16 for VRAM efficiency
+                "area": np.float16("inf"),           # Use fp16 for VRAM efficiency
             })
 
         if not auto_masks:
             h, w = inst_mask.shape
             fg = np.zeros((h, w), dtype=bool)
-            pixel_data = np.zeros((h, w, 3), dtype=np.float32)
-            pixel_data[..., :2] = np.stack([~fg, fg], axis=-1).astype(np.float32)  # foreground one-hot
+            pixel_data = np.zeros((h, w, 3), dtype=np.float16)  # Use fp16 for VRAM efficiency
+            pixel_data[..., :2] = np.stack([~fg, fg], axis=-1).astype(np.float16)  # foreground one-hot
             return {
                 'pixel_data': pixel_data,
                 'instance_features': {}  # No instances
@@ -201,8 +194,8 @@ class ORIENTANYWorker:
         # Per-prompt sim maps and combine
         segment_sim_maps: List[np.ndarray] = []
         for text in text_prompts:
-            text_emb = self.clip_model.encode_text(text)
-            neg_text_embs = torch.stack([self.clip_model.encode_text(neg) for neg in ORIENTANYArgs.negative_texts], dim=0)
+            text_emb = self.clip_model.encode_text(text).half()
+            neg_text_embs = torch.stack([self.clip_model.encode_text(neg).half() for neg in ORIENTANYArgs.negative_texts], dim=0)
             sim_map = self.clip_model.compute_similarity(
                 clip_patch_feats,
                 text_emb,
@@ -210,7 +203,7 @@ class ORIENTANYWorker:
                 softmax_temp=ORIENTANYArgs.softmax_temp,
                 normalize=True,
             )
-            sim_map_up = np.array(Image.fromarray(sim_map.cpu().numpy()).resize((w, h), Image.BILINEAR))
+            sim_map_up = np.array(Image.fromarray(sim_map.cpu().float().numpy()).resize((w, h), Image.BILINEAR)).astype(np.float16)
 
             seg_map = np.zeros_like(sim_map_up)
             for m in auto_masks:
@@ -234,8 +227,8 @@ class ORIENTANYWorker:
                 fg_mask |= seg
 
         # Initialize per-pixel data: (H, W, 3) - [fg_one_hot, instance_id]
-        pixel_data = np.zeros((h, w, 3), dtype=np.float32)
-        pixel_data[..., :2] = np.stack([~fg_mask, fg_mask], axis=-1).astype(np.float32)  # foreground one-hot
+        pixel_data = np.zeros((h, w, 3), dtype=np.float16)  # Use fp16 for VRAM efficiency
+        pixel_data[..., :2] = np.stack([~fg_mask, fg_mask], axis=-1).astype(np.float16)  # foreground one-hot
 
         # Initialize instance features mapping
         instance_features = {}
@@ -311,13 +304,13 @@ class ORIENTANYWorker:
             # Polar: normal (linear, 0-180°)
             pl_mean, pl_std = probs_to_normal(probs_pl_world, n_bins=180, angle_min_deg=0.0, period_deg=180.0)
 
-            # Store compact representation: 8D vector (2 von Mises means, 2 von Mises kappas, 1 normal mean, 1 normal std, 2 confidence)
+            # Store compact representation: 6D vector (2 von Mises means, 2 von Mises kappas, 1 normal mean, 1 normal std)
+            # Note: confidence logits are used for scaling but not saved/loaded
             instance_feat = np.array([
                 ax_mean.cpu().item(), ax_kappa.cpu().item(),  # azimuth von Mises params
                 pl_mean.cpu().item(), pl_std.cpu().item(),    # polar normal params
                 ro_mean.cpu().item(), ro_kappa.cpu().item(),  # roll von Mises params
-                conf_logits[0].cpu().item(), conf_logits[1].cpu().item()  # confidence logits
-            ], dtype=np.float32)
+            ], dtype=np.float16)  # Use fp16 for VRAM efficiency
 
             instance_features[next_instance_id] = instance_feat.tolist()  # Convert to list for JSON serialization
 
@@ -362,7 +355,7 @@ class ORIENTANYExtractor:
         if self.data_dir is None:
             raise ValueError("ORIENTANYExtractor requires data_dir to locate precomputed CLIP and SAM2 shards")
 
-        # Validate prerequisites
+        # Validate prerequisites for new per-image system
         feat_root = self.data_dir / "features"
         clip_root = feat_root / "clip"
         sam2_root = feat_root / "sam2"
@@ -370,12 +363,12 @@ class ORIENTANYExtractor:
 
         if not (clip_root / "meta.pt").exists():
             raise FileNotFoundError(f"Missing CLIP meta: {clip_root / 'meta.pt'}")
-        if not list(clip_root.glob("chunk_*.npy")):
-            raise FileNotFoundError(f"Missing CLIP shards under {clip_root}")
-        if not list(sam2_root.glob("chunk_*.npz")):
-            raise FileNotFoundError(f"Missing SAM2 shards under {sam2_root}")
-        if text_prompts is None and not list(text_root.glob("chunk_*.json")):
-            raise FileNotFoundError(f"Missing TEXT shards under {text_root} (required when using per-image text prompts)")
+        if not list(clip_root.glob("image_*.npy")):
+            raise FileNotFoundError(f"Missing CLIP per-image features under {clip_root}")
+        if not list(sam2_root.glob("image_*.npz")):
+            raise FileNotFoundError(f"Missing SAM2 per-image features under {sam2_root}")
+        if text_prompts is None and not list(text_root.glob("image_*.json")):
+            raise FileNotFoundError(f"Missing TEXT per-image features under {text_root} (required when using per-image text prompts)")
 
         devices_param, num_workers = resolve_devices_and_workers(device, ORIENTANYArgs.batch_size_per_gpu)
         if verbose:
@@ -394,14 +387,8 @@ class ORIENTANYExtractor:
         return results
 
 
-def make_orientany_extractor(device: torch.device, verbose: bool = False, data_dir: Optional[Path] = None, text_prompts: Optional[List[str]] = None) -> "ORIENTANYExtractor":
-    if data_dir is None:
-        raise ValueError("make_orientany_extractor requires data_dir")
-    return ORIENTANYExtractor(device=device, data_dir=data_dir, text_prompts=text_prompts, verbose=verbose)
-
-
 async def extract_orientany_batch(image_paths: List[str], device: torch.device, data_dir: Path, verbose: bool = False, text_prompts: Optional[List[str]] = None, debug: bool = False):
-    extractor = make_orientany_extractor(device=device, verbose=verbose, data_dir=data_dir, text_prompts=text_prompts)
+    extractor = ORIENTANYExtractor(device=device, data_dir=data_dir, text_prompts=text_prompts, verbose=verbose)
     return await extractor.extract_batch_async(image_paths, debug=debug)
 
 
@@ -410,14 +397,14 @@ async def process_single_image_orientany_async(image_path: str, orientany_client
 
 
 if __name__ == "__main__":
-    data_root = Path("datasets/f3rm/panda_demos/caterpillar")
+    data_root = Path("datasets/f3rm/opt/caterpillar")
     image_dir = data_root / "images"
     image_paths = sorted(list(image_dir.glob("*.jpg")) + list(image_dir.glob("*.png")))
     image_paths = [str(p) for p in image_paths[:3]]  # Just 3 for demo
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Extract orientation features using global prompts (with debug info)
-    extractor = make_orientany_extractor(device=device, data_dir=data_root, text_prompts=["toy"], verbose=True)
+    extractor = ORIENTANYExtractor(device=device, data_dir=data_root, text_prompts=["toy"], verbose=True)
     features_data = run_async_in_any_context(lambda: extractor.extract_batch_async(image_paths, debug=True))
     print(f"Extracted {len(features_data)} feature maps")
 
@@ -425,24 +412,24 @@ if __name__ == "__main__":
     features = []
     for data in features_data:
         pixel_data = data['pixel_data']  # (H, W, 3)
-        instance_features = data['instance_features']  # {instance_id: 8D_mixed_distribution_params}
+        instance_features = data['instance_features']  # {instance_id: 6D_mixed_distribution_params}
 
-        # Reconstruct full feature array (H, W, 10) - compact representation
+        # Reconstruct full feature array (H, W, 8) - compact representation
         h, w, _ = pixel_data.shape
-        full_features = np.zeros((h, w, 10), dtype=np.float32)
+        full_features = np.zeros((h, w, 8), dtype=np.float16)  # Use fp16 for VRAM efficiency
 
         # Set foreground one-hot at the end
-        full_features[..., 8:10] = pixel_data[..., :2]  # foreground one-hot
+        full_features[..., 6:8] = pixel_data[..., :2]  # foreground one-hot
 
-        # For each foreground pixel, get its instance features (8D mixed distribution params)
+        # For each foreground pixel, get its instance features (6D mixed distribution params)
         for instance_id, instance_feat in instance_features.items():
             instance_id = int(instance_id)
             mask = (pixel_data[..., 2] == instance_id)
             if np.any(mask):
                 # Convert list back to numpy array if needed
                 if isinstance(instance_feat, list):
-                    instance_feat = np.array(instance_feat, dtype=np.float32)
-                full_features[mask, :8] = instance_feat
+                    instance_feat = np.array(instance_feat, dtype=np.float16)  # Use fp16 for VRAM efficiency
+                full_features[mask, :6] = instance_feat
 
         features.append(full_features)
 

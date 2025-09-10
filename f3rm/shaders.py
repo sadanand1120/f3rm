@@ -45,7 +45,7 @@ class CentroidShader(nn.Module):
 
         if valid_mask is not None:
             vis = vis * valid_mask.to(vis.device)
-        return vis
+        return vis.to(torch.float16)  # Ensure fp16 consistency for RGB visualization
 
 
 class ScalarShader(nn.Module):
@@ -67,7 +67,7 @@ class ScalarShader(nn.Module):
         rgb = x.unsqueeze(-1).expand(*x.shape, 3)
         if valid_mask is not None:
             rgb = rgb * valid_mask.to(rgb.device)
-        return rgb
+        return rgb.to(torch.float16)  # Ensure fp16 consistency for RGB visualization
 
 
 class ProbShader(nn.Module):
@@ -82,7 +82,7 @@ class ProbShader(nn.Module):
         rgb = probs.expand(*probs.shape[:-1], 3)
         if valid_mask is not None:
             rgb = rgb * valid_mask.to(rgb.device)
-        return rgb
+        return rgb.to(torch.float16)  # Ensure fp16 consistency for RGB visualization
 
 
 class ProbFromProbsShader(nn.Module):
@@ -97,4 +97,4 @@ class ProbFromProbsShader(nn.Module):
         rgb = p.expand(*p.shape[:-1], 3)
         if valid_mask is not None:
             rgb = rgb * valid_mask.to(rgb.device)
-        return rgb
+        return rgb.to(torch.float16)  # Ensure fp16 consistency for RGB visualization

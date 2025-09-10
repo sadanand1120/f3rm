@@ -323,12 +323,8 @@ class TextExtractor:
         return results
 
 
-def make_text_extractor(device: torch.device, verbose: bool = False, data_dir: Optional[Path] = None) -> TextExtractor:
-    return TextExtractor(device=device, verbose=verbose, data_dir=data_dir)
-
-
 def extract_text_features(image_paths: List[str], device: torch.device, verbose=False, data_dir: Optional[Path] = None) -> List[List[str]]:
-    extractor = make_text_extractor(device, verbose=verbose, data_dir=data_dir)
+    extractor = TextExtractor(device=device, verbose=verbose, data_dir=data_dir)
     return run_async_in_any_context(lambda: extractor.extract_batch_async(image_paths))
 
 

@@ -26,77 +26,77 @@ f3rm_method = MethodSpecification(
         steps_per_save=5000,
         max_num_iterations=30000,
         mixed_precision=True,
-        # Seeding configuration - now with comprehensive support
-        enable_comprehensive_seeding=False,   # causing some issues with normals training, TODO: fix later
-        seed_deterministic_algorithms=True,
-        seed_warn_only=False,  # Set to True if you encounter issues with deterministic algorithms
+        enable_comprehensive_seeding=False,   # TODO: fix normals training issues
+        seed_deterministic_algorithms=False,
+        seed_warn_only=True,  # Set to True if you encounter issues with deterministic algorithms
         seed_cublas_workspace=True,
         print_seed_info=True,
         pipeline=FeaturePipelineConfig(
             datamanager=FeatureDataManagerConfig(
                 feature_type="CLIP",
-                sam2_feature_type="SAM2",
+                sam2_feature_type="CLIPSAM_",
                 foreground_feature_type="FOREGROUND_",
                 orientany_feature_type="ORIENTANY_",
+                cpu_feature_cache_images=256,
+                gpu_feature_cache_images=128,
                 dataparser=NerfstudioDataParserConfig(train_split_fraction=0.95),
-                train_num_rays_per_batch=8192,
-                eval_num_rays_per_batch=4096,
+                train_num_rays_per_batch=1 << 13,
+                train_num_images_to_sample_from=64,
+                train_num_times_to_repeat_images=2048,
+                eval_num_rays_per_batch=1 << 12,
+                eval_num_images_to_sample_from=64,
+                eval_num_times_to_repeat_images=2048,
                 camera_optimizer=CameraOptimizerConfig(
                     mode="SO3xR3",
-                    optimizer=AdamOptimizerConfig(lr=6e-4, eps=1e-8, weight_decay=1e-2),
+                    optimizer=AdamOptimizerConfig(lr=6e-4, eps=1e-8, weight_decay=0.0, max_norm=1.0),
+                    scheduler=ExponentialDecaySchedulerConfig(lr_final=6e-5, warmup_steps=3000, max_steps=30000),
                 ),
             ),
-            # To support more GPUs, we reduce the num rays per chunk. The default was 1 << 15 which uses ~16GB of GPU
-            # memory when training and using viewer. 1 << 14 uses ~12GB of GPU memory in comparison. The decrease in
-            # rendering speed is not too important.
             model=FeatureFieldModelConfig(
                 eval_num_rays_per_chunk=1 << 14,
                 predict_normals=True,
                 feat_condition_on_density=False,  # degraded performance
                 feat_condition_density_grad_to_nerf=False,   # degraded performance
-                # Centroid head controls
+                num_proposal_iterations=2,  # May reduce proposal iterations for speed
                 centroid_enable=True,
-                centroid_loss_weight=2e-3,
+                centroid_loss_weight=1e-3,
                 centroid_condition_on_density=False,
                 centroid_condition_density_grad_to_nerf=False,
                 centroid_hidden_dim=64,
                 centroid_num_layers=2,
                 centroid_gt_blend=0.5,
-                centroid_blend_after_steps=0,
-                # Foreground head controls
+                centroid_blend_after_steps=10000,
                 foreground_enable=True,
                 foreground_condition_on_density=False,
                 foreground_condition_density_grad_to_nerf=False,
                 enable_campose_refine_feature_field=False,
-                foreground_loss_weight=2e-3,
+                foreground_loss_weight=1e-3,
                 foreground_hidden_dim=64,
                 foreground_num_layers=2,
-                # OrientAny head controls
                 orientany_enable=True,
                 orientany_condition_on_density=False,
                 orientany_condition_density_grad_to_nerf=False,
-                orientany_loss_weight=2e-3,
+                orientany_loss_weight=1e-4,
                 orientany_hidden_dim=64,
                 orientany_num_layers=2,
-                # OrientAny input controls: xyz encoding (True) or encoded centroid prediction (False)
-                orientany_use_xyz_encoding=False,
+                orientany_use_xyz_encoding=False,  # xyz encoding (True) or encoded centroid prediction (False)
             ),
             steps_per_train_cache_update=0,
-            train_cache_cold_start_skip_steps=0,
-            steps_per_train_image_viz=500,
+            train_cache_cold_start_skip_steps=3000,
+            steps_per_train_image_viz=8000,
         ),
         optimizers={
             "proposal_networks": {
                 "optimizer": AdamOptimizerConfig(lr=1e-2, eps=1e-15, max_norm=1.0),
-                "scheduler": ExponentialDecaySchedulerConfig(lr_final=0.0001, max_steps=200000),
+                "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, warmup_steps=1000, max_steps=200000),
             },
             "fields": {
                 "optimizer": AdamOptimizerConfig(lr=1e-2, eps=1e-15, max_norm=1.0),
-                "scheduler": ExponentialDecaySchedulerConfig(lr_final=0.0001, max_steps=200000),
+                "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, warmup_steps=1000, max_steps=200000),
             },
             "feature_field": {
-                "optimizer": AdamOptimizerConfig(lr=1e-2, eps=1e-15, max_norm=1.0),
-                "scheduler": ExponentialDecaySchedulerConfig(lr_final=0.0001, max_steps=200000),
+                "optimizer": AdamOptimizerConfig(lr=5e-3, eps=1e-15, max_norm=1.0),
+                "scheduler": ExponentialDecaySchedulerConfig(lr_final=6e-5, warmup_steps=1000, max_steps=28000),
             },
         },
         viewer=ViewerConfig(num_rays_per_chunk=1 << 15),

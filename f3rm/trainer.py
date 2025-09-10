@@ -64,6 +64,13 @@ class F3RMTrainer(Trainer):
         if config.enable_comprehensive_seeding:
             self._setup_seeding(config, local_rank, world_size)
 
+        # Fast kernels on H100: enable TF32 + cudnn benchmark when not forcing determinism
+        if not config.seed_deterministic_algorithms:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+            torch.set_float32_matmul_precision("high")
+
         # Call parent constructor
         super().__init__(config, local_rank, world_size)
 

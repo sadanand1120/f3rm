@@ -153,7 +153,8 @@ class FeaturePipeline(VanillaPipeline):
                     # After cold start, render centroid preds to enable EMA (if enabled) and spread logic; skip feature rendering and OrientAny for cache
                     images = self._render_full_image_images_for_camera(ci, render_features=False, render_centroid=need_centroid_preds, render_foreground=self.model.config.foreground_enable, render_orientany=False)
                     if images is not None:
-                        self._train_depth_cache[ci] = images["depth_raw"].detach()
+                        # Keep depth cache on CPU to reduce VRAM pressure
+                        self._train_depth_cache[ci] = images["depth_raw"].detach().cpu()
                         c_img, v_img, c_rgb, s_img, s_err_rgb, s_prob_rgb, s_valid = self._compute_centroid_and_spread_gt_for_camera(ci, images, allow_blend=allow_blend)
                         self._train_centroid_cache[ci] = c_img.cpu()
                         self._train_centroid_valid[ci] = v_img.cpu()
@@ -168,7 +169,7 @@ class FeaturePipeline(VanillaPipeline):
                         if rep_spread_prob_rgb is None:
                             rep_spread_prob_rgb = s_prob_rgb
                         if rep_depth is None:
-                            rep_depth = images["depth"]
+                            rep_depth = images["depth"].cpu()
                         # # TODO: Do you need this for VRAM management? Aggressive cleanup after each camera
                         # del images, c_img, v_img, c_rgb, s_img, s_err_rgb, s_prob_rgb, s_valid
                         # torch.cuda.empty_cache()
@@ -177,7 +178,7 @@ class FeaturePipeline(VanillaPipeline):
             for ci in unique_cams:
                 images = self._render_full_image_images_for_camera(ci, render_features=False, render_centroid=need_centroid_preds, render_foreground=self.model.config.foreground_enable, render_orientany=False)
                 if images is not None:
-                    self._train_depth_cache[ci] = images["depth_raw"].detach()
+                    self._train_depth_cache[ci] = images["depth_raw"].detach().cpu()
                     c_img, v_img, _, s_img, _, _, s_valid = self._compute_centroid_and_spread_gt_for_camera(ci, images, allow_blend=allow_blend)
                     self._train_centroid_cache[ci] = c_img.cpu()
                     self._train_centroid_valid[ci] = v_img.cpu()
@@ -186,7 +187,7 @@ class FeaturePipeline(VanillaPipeline):
                     images["centroid_spread_gt_full"] = s_img
                     images["centroid_spread_prob_soft_gt_full"] = torch.cat([1.0 - s_img[..., 1:2], s_img[..., 1:2]], dim=-1)
                     if rep_depth is None:
-                        rep_depth = images["depth"]
+                        rep_depth = images["depth"].cpu()
                     # # TODO: Do you need this for VRAM management? Aggressive cleanup after each camera
                     # del images, c_img, v_img, s_img, s_valid
                     # torch.cuda.empty_cache()
@@ -256,7 +257,7 @@ class FeaturePipeline(VanillaPipeline):
 
     def _compute_centroid_and_spread_gt_for_camera(self, camera_index: int, images: Dict[str, torch.Tensor], is_eval: bool = False, allow_blend: bool = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # Require SAM2 masks (must be present)
-        sam2 = self.datamanager.sam2_masks
+        sam2 = self.datamanager.sam2_loader
         # Determine split and global index
         eval_offset = getattr(self.datamanager, "eval_offset", 0)
         global_idx = camera_index + (eval_offset if is_eval else 0)
@@ -414,13 +415,8 @@ class FeaturePipeline(VanillaPipeline):
         # Add foreground pred vs GT side-by-side using full-image GT from datamanager
         if self.model.config.foreground_enable and ("foreground_prob_rgb" in outputs):
             ci_global = ci  # train split uses train indices directly
-            # Use original FOREGROUND_ datamanager map
-            fg_map = self.datamanager.fg_maps[ci_global]
-            if isinstance(fg_map, np.ndarray):
-                fg_map = torch.from_numpy(fg_map)
-            fg_map = fg_map.to(self.device).float()
+            fg_map = self.datamanager.fg_loader[ci_global]
             fg_gt_prob = fg_map[..., 1:2]
-
             fg_gt_rgb = self.model.prob_from_probs_shader(fg_gt_prob)
 
             images_dict["foreground_prob_gt"] = fg_gt_rgb
@@ -431,14 +427,13 @@ class FeaturePipeline(VanillaPipeline):
             # Get full OrientAny GT tensor (memory efficient, no gradients needed)
             with torch.no_grad():
                 ci_global = ci  # train split uses train indices directly
-                orientany_gt_np = self.datamanager.orientany_maps[ci_global]  # (H, W, 10) numpy array
-                orientany_gt = torch.from_numpy(orientany_gt_np).float()  # Keep on CPU
+                orientany_gt = self.datamanager.orientany_loader[ci_global].cpu()
 
                 # Convert GT distribution means to RGB (vectorized operations on CPU)
                 ax_mean_gt = orientany_gt[..., 0]  # azimuth mean
                 pl_mean_gt = orientany_gt[..., 2]  # polar mean
                 ro_mean_gt = orientany_gt[..., 4]  # roll mean
-                fg_gt = orientany_gt[..., 9] > 0.5  # foreground mask from GT
+                fg_gt = orientany_gt[..., 7] > 0.5  # foreground mask from GT
 
                 orientany_gt_rgb = torch.stack([
                     torch.clamp(ax_mean_gt / 359.0, 0, 1),
@@ -497,12 +492,8 @@ class FeaturePipeline(VanillaPipeline):
         # Add foreground pred vs GT side-by-side if available in eval batch
         if self.model.config.foreground_enable and ("foreground_prob_rgb" in outputs):
             ci_global = int(image_idx) + getattr(self.datamanager, "eval_offset", 0)
-            fg_map = self.datamanager.fg_maps[ci_global]
-            if isinstance(fg_map, np.ndarray):
-                fg_map = torch.from_numpy(fg_map)
-            fg_map = fg_map.to(self.device).float()
+            fg_map = self.datamanager.fg_loader[ci_global]
             fg_gt_prob = fg_map[..., 1:2]
-
             fg_gt_rgb = self.model.prob_from_probs_shader(fg_gt_prob)
 
             images_dict["foreground_prob_gt"] = fg_gt_rgb
@@ -513,14 +504,13 @@ class FeaturePipeline(VanillaPipeline):
             # Get full OrientAny GT tensor (memory efficient, no gradients needed)
             with torch.no_grad():
                 ci_global = int(image_idx) + getattr(self.datamanager, "eval_offset", 0)
-                orientany_gt_np = self.datamanager.orientany_maps[ci_global]  # (H, W, 10) numpy array
-                orientany_gt = torch.from_numpy(orientany_gt_np).float()  # Keep on CPU
+                orientany_gt = self.datamanager.orientany_loader[ci_global].cpu()
 
                 # Convert GT distribution means to RGB (vectorized operations on CPU)
                 ax_mean_gt = orientany_gt[..., 0]  # azimuth mean
                 pl_mean_gt = orientany_gt[..., 2]  # polar mean
                 ro_mean_gt = orientany_gt[..., 4]  # roll mean
-                fg_gt = orientany_gt[..., 9] > 0.5  # foreground mask from GT
+                fg_gt = orientany_gt[..., 7] > 0.5  # foreground mask from GT
 
                 orientany_gt_rgb = torch.stack([
                     torch.clamp(ax_mean_gt / 359.0, 0, 1),
@@ -556,7 +546,7 @@ class FeaturePipeline(VanillaPipeline):
             transient=True,
         ) as progress:
             task = progress.add_task("[green]Evaluating all eval images...", total=num_images)
-            for camera_ray_bundle, batch in self.datamanager.fixed_indices_eval_dataloader:
+            for i, (camera_ray_bundle, batch) in enumerate(self.datamanager.fixed_indices_eval_dataloader):
                 inner_start = time()
                 height, width = camera_ray_bundle.shape
                 num_rays = height * width
@@ -577,7 +567,8 @@ class FeaturePipeline(VanillaPipeline):
 
                 # Aggressive cleanup between images
                 del outputs, images_dict
-                torch.cuda.empty_cache()
+                if i % 10 == 0:  # Only clear cache every 10 images
+                    torch.cuda.empty_cache()
                 progress.advance(task)
         # average the metrics list
         metrics_dict = {}

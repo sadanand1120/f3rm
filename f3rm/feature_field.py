@@ -24,39 +24,30 @@ class FeatureField(Field):
         self,
         feature_dim: int,
         spatial_distortion: SpatialDistortion,
-        # Density embedding conditioning
         cond_on_density_feature: bool = True,
         cond_on_density_centroid: bool = True,
         cond_on_density_foreground: bool = True,
         cond_on_density_orientany: bool = True,
         density_embedding_dim: int = 15,
-        # Per-head grad flow controls for density embedding
         feat_grad_to_density: bool = False,
         centroid_grad_to_density: bool = False,
         foreground_grad_to_density: bool = False,
         orientany_grad_to_density: bool = False,
-        # Positional encoding
         use_pe: bool = True,
         pe_n_freq: int = 6,
-        # Hash grid
         num_levels: int = 12,
         log2_hashmap_size: int = 19,
         start_res: int = 16,
         max_res: int = 128,
         features_per_level: int = 8,
-        # Feature head MLP
         hidden_dim: int = 64,
         num_layers: int = 2,
-        # Centroid head MLP (predicts world-space centroids directly)
         centroid_hidden_dim: int = 64,
         centroid_num_layers: int = 2,
-        # Foreground head MLP (binary classification with 2 logits)
         foreground_hidden_dim: int = 64,
         foreground_num_layers: int = 1,
-        # OrientAny head MLP (4 separate heads: 360 azimuth + 180 polar + 360 roll + 2 foreground)
         orientany_hidden_dim: int = 64,
         orientany_num_layers: int = 1,
-        # OrientAny input controls: xyz encoding (True) or encoded centroid prediction (False)
         orientany_use_xyz_encoding: bool = True,
     ):
         super().__init__()
@@ -71,8 +62,6 @@ class FeatureField(Field):
         self.foreground_grad_to_density = foreground_grad_to_density
         self.orientany_grad_to_density = orientany_grad_to_density
         self.orientany_use_xyz_encoding = bool(orientany_use_xyz_encoding)
-
-        # Feature field has its own hash grid
         growth_factor = np.exp((np.log(max_res) - np.log(start_res)) / (num_levels - 1))
         encoding_config = {
             "otype": "Composite",
@@ -97,7 +86,6 @@ class FeatureField(Field):
                 }
             )
 
-        # Separate encoding and MLPs so we can concatenate density embeddings post-encoding per head
         self.encoding = tcnn.Encoding(n_input_dims=3, encoding_config=encoding_config)
         mlp_in_dims_feature = self.encoding.n_output_dims + (density_embedding_dim if self.cond_on_density_feature else 0)
         self.mlp_feature = tcnn.Network(
@@ -125,7 +113,6 @@ class FeatureField(Field):
             },
         )
 
-        # Centroid spread head (scalar) - outputs spread preds (2), softmax logits (2)
         mlp_in_dims_spread = self.encoding.n_output_dims + (density_embedding_dim if self.cond_on_density_centroid else 0)
         self.mlp_centroid_spread = tcnn.Network(
             n_input_dims=mlp_in_dims_spread,
@@ -139,7 +126,6 @@ class FeatureField(Field):
             },
         )
 
-        # Foreground classification head (2 logits with density conditioning)
         mlp_in_dims_foreground = self.encoding.n_output_dims + (density_embedding_dim if self.cond_on_density_foreground else 0)
         self.mlp_foreground = tcnn.Network(
             n_input_dims=mlp_in_dims_foreground,
@@ -153,18 +139,14 @@ class FeatureField(Field):
             },
         )
 
-        # Separate encoding object for centroid predictions (same config, different learnable params)
         if not self.orientany_use_xyz_encoding:
             self.orientany_centroid_encoding = tcnn.Encoding(n_input_dims=3, encoding_config=encoding_config)
             orientany_base_in = self.orientany_centroid_encoding.n_output_dims
         else:
             self.orientany_centroid_encoding = None
             orientany_base_in = self.encoding.n_output_dims
-
-        # OrientAny heads (4 separate MLPs: azimuth, polar, roll, foreground)
         mlp_in_dims_orientany = orientany_base_in + (density_embedding_dim if self.cond_on_density_orientany else 0)
 
-        # Azimuth head (360 logits for 0-359 degrees)
         self.mlp_orientany_azimuth = tcnn.Network(
             n_input_dims=mlp_in_dims_orientany,
             n_output_dims=360,
@@ -177,7 +159,6 @@ class FeatureField(Field):
             },
         )
 
-        # Polar head (180 logits for 0-179 degrees)
         self.mlp_orientany_polar = tcnn.Network(
             n_input_dims=mlp_in_dims_orientany,
             n_output_dims=180,
@@ -190,7 +171,6 @@ class FeatureField(Field):
             },
         )
 
-        # Roll head (360 logits for 0-359 degrees)
         self.mlp_orientany_roll = tcnn.Network(
             n_input_dims=mlp_in_dims_orientany,
             n_output_dims=360,
@@ -203,7 +183,6 @@ class FeatureField(Field):
             },
         )
 
-        # OrientAny foreground head (2 logits for binary classification)
         self.mlp_orientany_foreground = tcnn.Network(
             n_input_dims=mlp_in_dims_orientany,
             n_output_dims=2,
