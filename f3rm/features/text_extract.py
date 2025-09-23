@@ -19,7 +19,7 @@ from sam2.features.utils import AsyncMultiWrapper
 class TextArgs:
     # VLM and LLM server configurations - updated to match orienter
     vlm_server: Dict[str, str] = {
-        "base_url": "http://10.0.0.212:8000/v1",
+        "base_url": "http://10.0.0.212:8069/v1",
         "api_key": None,
         "model": "qwen2p5-vl-72b"
     }

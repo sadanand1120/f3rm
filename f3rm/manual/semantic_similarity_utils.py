@@ -63,7 +63,7 @@ class SemanticSimilarityUtils:
                     has_negatives=has_negatives,
                     softmax_temp=softmax_temp
                 )
-                all_similarities.append(chunk_similarities.cpu().numpy())
+                all_similarities.append(chunk_similarities.cpu().numpy().astype(np.float32))
             del features_torch
             torch.cuda.empty_cache()
         similarities = np.concatenate(all_similarities, axis=0)

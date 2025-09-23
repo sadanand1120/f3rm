@@ -64,6 +64,28 @@ class FeaturePipeline(VanillaPipeline):
     def cfg(self) -> FeaturePipelineConfig:
         return self.config  # type: ignore[return-value]
 
+    def _compute_blend_value(self, step: int) -> float:
+        """Compute blend value using exponential schedule.
+
+        Schedule:
+        - centroid_blend_start_value until centroid_blend_after_steps
+        - Exponential growth from centroid_blend_start_value to centroid_blend_end_value from centroid_blend_after_steps to centroid_blend_until_steps
+        - centroid_blend_end_value after centroid_blend_until_steps
+        """
+        blend_after = int(getattr(self.model.config, "centroid_blend_after_steps", 0))
+        blend_until = int(getattr(self.model.config, "centroid_blend_until_steps", 0))
+        blend_start = float(getattr(self.model.config, "centroid_blend_start_value", 0.0))
+        blend_end = float(getattr(self.model.config, "centroid_blend_end_value", 1.0))
+
+        if step < blend_after:
+            return blend_start
+        elif step >= blend_until:
+            return blend_end
+        else:
+            # Exponential growth from blend_start to blend_end
+            progress = (step - blend_after) / (blend_until - blend_after)
+            return blend_start + (blend_end - blend_start) * (1.0 - (1.0 - progress) ** 3)  # Cubic growth for smooth transition
+
     @profiler.time_function
     def get_train_loss_dict(self, step: int):
         # Same as VanillaPipeline.get_train_loss_dict, but update centroid cache BEFORE model forward
@@ -93,10 +115,6 @@ class FeaturePipeline(VanillaPipeline):
         return model_outputs, loss_dict, metrics_dict
 
     def _maybe_update_train_centroid_cache(self, batch: Dict, step: int) -> None:
-        # Single knob: cache is active when centroid training is enabled
-        if not getattr(self.model.config, "centroid_enable", False):
-            return
-
         if "indices" not in batch:
             return
         cam_idxs = batch["indices"][:, 0]
@@ -133,14 +151,11 @@ class FeaturePipeline(VanillaPipeline):
         rep_centroid_rgb = None
         rep_spread_err_rgb = None
         rep_spread_prob_rgb = None
-        # Decide once whether we need centroid preds for EMA blending at this step
-        blend = float(getattr(self.model.config, "centroid_gt_blend", 0.5))
+        # Compute blend value using exponential schedule
+        blend = self._compute_blend_value(step)
         blend_after = int(getattr(self.model.config, "centroid_blend_after_steps", 0))
         allow_blend = (step >= blend_after) and getattr(self.model, "_train_centroid_cache_enabled", False) and (blend > 0.0)
-        # We want centroid predictions:
-        # - if EMA is enabled (allow_blend True) for centroid & spread GT EMA
-        # - or after cold start to apply background-skip logic for spread even when EMA is off
-        need_centroid_preds = allow_blend or getattr(self.model, "_train_centroid_cache_enabled", False)
+        # Centroid predictions are always available since centroid is always rendered
         if self._local_rank == 0:
             with Progress(
                 TextColumn("[progress.description]{task.description}"),
@@ -150,12 +165,12 @@ class FeaturePipeline(VanillaPipeline):
             ) as progress:
                 task = progress.add_task("Caching train centroid/depth", total=len(unique_cams))
                 for ci in unique_cams:
-                    # After cold start, render centroid preds to enable EMA (if enabled) and spread logic; skip feature rendering and OrientAny for cache
-                    images = self._render_full_image_images_for_camera(ci, render_features=False, render_centroid=need_centroid_preds, render_foreground=self.model.config.foreground_enable, render_orientany=False)
+                    # Skip feature rendering and OrientAny for cache (centroid and foreground always rendered)
+                    images = self._render_full_image_images_for_camera(ci, render_features=False, render_orientany=False)
                     if images is not None:
                         # Keep depth cache on CPU to reduce VRAM pressure
                         self._train_depth_cache[ci] = images["depth_raw"].detach().cpu()
-                        c_img, v_img, c_rgb, s_img, s_err_rgb, s_prob_rgb, s_valid = self._compute_centroid_and_spread_gt_for_camera(ci, images, allow_blend=allow_blend)
+                        c_img, v_img, c_rgb, s_img, s_err_rgb, s_prob_rgb, s_valid = self._compute_centroid_and_spread_gt_for_camera(ci, images, allow_blend=allow_blend, blend=blend)
                         self._train_centroid_cache[ci] = c_img.cpu()
                         self._train_centroid_valid[ci] = v_img.cpu()
                         self._train_centroid_spread_cache[ci] = s_img.cpu()
@@ -170,16 +185,13 @@ class FeaturePipeline(VanillaPipeline):
                             rep_spread_prob_rgb = s_prob_rgb
                         if rep_depth is None:
                             rep_depth = images["depth"].cpu()
-                        # # TODO: Do you need this for VRAM management? Aggressive cleanup after each camera
-                        # del images, c_img, v_img, c_rgb, s_img, s_err_rgb, s_prob_rgb, s_valid
-                        # torch.cuda.empty_cache()
                     progress.advance(task)
         else:
             for ci in unique_cams:
-                images = self._render_full_image_images_for_camera(ci, render_features=False, render_centroid=need_centroid_preds, render_foreground=self.model.config.foreground_enable, render_orientany=False)
+                images = self._render_full_image_images_for_camera(ci, render_features=False, render_orientany=False)
                 if images is not None:
                     self._train_depth_cache[ci] = images["depth_raw"].detach().cpu()
-                    c_img, v_img, _, s_img, _, _, s_valid = self._compute_centroid_and_spread_gt_for_camera(ci, images, allow_blend=allow_blend)
+                    c_img, v_img, _, s_img, _, _, s_valid = self._compute_centroid_and_spread_gt_for_camera(ci, images, allow_blend=allow_blend, blend=blend)
                     self._train_centroid_cache[ci] = c_img.cpu()
                     self._train_centroid_valid[ci] = v_img.cpu()
                     self._train_centroid_spread_cache[ci] = s_img.cpu()
@@ -188,9 +200,6 @@ class FeaturePipeline(VanillaPipeline):
                     images["centroid_spread_prob_soft_gt_full"] = torch.cat([1.0 - s_img[..., 1:2], s_img[..., 1:2]], dim=-1)
                     if rep_depth is None:
                         rep_depth = images["depth"].cpu()
-                    # # TODO: Do you need this for VRAM management? Aggressive cleanup after each camera
-                    # del images, c_img, v_img, s_img, s_valid
-                    # torch.cuda.empty_cache()
 
         # Log one representative image to keep overhead minimal (post cold-start only)
         if getattr(self.model, "_train_centroid_cache_enabled", False):
@@ -203,7 +212,7 @@ class FeaturePipeline(VanillaPipeline):
             if rep_spread_prob_rgb is not None:
                 writer.put_image(name="Train Cache Images/centroid_spread_prob", image=rep_spread_prob_rgb, step=step)
 
-    def _render_full_image_images_for_camera(self, camera_index: int, render_features: bool = True, render_centroid: bool = True, render_foreground: bool = True, render_orientany: bool = True) -> Optional[Dict[str, torch.Tensor]]:
+    def _render_full_image_images_for_camera(self, camera_index: int, render_features: bool = True, render_orientany: bool = True) -> Optional[Dict[str, torch.Tensor]]:
         cams = self.datamanager.train_ray_generator.cameras
         # camera_opt_to_camera transform for this camera; broadcasted inside generate_rays
         c_tensor = torch.tensor([camera_index], device=cams.device)
@@ -217,8 +226,6 @@ class FeaturePipeline(VanillaPipeline):
                     outputs = self.model.get_outputs_for_camera_ray_bundle(
                         camera_ray_bundle,
                         render_features=render_features,
-                        render_centroid=render_centroid,
-                        render_foreground=render_foreground,
                         render_orientany=render_orientany,
                     )
                     progress.advance(task)
@@ -226,12 +233,8 @@ class FeaturePipeline(VanillaPipeline):
                 outputs = self.model.get_outputs_for_camera_ray_bundle(
                     camera_ray_bundle,
                     render_features=render_features,
-                    render_centroid=render_centroid,
-                    render_foreground=render_foreground,
                     render_orientany=render_orientany,
                 )
-        if "rgb" not in outputs or "accumulation" not in outputs or "depth" not in outputs:
-            return None
         rgb = outputs["rgb"]
         acc_raw = outputs["accumulation"]
         acc = colormaps.apply_colormap(acc_raw)  # HWC in [0,1]
@@ -242,20 +245,17 @@ class FeaturePipeline(VanillaPipeline):
         images["ray_directions"] = camera_ray_bundle.directions
         if "feature_pca" in outputs:
             images["feature_pca"] = outputs["feature_pca"]
-        # If features were rendered and centroid is available, include it for EMA blending
-        if "centroid" in outputs:
-            images["centroid_pred_full"] = outputs["centroid"]
-        if "centroid_spread" in outputs:
-            images["centroid_spread_pred_full"] = outputs["centroid_spread"]
+        # Always include centroid and spread for EMA blending
+        images["centroid_pred_full"] = outputs["centroid"]
+        images["centroid_spread_pred_full"] = outputs["centroid_spread"]
         # Append foreground viz
-        if "foreground_prob_rgb" in outputs:
-            images["foreground_prob"] = outputs["foreground_prob_rgb"]
+        images["foreground_prob"] = outputs["foreground_prob_rgb"]
         # Append OrientAny viz
         if "orientany_rgb" in outputs:
             images["orientany_rgb"] = outputs["orientany_rgb"]
         return images
 
-    def _compute_centroid_and_spread_gt_for_camera(self, camera_index: int, images: Dict[str, torch.Tensor], is_eval: bool = False, allow_blend: bool = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _compute_centroid_and_spread_gt_for_camera(self, camera_index: int, images: Dict[str, torch.Tensor], is_eval: bool = False, allow_blend: bool = False, blend: float = 0.0) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # Require SAM2 masks (must be present)
         sam2 = self.datamanager.sam2_loader
         # Determine split and global index
@@ -333,11 +333,11 @@ class FeaturePipeline(VanillaPipeline):
             valid_mask &= (acc >= min_acc)
         # Blend with current model prediction to stabilize (EMA)
         # IMPORTANT: Use per-segment mean of current predictions, not per-pixel, for robustness
-        blend = float(getattr(self.model.config, "centroid_gt_blend", 0.5))
+        # Note: blend value is passed from caller (computed using schedule)
         # Blend only after allowed and only if blend > 0
         if allow_blend and blend > 0.0:
-            # Expect centroid prediction to be present in images if we requested features earlier
-            assert "centroid_pred_full" in images, "Centroid prediction missing for EMA blending; expected render_features=True"
+            # Expect centroid prediction to be present in images (always rendered)
+            assert "centroid_pred_full" in images, "Centroid prediction missing for EMA blending"
             pred_full = images["centroid_pred_full"].to(centroid_img)
             # centroid_img = (blend * pred_full + (1.0 - blend) * centroid_img)  # TODO: per-pixel blending (legacy, remove later if new blending working better)
             # Build an image where each pixel in a segment holds that segment's mean predicted centroid
@@ -404,23 +404,22 @@ class FeaturePipeline(VanillaPipeline):
             if self._local_rank == 0:
                 with Progress(TextColumn("[progress.description]{task.description}"), BarColumn(), TimeElapsedColumn(), transient=True) as progress:
                     task = progress.add_task("Rendering train image", total=1)
-                    outputs = self.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle, render_features=True, render_centroid=True, render_foreground=self.model.config.foreground_enable, render_orientany=self.model.config.orientany_enable)
+                    outputs = self.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle, render_features=True, render_orientany=self.model.config.orientany_enable)
                     progress.advance(task)
             else:
-                outputs = self.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle, render_features=True, render_centroid=True, render_foreground=self.model.config.foreground_enable, render_orientany=self.model.config.orientany_enable)
+                outputs = self.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle, render_features=True, render_orientany=self.model.config.orientany_enable)
         # Construct a batch with the full GT image to mirror eval flow
         full_batch = self.datamanager.train_dataset.get_data(ci)
         # Reuse model's image/metrics helper for identical formatting (GT|Pred concat)
         _, images_dict = self.model.get_image_metrics_and_images(outputs, full_batch)
         # Add foreground pred vs GT side-by-side using full-image GT from datamanager
-        if self.model.config.foreground_enable and ("foreground_prob_rgb" in outputs):
-            ci_global = ci  # train split uses train indices directly
-            fg_map = self.datamanager.fg_loader[ci_global]
-            fg_gt_prob = fg_map[..., 1:2]
-            fg_gt_rgb = self.model.prob_from_probs_shader(fg_gt_prob)
+        ci_global = ci  # train split uses train indices directly
+        fg_map = self.datamanager.fg_loader[ci_global]
+        fg_gt_prob = fg_map[..., 1:2]
+        fg_gt_rgb = self.model.prob_from_probs_shader(fg_gt_prob)
 
-            images_dict["foreground_prob_gt"] = fg_gt_rgb
-            images_dict["foreground_prob_vs_gt"] = torch.cat([outputs["foreground_prob_rgb"], fg_gt_rgb], dim=1)
+        images_dict["foreground_prob_gt"] = fg_gt_rgb
+        images_dict["foreground_prob_vs_gt"] = torch.cat([outputs["foreground_prob_rgb"], fg_gt_rgb], dim=1)
 
         # Add OrientAny pred vs GT side-by-side using full-image GT from datamanager
         if self.model.config.orientany_enable and ("orientany_rgb" in outputs):
@@ -472,10 +471,10 @@ class FeaturePipeline(VanillaPipeline):
             if self._local_rank == 0:
                 with Progress(TextColumn("[progress.description]{task.description}"), BarColumn(), TimeElapsedColumn(), transient=True) as progress:
                     task = progress.add_task("Rendering eval image", total=1)
-                    outputs = self.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle, render_features=True, render_centroid=True, render_foreground=self.model.config.foreground_enable, render_orientany=self.model.config.orientany_enable)
+                    outputs = self.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle, render_features=True, render_orientany=self.model.config.orientany_enable)
                     progress.advance(task)
             else:
-                outputs = self.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle, render_features=True, render_centroid=True, render_foreground=self.model.config.foreground_enable, render_orientany=self.model.config.orientany_enable)
+                outputs = self.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle, render_features=True, render_orientany=self.model.config.orientany_enable)
         metrics_dict, images_dict = self.model.get_image_metrics_and_images(outputs, batch)
         # Append centroid GT visualization for eval only after cold-start (no blending in eval)
         if getattr(self.model, "_train_centroid_cache_enabled", False):
@@ -490,14 +489,13 @@ class FeaturePipeline(VanillaPipeline):
             if ("centroid_spread_prob_soft_rgb" in outputs) and (spread_prob_rgb is not None):
                 images_dict["centroid_spread_prob_soft_vs_gt"] = torch.cat([outputs["centroid_spread_prob_soft_rgb"], spread_prob_rgb], dim=1)
         # Add foreground pred vs GT side-by-side if available in eval batch
-        if self.model.config.foreground_enable and ("foreground_prob_rgb" in outputs):
-            ci_global = int(image_idx) + getattr(self.datamanager, "eval_offset", 0)
-            fg_map = self.datamanager.fg_loader[ci_global]
-            fg_gt_prob = fg_map[..., 1:2]
-            fg_gt_rgb = self.model.prob_from_probs_shader(fg_gt_prob)
+        ci_global = int(image_idx) + getattr(self.datamanager, "eval_offset", 0)
+        fg_map = self.datamanager.fg_loader[ci_global]
+        fg_gt_prob = fg_map[..., 1:2]
+        fg_gt_rgb = self.model.prob_from_probs_shader(fg_gt_prob)
 
-            images_dict["foreground_prob_gt"] = fg_gt_rgb
-            images_dict["foreground_prob_vs_gt"] = torch.cat([outputs["foreground_prob_rgb"], fg_gt_rgb], dim=1)
+        images_dict["foreground_prob_gt"] = fg_gt_rgb
+        images_dict["foreground_prob_vs_gt"] = torch.cat([outputs["foreground_prob_rgb"], fg_gt_rgb], dim=1)
 
         # Add OrientAny pred vs GT side-by-side if available in eval batch
         if self.model.config.orientany_enable and ("orientany_rgb" in outputs):
@@ -551,7 +549,7 @@ class FeaturePipeline(VanillaPipeline):
                 height, width = camera_ray_bundle.shape
                 num_rays = height * width
                 with torch.no_grad():
-                    outputs = self.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle, render_features=True, render_centroid=True, render_foreground=self.model.config.foreground_enable, render_orientany=self.model.config.orientany_enable)
+                    outputs = self.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle, render_features=True, render_orientany=self.model.config.orientany_enable)
                 metrics_dict, images_dict = self.model.get_image_metrics_and_images(outputs, batch)
 
                 if output_path is not None:

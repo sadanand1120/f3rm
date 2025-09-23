@@ -62,7 +62,7 @@ def sample_feature_pointcloud(
     pipeline,
     num_points: int,
     bbox_bounds: Tuple[float, float] = (-1.0, 1.0),
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
     """Sample a pointcloud with RGB, features, and consistent PCA features.
 
     Bbox filtering is applied during sampling to prioritize points within the cube
@@ -128,6 +128,7 @@ def sample_feature_pointcloud(
 
     # Process raw additional outputs and apply shaders
     final_additional = {}
+    raw_arrays: Dict[str, torch.Tensor] = {}
     with Progress(TextColumn("[bold blue]{task.description}"), BarColumn(), TextColumn("[progress.percentage]{task.percentage:>3.0f}%"), TimeElapsedColumn(), console=console) as progress:
         process_task = progress.add_task("Processing additional outputs", total=len(raw_additional_outputs))
         for key, tensor_list in raw_additional_outputs.items():
@@ -145,20 +146,31 @@ def sample_feature_pointcloud(
                     min_v = contracted.amin(dim=0, keepdim=True)
                     max_v = contracted.amax(dim=0, keepdim=True)
                     final_additional["centroid_pred_rgb"] = pipeline.model.centroid_shader(raw_tensor, global_min=min_v, global_max=max_v)
+                    # Save raw centroids (Nx3)
+                    raw_arrays["centroids"] = raw_tensor.detach().cpu().numpy().astype(np.float32)
                 elif key == "centroid_spread":
-                    # Apply spread shaders (exactly as in model.py lines 493-494)
+                    # Apply spread shaders (exactly as in model.py lines 616-630)
                     final_additional["centroid_spread_error_rgb"] = pipeline.model.spread_shader(raw_tensor[..., :1])
                     final_additional["centroid_spread_prob_rgb"] = pipeline.model.prob_shader(raw_tensor[..., 1:2])
+                    # Add softmax probability for class-1 using soft logits (channels 2-3)
+                    soft_logits = raw_tensor[..., 2:4]
+                    soft_probs = torch.softmax(soft_logits, dim=-1)[..., 1:2]
+                    final_additional["centroid_spread_prob_soft_rgb"] = pipeline.model.prob_from_probs_shader(soft_probs)
+                    # Save raw soft foreground prob (Nx1)
+                    raw_arrays["fg_soft"] = soft_probs.detach().cpu().numpy().astype(np.float32)
+                    # Save raw centroid error (channel 0)
+                    centroid_error = raw_tensor[..., :1]
+                    raw_arrays["centroid_error"] = centroid_error.detach().cpu().numpy().astype(np.float32)
                 elif key == "foreground_logits":
                     # Convert logits → probs for class-1, then apply shader (matches model full-image viz)
                     probs = torch.softmax(raw_tensor / 1.0, dim=-1)[..., 1:2]  # 1.0 is softmax temp
                     final_additional["foreground_prob_rgb"] = pipeline.model.prob_from_probs_shader(probs)
             progress.advance(process_task)
 
-    return results["points"], results["rgbs"], results["features"], feature_pca, pca_proj, pca_min, pca_max, final_additional
+    return results["points"], results["rgbs"], results["features"], feature_pca, pca_proj, pca_min, pca_max, final_additional, raw_arrays
 
 
-def save_pointcloud_data(output_dir: Path, points: torch.Tensor, rgbs: torch.Tensor, features: torch.Tensor, feature_pca: torch.Tensor, pca_proj: torch.Tensor, pca_min: torch.Tensor, pca_max: torch.Tensor, additional_outputs: Dict[str, torch.Tensor], compress_features: bool = True) -> None:
+def save_pointcloud_data(output_dir: Path, points: torch.Tensor, rgbs: torch.Tensor, features: torch.Tensor, feature_pca: torch.Tensor, pca_proj: torch.Tensor, pca_min: torch.Tensor, pca_max: torch.Tensor, additional_outputs: Dict[str, torch.Tensor], compress_features: bool = True, raw_arrays: Optional[Dict[str, torch.Tensor]] = None) -> None:
     """Save pointcloud data in multiple formats with data type optimization."""
     output_dir.mkdir(parents=True, exist_ok=True)
     data_np = {
@@ -188,6 +200,8 @@ def save_pointcloud_data(output_dir: Path, points: torch.Tensor, rgbs: torch.Ten
 
     np.save(output_dir / "points.npy", data_np["points"])
     console.print(f"[green]✓ Saved points: {output_dir}/points.npy")
+    np.save(output_dir / "rgbs.npy", data_np["rgbs"])
+    console.print(f"[green]✓ Saved rgbs: {output_dir}/rgbs.npy")
 
     features_file = "features_float16.npy" if compress_features else "features_float32.npy"
     features_data = data_np["features"].astype(np.float16 if compress_features else np.float32)
@@ -209,6 +223,20 @@ def save_pointcloud_data(output_dir: Path, points: torch.Tensor, rgbs: torch.Ten
         pickle.dump(pca_data, f)
     console.print(f"[green]✓ Saved PCA parameters: {output_dir}/pca_params.pkl")
 
+    # Save raw arrays if provided
+    additional_raw_files: Dict[str, str] = {}
+    if raw_arrays:
+        for key, tensor in raw_arrays.items():
+            if isinstance(tensor, torch.Tensor):
+                arr = tensor.cpu().numpy().astype(np.float32)
+            else:
+                # Already a numpy array
+                arr = tensor.astype(np.float32)
+            fname = f"{key}.npy"
+            np.save(output_dir / fname, arr)
+            console.print(f"[green]✓ Saved raw array: {output_dir}/{fname}")
+            additional_raw_files[key] = fname
+
     metadata = {
         'num_points': len(points),
         'feature_dim': features.shape[-1],
@@ -221,10 +249,12 @@ def save_pointcloud_data(output_dir: Path, points: torch.Tensor, rgbs: torch.Ten
             'pca_pointcloud': 'pointcloud_feature_pca.ply',
             'features': features_file,
             'points': 'points.npy',
+            'rgbs': 'rgbs.npy',
             'pca_params': 'pca_params.pkl',
             **additional_files
         },
-        'additional_outputs': list(additional_outputs.keys())
+        'additional_outputs': list(additional_outputs.keys()),
+        'raw_arrays': additional_raw_files
     }
     with open(output_dir / "metadata.json", 'w') as f:
         json.dump(metadata, f, indent=2)
@@ -249,10 +279,10 @@ def export_feature_pointcloud(config_path: Path, output_dir: Path, num_points: i
     config, pipeline, checkpoint_path, step = eval_setup(config_path=config_path, test_mode="test")
     console.print(f"[bold green]Loaded checkpoint from step {step}")
     pipeline.eval()
-    points, rgbs, features, feature_pca, pca_proj, pca_min, pca_max, additional_outputs = sample_feature_pointcloud(
+    points, rgbs, features, feature_pca, pca_proj, pca_min, pca_max, additional_outputs, raw_arrays = sample_feature_pointcloud(
         pipeline, num_points, bbox_bounds=(-1.0, 1.0)
     )
-    save_pointcloud_data(output_dir, points, rgbs, features, feature_pca, pca_proj, pca_min, pca_max, additional_outputs, compress_features=compress_features)
+    save_pointcloud_data(output_dir, points, rgbs, features, feature_pca, pca_proj, pca_min, pca_max, additional_outputs, compress_features=compress_features, raw_arrays=raw_arrays)
     console.print(f"[bold green]✓ Export completed successfully!")
 
 

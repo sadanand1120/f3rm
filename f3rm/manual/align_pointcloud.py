@@ -200,6 +200,21 @@ class InteractiveAlignmentTool:
         np.save(data_dir / "points.npy", points_transformed.astype(np.float32))
         console.print("[green]✓ Updated points array")
 
+        # Transform raw arrays if present (centroids only; fg_soft unchanged)
+        metadata_path = data_dir / "metadata.json"
+        with open(metadata_path, 'r') as f:
+            metadata = json.load(f)
+        raw_arrays = metadata.get('raw_arrays', {})
+        if 'centroids' in raw_arrays:
+            cent_path = data_dir / raw_arrays['centroids']
+            if cent_path.exists():
+                centroids = np.load(cent_path)
+                cent_homo = np.hstack([centroids, np.ones((len(centroids), 1))])
+                centroids_t = (self.transform @ cent_homo.T).T[:, :3]
+                np.save(cent_path, centroids_t.astype(np.float32))
+                console.print("[green]✓ Updated centroids.npy")
+        # rgbs.npy does not require transform
+
         features_file = self.data.metadata['files']['features']
         features = np.load(data_dir / features_file)
         np.save(data_dir / features_file, features)
@@ -426,6 +441,31 @@ class InteractiveFilterTool:
         filtered_points = points[within_bounds]
         np.save(data_dir / "points.npy", filtered_points.astype(np.float32))
         console.print("[green]✓ Updated points array")
+
+        # Filter rgbs.npy if present
+        with open(data_dir / "metadata.json", 'r') as f:
+            metadata = json.load(f)
+        files_map = metadata.get('files', {})
+        rgbs_key = files_map.get('rgbs', None)
+        if rgbs_key is not None and (data_dir / rgbs_key).exists():
+            rgbs = np.load(data_dir / rgbs_key)
+            np.save(data_dir / rgbs_key, rgbs[within_bounds].astype(np.float32))
+            console.print("[green]✓ Updated rgbs array")
+
+        # Filter raw arrays if present
+        raw_arrays = metadata.get('raw_arrays', {})
+        if 'centroids' in raw_arrays:
+            cent_path = data_dir / raw_arrays['centroids']
+            if cent_path.exists():
+                centroids = np.load(cent_path)
+                np.save(cent_path, centroids[within_bounds].astype(np.float32))
+                console.print("[green]✓ Updated centroids.npy")
+        if 'fg_soft' in raw_arrays:
+            fg_path = data_dir / raw_arrays['fg_soft']
+            if fg_path.exists():
+                fg_soft = np.load(fg_path)
+                np.save(fg_path, fg_soft[within_bounds].astype(np.float32))
+                console.print("[green]✓ Updated fg_soft.npy")
 
         features_file = self.data.metadata['files']['features']
         features = np.load(data_dir / features_file)

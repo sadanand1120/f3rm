@@ -364,7 +364,8 @@ def visualize_additional(
     semantic_threshold: float = 0.502,
     semantic_softmax_temp: float = 1.0,
     semantic_negatives: Optional[List[str]] = None,
-    foreground_prob_thresh: Optional[float] = None
+    foreground_prob_thresh: Optional[float] = None,
+    centroid_error_thresh: Optional[float] = None
 ):
     """Visualize additional pointcloud with optional filtering."""
     pcd = data.get_additional_pointcloud(output_name)
@@ -397,6 +398,22 @@ def visualize_additional(
         else:
             console.print(f"[yellow]Warning: foreground_prob_rgb not found, skipping foreground threshold filtering")
 
+    # Apply centroid error threshold if requested
+    if centroid_error_thresh is not None:
+        # centroid error saved in raw_arrays as centroid_error.npy
+        metadata_path = data.data_dir / "metadata.json"
+        with open(metadata_path, 'r') as f:
+            md = json.load(f)
+        raw_map = md.get('raw_arrays', {})
+        ce_key = raw_map.get('centroid_error', None)
+        if ce_key is not None and (data.data_dir / ce_key).exists():
+            centroid_error = np.load(data.data_dir / ce_key).reshape(-1)
+            # Show high-error points as white; keep others as their original/semantic colors
+            high_err_mask = centroid_error > centroid_error_thresh
+            colors[high_err_mask] = [1.0, 0.0, 0.0]
+        else:
+            console.print(f"[yellow]Warning: centroid_error not found, skipping centroid error filtering")
+
     filtered_pcd = o3d.geometry.PointCloud()
     filtered_pcd.points = o3d.utility.Vector3dVector(points)
     filtered_pcd.colors = o3d.utility.Vector3dVector(colors)
@@ -415,6 +432,96 @@ def visualize_additional(
     o3d.visualization.draw_geometries(
         all_geometries,
         window_name=f"F3RM {output_name.replace('_', ' ').title()} Pointcloud",
+        width=1200,
+        height=800,
+        left=50,
+        top=50
+    )
+
+
+def visualize_centroidrgb(
+    data: FeaturePointcloudData,
+    show_guides: bool = True,
+    bbox_filter_min: Optional[List[float]] = None,
+    bbox_filter_max: Optional[List[float]] = None,
+    semantic_filter_query: Optional[str] = None,
+    semantic_filter_mode: Optional[str] = None,
+    semantic_threshold: float = 0.502,
+    semantic_softmax_temp: float = 1.0,
+    semantic_negatives: Optional[List[str]] = None,
+    foreground_prob_thresh: Optional[float] = None,
+    background_alpha: float = 0.3
+):
+    """Visualize centroid prediction pointcloud with RGB colors from original points."""
+    # Load raw centroid predictions
+    metadata_path = data.data_dir / "metadata.json"
+    with open(metadata_path, 'r') as f:
+        md = json.load(f)
+    raw_map = md.get('raw_arrays', {})
+    centroids_key = raw_map.get('centroids', None)
+    if centroids_key is None or not (data.data_dir / centroids_key).exists():
+        console.print(f"[bold red]Error: raw centroids not available")
+        return
+
+    # Load centroid points and original RGB data
+    centroid_points = np.load(data.data_dir / centroids_key)  # Nx3 centroid locations
+    rgb_pcd = data.rgb_pointcloud
+    original_points = np.asarray(rgb_pcd.points)  # Nx3 original points
+    original_colors = np.asarray(rgb_pcd.colors)  # Nx3 RGB colors
+
+    # Ensure same number of points
+    if len(centroid_points) != len(original_colors) != len(original_points):
+        console.print(f"[bold red]Error: Mismatch between arrays - centroids: {len(centroid_points)}, original points: {len(original_points)}, colors: {len(original_colors)}")
+        return
+
+    # Apply foreground probability filter first
+    if foreground_prob_thresh is not None:
+        fg_probs_key = raw_map.get('fg_soft', None)
+        if fg_probs_key is not None and (data.data_dir / fg_probs_key).exists():
+            fg_probs = np.load(data.data_dir / fg_probs_key).reshape(-1)
+            fg_mask = fg_probs >= foreground_prob_thresh
+            centroid_points = centroid_points[fg_mask]
+            original_points = original_points[fg_mask]
+            original_colors = original_colors[fg_mask]
+            console.print(f"[green]Foreground filter: kept {len(centroid_points):,} points (threshold: {foreground_prob_thresh})")
+        else:
+            console.print(f"[yellow]Warning: fg_soft not found, skipping foreground filtering")
+
+    # Apply other filters if requested (using original points for filtering)
+    filtered_orig_points, filtered_orig_colors = apply_filters(
+        data, original_points, original_colors, bbox_filter_min, bbox_filter_max,
+        semantic_filter_query, semantic_filter_mode, semantic_threshold,
+        semantic_softmax_temp, semantic_negatives
+    )
+
+    # Apply same filtering to centroid points (they should have same indices)
+    filtered_centroid_points = centroid_points[:len(filtered_orig_points)]
+    filtered_centroid_colors = original_colors[:len(filtered_orig_points)]
+
+    # Create RGB background pointcloud with transparency
+    rgb_pcd = o3d.geometry.PointCloud()
+    rgb_pcd.points = o3d.utility.Vector3dVector(filtered_orig_points)
+    rgb_pcd.colors = o3d.utility.Vector3dVector(filtered_orig_colors * background_alpha)
+
+    # Create centroid pointcloud with red colors
+    centroid_pcd = o3d.geometry.PointCloud()
+    centroid_pcd.points = o3d.utility.Vector3dVector(filtered_centroid_points)
+    centroid_pcd.colors = o3d.utility.Vector3dVector(np.tile([1.0, 0.0, 0.0], (len(filtered_centroid_points), 1)))
+
+    # Start with both pointclouds
+    all_geometries = [rgb_pcd, centroid_pcd]
+
+    # Add reference geometries if requested
+    if show_guides:
+        filter_bbox_min = np.array(bbox_filter_min) if bbox_filter_min is not None else None
+        filter_bbox_max = np.array(bbox_filter_max) if bbox_filter_max is not None else None
+        reference_geoms = create_reference_geometries(data, filter_bbox_min, filter_bbox_max)
+        all_geometries.extend(reference_geoms)
+
+    # Simple visualization
+    o3d.visualization.draw_geometries(
+        all_geometries,
+        window_name="F3RM Centroid RGB Pointcloud",
         width=1200,
         height=800,
         left=50,
@@ -539,7 +646,7 @@ def main():
     except Exception:
         data = None
     additional = data.metadata.get('additional_outputs', []) if data else []
-    available_modes = ["rgb", "pca", "semantic", "LISTALL"] + additional
+    available_modes = ["rgb", "pca", "semantic", "centroidrgb", "LISTALL"] + additional
 
     parser.add_argument("--mode", choices=available_modes, default="rgb", help="Visualization mode")
     parser.add_argument("--query", type=str, default=None, help="Semantic query")
@@ -574,6 +681,8 @@ def main():
     # Foreground probability threshold argument
     parser.add_argument("--foreground-prob-thresh", type=float, default=None,
                         help="Additional mode: threshold for foreground probability filtering (points below threshold become black)")
+    parser.add_argument("--centroid-error-thresh", type=float, default=None,
+                        help="Additional mode: threshold for centroid prediction error (only show points with error < thresh; others black)")
 
     args = parser.parse_args()
 
@@ -591,9 +700,9 @@ def main():
     # Show available outputs if requested
     if args.mode == "LISTALL":
         console.print(f"[bold blue]Available visualization modes:")
-        console.print(f"  [green]Core modes: rgb, pca, semantic")
+        console.print(f"  [green]Core modes: rgb, pca, semantic, centroidrgb")
         console.print(f"  [cyan]Additional outputs: {data.metadata.get('additional_outputs', [])}")
-        console.print(f"  [yellow]Total available: {len(['rgb', 'pca', 'semantic'] + data.metadata.get('additional_outputs', []))} modes")
+        console.print(f"  [yellow]Total available: {len(['rgb', 'pca', 'semantic', 'centroidrgb'] + data.metadata.get('additional_outputs', []))} modes")
         return
 
     # Visualize based on mode
@@ -621,6 +730,20 @@ def main():
             args.softmax_temp,
             args.semantic_negatives
         )
+    elif args.mode == "centroidrgb":
+        visualize_centroidrgb(
+            data,
+            show_guides,
+            args.bbox_filter_min,
+            args.bbox_filter_max,
+            args.semantic_filter_query,
+            args.semantic_filter_mode,
+            args.threshold,
+            args.softmax_temp,
+            args.semantic_negatives,
+            args.foreground_prob_thresh,
+            args.background_alpha
+        )
     elif args.mode in data.metadata.get('additional_outputs', []):
         visualize_additional(
             data,
@@ -633,7 +756,8 @@ def main():
             args.threshold,
             args.softmax_temp,
             args.semantic_negatives,
-            args.foreground_prob_thresh
+            args.foreground_prob_thresh,
+            args.centroid_error_thresh
         )
     elif args.mode == "semantic":
         # Allow using --query or fallback to --semantic-filter-query for semantic mode
@@ -660,7 +784,7 @@ def main():
         )
     else:
         console.print(f"[bold red]Error: Visualization mode '{args.mode}' not available")
-        console.print(f"[yellow]Available modes: rgb, pca, semantic, {', '.join(data.metadata.get('additional_outputs', []))}")
+        console.print(f"[yellow]Available modes: rgb, pca, semantic, centroidrgb, {', '.join(data.metadata.get('additional_outputs', []))}")
         console.print(f"[cyan]Use --mode LISTALL to see all available modes")
 
 

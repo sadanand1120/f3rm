@@ -23,14 +23,10 @@ f3rm_method = MethodSpecification(
         steps_per_eval_batch=500,
         steps_per_eval_image=100000,   # HACK TODO: for rapid testing, since its too slow
         steps_per_eval_all_images=100000,  # HACK TODO: for rapid testing, since its too slow
+        save_only_latest_checkpoint=True,
         steps_per_save=5000,
         max_num_iterations=30000,
         mixed_precision=True,
-        enable_comprehensive_seeding=False,   # TODO: fix normals training issues
-        seed_deterministic_algorithms=False,
-        seed_warn_only=True,  # Set to True if you encounter issues with deterministic algorithms
-        seed_cublas_workspace=True,
-        print_seed_info=True,
         pipeline=FeaturePipelineConfig(
             datamanager=FeatureDataManagerConfig(
                 feature_type="CLIP",
@@ -42,40 +38,32 @@ f3rm_method = MethodSpecification(
                 dataparser=NerfstudioDataParserConfig(train_split_fraction=0.95),
                 train_num_rays_per_batch=1 << 13,
                 train_num_images_to_sample_from=64,
-                train_num_times_to_repeat_images=2048,
+                train_num_times_to_repeat_images=512,
                 eval_num_rays_per_batch=1 << 12,
                 eval_num_images_to_sample_from=64,
-                eval_num_times_to_repeat_images=2048,
+                eval_num_times_to_repeat_images=512,
                 camera_optimizer=CameraOptimizerConfig(
-                    mode="SO3xR3",
-                    optimizer=AdamOptimizerConfig(lr=6e-4, eps=1e-8, weight_decay=0.0, max_norm=1.0),
-                    scheduler=ExponentialDecaySchedulerConfig(lr_final=6e-5, warmup_steps=3000, max_steps=30000),
+                    mode="SO3xR3",    # "SO3xR3" or "off"
+                    optimizer=AdamOptimizerConfig(lr=1e-4, eps=1e-8, weight_decay=0.0, max_norm=0.5),
+                    scheduler=ExponentialDecaySchedulerConfig(lr_final=1e-5, warmup_steps=3000, max_steps=15000),
                 ),
             ),
             model=FeatureFieldModelConfig(
                 eval_num_rays_per_chunk=1 << 14,
                 predict_normals=True,
-                feat_condition_on_density=False,  # degraded performance
-                feat_condition_density_grad_to_nerf=False,   # degraded performance
                 num_proposal_iterations=2,  # May reduce proposal iterations for speed
-                centroid_enable=True,
                 centroid_loss_weight=1e-3,
-                centroid_condition_on_density=False,
-                centroid_condition_density_grad_to_nerf=False,
                 centroid_hidden_dim=64,
                 centroid_num_layers=2,
-                centroid_gt_blend=0.5,
-                centroid_blend_after_steps=10000,
-                foreground_enable=True,
-                foreground_condition_on_density=False,
-                foreground_condition_density_grad_to_nerf=False,
-                enable_campose_refine_feature_field=False,
+                centroid_min_accum=0.0,   # TODO: maybe make it 0.3 for more better filtering
+                centroid_blend_after_steps=17000,
+                centroid_blend_until_steps=34000,
+                centroid_blend_start_value=0.0,
+                centroid_blend_end_value=1.0,
                 foreground_loss_weight=1e-3,
                 foreground_hidden_dim=64,
                 foreground_num_layers=2,
                 orientany_enable=True,
-                orientany_condition_on_density=False,
-                orientany_condition_density_grad_to_nerf=False,
                 orientany_loss_weight=1e-4,
                 orientany_hidden_dim=64,
                 orientany_num_layers=2,
