@@ -361,56 +361,67 @@ class FeatureFieldModel(NerfactoModel):
         loss_dict["foreground_loss"] = self.config.foreground_loss_weight * ce
 
         # OrientAny classification loss (4 separate losses: azimuth, polar, roll, foreground)
-        if self.config.orientany_enable and ("orientany_logits" in outputs) and ("orientany" in batch):
+        if self.config.orientany_enable and ("orientany_logits" in outputs):
             orientany_logits = outputs["orientany_logits"].view(-1, 902).to(self.device)  # (N, 902) - ensure on correct device
-            orientany_target = batch["orientany"].to(self.device, non_blocking=True)  # (N, 8) - compact GT
 
-            # Split logits into components
-            gaus_ax_logits = orientany_logits[:, 0:360]      # azimuth logits
-            gaus_pl_logits = orientany_logits[:, 360:540]    # polar logits
-            gaus_ro_logits = orientany_logits[:, 540:900]    # roll logits
-            orientany_fg_logits = orientany_logits[:, 900:902]  # OrientAny foreground logits
+            # Use cached OrientAny GT if available, otherwise fall back to batch GT
+            if self.training and getattr(self, "_train_centroid_cache_enabled", False):
+                # Use OrientAny cache
+                orientany_target = self._get_orientany_target_from_cache(batch)
+            elif "orientany" in batch:
+                # Fallback to direct batch GT
+                orientany_target = batch["orientany"].to(self.device, non_blocking=True)  # (N, 8) - compact GT
+            else:
+                # No OrientAny supervision available
+                orientany_target = None
 
-            # Extract GT parameters
-            orientany_fg_target = orientany_target[:, 6:8]  # OrientAny foreground one-hot
-            orientany_fg_mask = orientany_fg_target[:, 1] > 0.5  # GT foreground pixels
+            if orientany_target is not None:
+                # Split logits into components
+                gaus_ax_logits = orientany_logits[:, 0:360]      # azimuth logits
+                gaus_pl_logits = orientany_logits[:, 360:540]    # polar logits
+                gaus_ro_logits = orientany_logits[:, 540:900]    # roll logits
+                orientany_fg_logits = orientany_logits[:, 900:902]  # OrientAny foreground logits
 
-            # OrientAny foreground loss: supervise all pixels (use CE for stability)
-            orientany_fg_target_idx = orientany_fg_target.argmax(dim=-1)
-            orientany_fg_loss = F.cross_entropy(orientany_fg_logits, orientany_fg_target_idx)
-            loss_dict["orientany_foreground_loss"] = self.config.orientany_loss_weight * orientany_fg_loss
+                # Extract GT parameters
+                orientany_fg_target = orientany_target[:, 6:8]  # OrientAny foreground one-hot
+                orientany_fg_mask = orientany_fg_target[:, 1] > 0.5  # GT foreground pixels
 
-            # Orientation losses: only for GT foreground pixels, no supervision for background
-            if orientany_fg_mask.any():
-                # Foreground pixels only
-                fg_indices = orientany_fg_mask.nonzero(as_tuple=True)[0]
-                # Convert GT means to discrete class indices
-                ax_idx = torch.clamp(torch.round(orientany_target[fg_indices, 0]), 0, 359).long()
-                pl_idx = torch.clamp(torch.round(orientany_target[fg_indices, 2]), 0, 179).long()
-                ro_idx = torch.clamp(torch.round(orientany_target[fg_indices, 4]), 0, 359).long()
+                # OrientAny foreground loss: supervise all pixels (use CE for stability)
+                orientany_fg_target_idx = orientany_fg_target.argmax(dim=-1)
+                orientany_fg_loss = F.cross_entropy(orientany_fg_logits, orientany_fg_target_idx)
+                loss_dict["orientany_foreground_loss"] = self.config.orientany_loss_weight * orientany_fg_loss
 
-                # Variance-aware weighting: higher variance => lower weight (stable 1/(1+var) scheme)
-                eps = 1e-6
-                var_ax = torch.nan_to_num(torch.clamp(orientany_target[fg_indices, 1], min=0.0), nan=0.0, posinf=1e6, neginf=0.0)
-                var_pl = torch.nan_to_num(torch.clamp(orientany_target[fg_indices, 3], min=0.0), nan=0.0, posinf=1e6, neginf=0.0)
-                var_ro = torch.nan_to_num(torch.clamp(orientany_target[fg_indices, 5], min=0.0), nan=0.0, posinf=1e6, neginf=0.0)
-                w_ax = torch.clamp(1.0 / (1.0 + var_ax + eps), 0.05, 1.0)
-                w_pl = torch.clamp(1.0 / (1.0 + var_pl + eps), 0.05, 1.0)
-                w_ro = torch.clamp(1.0 / (1.0 + var_ro + eps), 0.05, 1.0)
+                # Orientation losses: only for GT foreground pixels, no supervision for background
+                if orientany_fg_mask.any():
+                    # Foreground pixels only
+                    fg_indices = orientany_fg_mask.nonzero(as_tuple=True)[0]
+                    # Convert GT means to discrete class indices
+                    ax_idx = torch.clamp(torch.round(orientany_target[fg_indices, 0]), 0, 359).long()
+                    pl_idx = torch.clamp(torch.round(orientany_target[fg_indices, 2]), 0, 179).long()
+                    ro_idx = torch.clamp(torch.round(orientany_target[fg_indices, 4]), 0, 359).long()
 
-                # Cross-entropy with per-sample weights
-                ce_ax_all = F.cross_entropy(gaus_ax_logits[fg_indices], ax_idx, reduction="none")
-                ce_pl_all = F.cross_entropy(gaus_pl_logits[fg_indices], pl_idx, reduction="none")
-                ce_ro_all = F.cross_entropy(gaus_ro_logits[fg_indices], ro_idx, reduction="none")
-                ce_ax = (ce_ax_all * w_ax).mean()
-                ce_pl = (ce_pl_all * w_pl).mean()
-                ce_ro = (ce_ro_all * w_ro).mean()
+                    # Variance-aware weighting: higher variance => lower weight (stable 1/(1+var) scheme)
+                    eps = 1e-6
+                    var_ax = torch.nan_to_num(torch.clamp(orientany_target[fg_indices, 1], min=0.0), nan=0.0, posinf=1e6, neginf=0.0)
+                    var_pl = torch.nan_to_num(torch.clamp(orientany_target[fg_indices, 3], min=0.0), nan=0.0, posinf=1e6, neginf=0.0)
+                    var_ro = torch.nan_to_num(torch.clamp(orientany_target[fg_indices, 5], min=0.0), nan=0.0, posinf=1e6, neginf=0.0)
+                    w_ax = torch.clamp(1.0 / (1.0 + var_ax + eps), 0.05, 1.0)
+                    w_pl = torch.clamp(1.0 / (1.0 + var_pl + eps), 0.05, 1.0)
+                    w_ro = torch.clamp(1.0 / (1.0 + var_ro + eps), 0.05, 1.0)
 
-                # Store separate losses (don't add them)
-                loss_dict["orientany_azimuth_loss"] = self.config.orientany_loss_weight * ce_ax
-                loss_dict["orientany_polar_loss"] = self.config.orientany_loss_weight * ce_pl
-                loss_dict["orientany_roll_loss"] = self.config.orientany_loss_weight * ce_ro
-            # No else clause - background pixels get no supervision at all
+                    # Cross-entropy with per-sample weights
+                    ce_ax_all = F.cross_entropy(gaus_ax_logits[fg_indices], ax_idx, reduction="none")
+                    ce_pl_all = F.cross_entropy(gaus_pl_logits[fg_indices], pl_idx, reduction="none")
+                    ce_ro_all = F.cross_entropy(gaus_ro_logits[fg_indices], ro_idx, reduction="none")
+                    ce_ax = (ce_ax_all * w_ax).mean()
+                    ce_pl = (ce_pl_all * w_pl).mean()
+                    ce_ro = (ce_ro_all * w_ro).mean()
+
+                    # Store separate losses (don't add them)
+                    loss_dict["orientany_azimuth_loss"] = self.config.orientany_loss_weight * ce_ax
+                    loss_dict["orientany_polar_loss"] = self.config.orientany_loss_weight * ce_pl
+                    loss_dict["orientany_roll_loss"] = self.config.orientany_loss_weight * ce_ro
+                # No else clause - background pixels get no supervision at all
         # Centroid loss (supervision via cache).
         if self.training and getattr(self, "_train_centroid_cache_enabled", False):
             full_cache = self._get_train_centroid_cache()  # type: ignore[attr-defined]
@@ -496,6 +507,41 @@ class FeatureFieldModel(NerfactoModel):
             # Cold start: do not supervise spread (consistent with centroid)
             pass
         return loss_dict
+
+    def _get_orientany_target_from_cache(self, batch: Dict) -> torch.Tensor:
+        """Get OrientAny target from cache, similar to centroid cache logic."""
+        full_cache = self._get_train_orientany_cache()  # type: ignore[attr-defined]
+        ray_indices = batch["indices"].to(self.device)
+        cam_idx = ray_indices[:, 0].long()
+        yi = ray_indices[:, 1].long()
+        xi = ray_indices[:, 2].long()
+
+        # Strict: all cameras in batch must be present in cache
+        unique_cams = torch.unique(cam_idx).tolist()
+        for ci in unique_cams:
+            assert int(ci) in full_cache, f"OrientAny cache missing camera {int(ci)}"
+
+        # Assemble GT on CPU per camera, then move picks to GPU (avoids moving full images to GPU)
+        num_rays = cam_idx.shape[0]
+        gt_orientany = torch.zeros((num_rays, 8), device=self.device, dtype=torch.float32)
+
+        with torch.no_grad():
+            for ci in unique_cams:
+                ci_int = int(ci)
+                sel = (cam_idx == ci)
+                idxs = torch.nonzero(sel, as_tuple=True)[0]
+                if idxs.numel() == 0:
+                    continue
+                y_sel = yi[idxs].cpu().long()
+                x_sel = xi[idxs].cpu().long()
+                o_img_cpu, o_valid_cpu = full_cache[ci_int]
+                # o_img_cpu: HxWx8 (CPU), o_valid_cpu: HxWx1 bool (CPU)
+                o_pick = o_img_cpu[y_sel, x_sel]  # Nx8 (CPU)
+                # Ensure dtype consistency - convert to float32 if needed
+                o_pick_float32 = o_pick.float()
+                gt_orientany[idxs] = o_pick_float32.to(self.device, non_blocking=True)
+
+        return gt_orientany
 
     def get_outputs_for_camera_ray_bundle(self, camera_ray_bundle: RayBundle, render_features: bool = True, render_orientany: bool = True) -> Dict[str, torch.Tensor]:
         """Full-image render with optional feature computation.
