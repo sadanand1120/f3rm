@@ -2,7 +2,9 @@ import gc
 import asyncio
 import glob
 import math
+import os
 import shutil
+import cv2
 from pathlib import Path
 from typing import List, Optional
 
@@ -28,6 +30,7 @@ class SAM2Args:
     model_cfg: str = "/robodata/smodak/repos/sam2/sam2/configs/sam2.1/sam2.1_hiera_l.yaml"
     checkpoint_path: str = "/robodata/smodak/repos/sam2/checkpoints/sam2.1_hiera_large.pt"
     batch_size_per_gpu: int = 4
+    use_object_masks: bool = True
 
     @classmethod
     def id_dict(cls):
@@ -42,10 +45,59 @@ class SAM2Args:
             "load_size": cls.load_size,
             "model_cfg": cls.model_cfg,
             "checkpoint_path": cls.checkpoint_path,
+            "use_object_masks": cls.use_object_masks,
         }
 
 
-async def process_single_image_async(image_path: str, sam2: AsyncMultiWrapper) -> List[dict]:
+def load_object_mask(image_path: str, data_dir: Path) -> Optional[np.ndarray]:
+    """Load object mask from object_masks directory corresponding to the image."""
+    image_name = Path(image_path).name
+    mask_path = data_dir / "object_masks" / image_name
+
+    if not mask_path.exists():
+        return None
+
+    mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+    if mask is None:
+        return None
+
+    # Convert to boolean mask (255 -> True, 0 -> False)
+    return mask > 0
+
+
+def object_mask_to_auto_masks(object_mask: np.ndarray) -> List[dict]:
+    """Convert object mask to SAM2-style auto masks format."""
+    if object_mask is None or not np.any(object_mask):
+        return []
+
+    # Create a single auto mask from the object mask
+    h, w = object_mask.shape
+    ys, xs = np.where(object_mask)
+
+    if len(ys) == 0:
+        return []
+
+    y_min, y_max = ys.min(), ys.max()
+    x_min, x_max = xs.min(), xs.max()
+    bbox = [int(x_min), int(y_min), int(x_max - x_min + 1), int(y_max - y_min + 1)]
+
+    return [{
+        "segmentation": object_mask,
+        "bbox": bbox,
+        "predicted_iou": np.float16(1.0),  # Perfect IoU for ground truth
+        "area": np.float16(np.sum(object_mask)),  # Actual area
+    }]
+
+
+async def process_single_image_async(image_path: str, sam2: AsyncMultiWrapper, data_dir: Optional[Path] = None) -> List[dict]:
+    if SAM2Args.use_object_masks and data_dir is not None:
+        # Use object masks instead of SAM2 processing
+        object_mask = load_object_mask(image_path, data_dir)
+        assert object_mask is not None, f"Object mask not found for image: {image_path}"
+        auto_masks = object_mask_to_auto_masks(object_mask)
+        return auto_masks
+
+    # Original SAM2 processing
     pil_img = Image.open(image_path).convert("RGB")
     original_width, original_height = pil_img.width, pil_img.height
     downscaled_img = SAM2utils.prevent_oom_resizing(pil_img, target=SAM2Args.load_size)
@@ -71,56 +123,65 @@ async def process_single_image_async(image_path: str, sam2: AsyncMultiWrapper) -
 
 
 class SAM2Extractor:
-    def __init__(self, device: torch.device, verbose: bool = False) -> None:
+    def __init__(self, device: torch.device, data_dir: Optional[Path] = None, verbose: bool = False) -> None:
+        self.data_dir = data_dir
         devices_param, num_workers = resolve_devices_and_workers(device, SAM2Args.batch_size_per_gpu)
         if verbose:
             print("Initializing SAM2 client")
         self.client = AsyncMultiWrapper(SAM2FeaturesUnified, num_objects=num_workers, devices=devices_param)
         self.num_workers = num_workers
-        # Sequential warm-up to avoid TorchScript race in torchvision Resize when constructing generators in parallel
-        if verbose:
-            print("Warming up SAM2 workers...")
-        tiny = Image.new("RGB", (8, 8), color=0)
-        for _ in range(self.num_workers):
-            _ = self.client.auto_mask(
-                image=tiny,
-                model_cfg=SAM2Args.model_cfg,
-                checkpoint_path=SAM2Args.checkpoint_path,
-                preset=SAM2Args.preset,
-                points_per_side=4,
-                points_per_batch=8,
-                pred_iou_thresh=SAM2Args.pred_iou_thresh,
-                stability_score_thresh=SAM2Args.stability_score_thresh,
-                min_mask_region_area=0,
-                output_mode="binary_mask",
-            )
+
+        # Only warm up SAM2 workers if not using object masks
+        if not SAM2Args.use_object_masks:
+            # Sequential warm-up to avoid TorchScript race in torchvision Resize when constructing generators in parallel
+            if verbose:
+                print("Warming up SAM2 workers...")
+            tiny = Image.new("RGB", (8, 8), color=0)
+            for _ in range(self.num_workers):
+                _ = self.client.auto_mask(
+                    image=tiny,
+                    model_cfg=SAM2Args.model_cfg,
+                    checkpoint_path=SAM2Args.checkpoint_path,
+                    preset=SAM2Args.preset,
+                    points_per_side=4,
+                    points_per_batch=8,
+                    pred_iou_thresh=SAM2Args.pred_iou_thresh,
+                    stability_score_thresh=SAM2Args.stability_score_thresh,
+                    min_mask_region_area=0,
+                    output_mode="binary_mask",
+                )
 
     async def extract_batch_async(self, image_paths: List[str]):
         results: List[List[dict]] = []
         for i in tqdm(range(0, len(image_paths), self.num_workers), desc="Processing & extracting SAM2 auto-masks", leave=False):
             batch_paths = image_paths[i:i + self.num_workers]
-            tasks = [process_single_image_async(path, self.client) for path in batch_paths]
+            tasks = [process_single_image_async(path, self.client, self.data_dir) for path in batch_paths]
             batch_results = await AsyncMultiWrapper.async_run_tasks(tasks, desc="SAM2 auto_mask", leave=False)
             results.extend(batch_results)
             gc.collect()
         return results
 
 
-def extract_sam2_features(image_paths: List[str], device: torch.device, verbose: bool = False):
-    extractor = SAM2Extractor(device=device, verbose=verbose)
+def extract_sam2_features(image_paths: List[str], device: torch.device, data_dir: Optional[Path] = None, verbose: bool = False):
+    extractor = SAM2Extractor(device=device, data_dir=data_dir, verbose=verbose)
     return run_async_in_any_context(lambda: extractor.extract_batch_async(image_paths))
 
 
 if __name__ == "__main__":
     # Get all images in the directory
-    image_dir = "datasets/f3rm/panda/scene_001/images"
+    # image_dir = "datasets/f3rm/panda/scene_001/images"
+    image_dir = "datasets/f3rm/opt/objaverse/car2/images"
+    data_dir = Path("datasets/f3rm/opt/objaverse/car2")
+    SAM2Args.use_object_masks = True
     image_paths = sorted(glob.glob(f"{image_dir}/*.jpg") + glob.glob(f"{image_dir}/*.png"))
     image_paths = image_paths[:10]
     print(f"Found {len(image_paths)} images in {image_dir}")
-    print("Extraction:")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    auto_masks_per_image = extract_sam2_features(image_paths, device=device, verbose=True)
-    print(f"Extracted auto-masks for {len(auto_masks_per_image)} images. Visualizing instance conversion for first few...")
+
+    # Test with object masks
+    print("Testing...")
+    auto_masks_per_image = extract_sam2_features(image_paths, device=device, data_dir=data_dir, verbose=True)
+    print(f"Extracted auto-masks for {len(auto_masks_per_image)} images. Visualizing...")
     visualize_auto_masks_demo(auto_masks_per_image, image_paths, "SAM2", max_vis=4, pred_iou_thresh=SAM2Args.pred_iou_thresh, min_mask_region_area=SAM2Args.min_mask_region_area)
 
     # Demo 2: Test the full pipeline (extract -> save -> load -> visualize)
@@ -134,7 +195,7 @@ if __name__ == "__main__":
 
     # Extract features
     print("Extracting SAM2 features...")
-    extractor = SAM2Extractor(device=device, verbose=True)
+    extractor = SAM2Extractor(device=device, data_dir=data_dir, verbose=True)
     auto_masks_per_image = run_async_in_any_context(lambda: extractor.extract_batch_async(image_paths))
 
     # Save per-image files (following new per-image system)
@@ -186,5 +247,5 @@ if __name__ == "__main__":
     # Cleanup
     plt.close('all')
     gc.collect()
-    shutil.rmtree(test_dir, ignore_errors=True)
+    shutil.rmtree(test_dir, ignore_errors=True)  # nfs sometimes will still leave a empty directory behind
     print(f"Cleaned up test directory: {test_dir}")

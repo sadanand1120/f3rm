@@ -67,3 +67,27 @@ class ClassProbRenderer(nn.Module):
             values = torch.where(torch.isfinite(values), values, torch.zeros_like(values))
         probs = torch.softmax(values, dim=-1)
         return torch.sum(weights * probs, dim=-2)
+
+
+class VectorRenderer(nn.Module):
+    """Render unit vectors along the ray, similar to NormalsRenderer."""
+
+    @classmethod
+    def forward(
+        cls,
+        vectors: Float[Tensor, "*bs num_samples 3"],
+        weights: Float[Tensor, "*bs num_samples 1"],
+        normalize: bool = True,
+    ) -> Float[Tensor, "*bs 3"]:
+        """Calculate vectors along the ray.
+
+        Args:
+            vectors: Unit vectors for each sample.
+            weights: Weights of each sample.
+            normalize: Normalize final vectors.
+        """
+        v = torch.sum(weights * vectors, dim=-2)
+        if normalize:
+            from nerfstudio.utils.math import safe_normalize
+            v = safe_normalize(v)
+        return v

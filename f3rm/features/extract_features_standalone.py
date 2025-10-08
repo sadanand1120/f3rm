@@ -93,7 +93,10 @@ async def _save_per_image_generic(
     else:
         if extractor_class is None:
             raise ValueError(f"No extractor class found for feature type: {feature_type}")
-        extractor = extractor_class(device=device, verbose=True)
+        if feature_type == "SAM2":
+            extractor = extractor_class(device=device, data_dir=data_dir, verbose=True)
+        else:
+            extractor = extractor_class(device=device, verbose=True)
 
     # Extract features in batches, then save per-image files
     for i in tqdm(range(n_batches), desc=f"{feature_type}: extracting", position=0):

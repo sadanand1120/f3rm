@@ -98,3 +98,29 @@ class ProbFromProbsShader(nn.Module):
         if valid_mask is not None:
             rgb = rgb * valid_mask.to(rgb.device)
         return rgb.to(torch.float16)  # Ensure fp16 consistency for RGB visualization
+
+
+class VectorShader(nn.Module):
+    """Visualize unit vectors similar to NormalsShader."""
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, vectors: Float[Tensor, "*bs 3"], valid_mask: Float[Tensor, "*bs 1"] | None = None) -> Float[Tensor, "*bs 3"]:
+        """Apply rainbow colormap to unit vectors.
+
+        Args:
+            vectors: Normalized 3D vectors.
+            valid_mask: Optional mask to scale vector colors.
+
+        Returns:
+            Colored vectors in [0,1] range
+        """
+        # Apply same transformation as NormalsShader: (vectors + 1) / 2
+        rgb = (vectors + 1.0) / 2.0
+        # rgb = torch.clamp(rgb, 0.0, 1.0)
+
+        if valid_mask is not None:
+            rgb = rgb * valid_mask.to(rgb.device)
+
+        return rgb.to(torch.float16)  # Ensure fp16 consistency for RGB visualization

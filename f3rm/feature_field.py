@@ -16,7 +16,9 @@ class FeatureFieldHeadNames:
     CENTROID: str = "centroid"
     CENTROID_SPREAD: str = "centroid_spread"
     FOREGROUND: str = "foreground"
-    ORIENTANY: str = "orientany"
+    ORIENTANY_RX: str = "orientany_rx"
+    ORIENTANY_RZ: str = "orientany_rz"
+    ORIENTANY_FOREGROUND: str = "orientany_foreground"
 
 
 class FeatureField(Field):
@@ -123,9 +125,11 @@ class FeatureField(Field):
         else:
             self.orientany_centroid_encoding = None
         orientany_input_dims = self.orientany_centroid_encoding.n_output_dims if self.orientany_centroid_encoding is not None else self.encoding.n_output_dims
-        self.mlp_orientany_azimuth = tcnn.Network(
+
+        # OrientAny heads: R_x, R_z, and foreground
+        self.mlp_orientany_rx = tcnn.Network(
             n_input_dims=orientany_input_dims,
-            n_output_dims=360,
+            n_output_dims=3,
             network_config={
                 "otype": "FullyFusedMLP",
                 "activation": "ReLU",
@@ -135,21 +139,9 @@ class FeatureField(Field):
             },
         )
 
-        self.mlp_orientany_polar = tcnn.Network(
+        self.mlp_orientany_rz = tcnn.Network(
             n_input_dims=orientany_input_dims,
-            n_output_dims=180,
-            network_config={
-                "otype": "FullyFusedMLP",
-                "activation": "ReLU",
-                "output_activation": "None",
-                "n_neurons": orientany_hidden_dim,
-                "n_hidden_layers": orientany_num_layers,
-            },
-        )
-
-        self.mlp_orientany_roll = tcnn.Network(
-            n_input_dims=orientany_input_dims,
-            n_output_dims=360,
+            n_output_dims=3,
             network_config={
                 "otype": "FullyFusedMLP",
                 "activation": "ReLU",
@@ -215,7 +207,7 @@ class FeatureField(Field):
         logits = self.mlp_foreground(encoded_base).view(*ray_samples.frustums.directions.shape[:-1], -1)
         return logits
 
-    def get_orientany_azimuth(self, ray_samples: RaySamples) -> Tensor:
+    def get_orientany_rx(self, ray_samples: RaySamples) -> Tensor:
         if self.orientany_use_xyz_encoding:
             encoded_base = self._encode_positions(ray_samples)
         else:
@@ -223,28 +215,22 @@ class FeatureField(Field):
             with torch.no_grad():
                 centroid_pred = self.get_centroid(ray_samples)
             encoded_base = self._encode_centroid_positions(centroid_pred)
-        logits = self.mlp_orientany_azimuth(encoded_base).view(*ray_samples.frustums.directions.shape[:-1], -1)
-        return logits
+        vectors = self.mlp_orientany_rx(encoded_base).view(*ray_samples.frustums.directions.shape[:-1], -1)
+        # Normalize to unit vectors
+        # vectors = torch.nn.functional.normalize(vectors, dim=-1)
+        return vectors
 
-    def get_orientany_polar(self, ray_samples: RaySamples) -> Tensor:
+    def get_orientany_rz(self, ray_samples: RaySamples) -> Tensor:
         if self.orientany_use_xyz_encoding:
             encoded_base = self._encode_positions(ray_samples)
         else:
             with torch.no_grad():
                 centroid_pred = self.get_centroid(ray_samples)
             encoded_base = self._encode_centroid_positions(centroid_pred)
-        logits = self.mlp_orientany_polar(encoded_base).view(*ray_samples.frustums.directions.shape[:-1], -1)
-        return logits
-
-    def get_orientany_roll(self, ray_samples: RaySamples) -> Tensor:
-        if self.orientany_use_xyz_encoding:
-            encoded_base = self._encode_positions(ray_samples)
-        else:
-            with torch.no_grad():
-                centroid_pred = self.get_centroid(ray_samples)
-            encoded_base = self._encode_centroid_positions(centroid_pred)
-        logits = self.mlp_orientany_roll(encoded_base).view(*ray_samples.frustums.directions.shape[:-1], -1)
-        return logits
+        vectors = self.mlp_orientany_rz(encoded_base).view(*ray_samples.frustums.directions.shape[:-1], -1)
+        # Normalize to unit vectors
+        # vectors = torch.nn.functional.normalize(vectors, dim=-1)
+        return vectors
 
     def get_orientany_foreground(self, ray_samples: RaySamples) -> Tensor:
         if self.orientany_use_xyz_encoding:
@@ -263,19 +249,19 @@ class FeatureField(Field):
         centroid_spread = self.get_centroid_spread(ray_samples)
         foreground = self.get_foreground(ray_samples)
 
-        # Get OrientAny components and concatenate
-        azimuth = self.get_orientany_azimuth(ray_samples)
-        polar = self.get_orientany_polar(ray_samples)
-        roll = self.get_orientany_roll(ray_samples)
+        # Get OrientAny components
+        orientany_rx = self.get_orientany_rx(ray_samples)
+        orientany_rz = self.get_orientany_rz(ray_samples)
         orientany_fg = self.get_orientany_foreground(ray_samples)
-        orientany = torch.cat([azimuth, polar, roll, orientany_fg], dim=-1)
 
         return {
             FeatureFieldHeadNames.FEATURE: features,
             FeatureFieldHeadNames.CENTROID: centroid,
             FeatureFieldHeadNames.CENTROID_SPREAD: centroid_spread,
             FeatureFieldHeadNames.FOREGROUND: foreground,
-            FeatureFieldHeadNames.ORIENTANY: orientany,
+            FeatureFieldHeadNames.ORIENTANY_RX: orientany_rx,
+            FeatureFieldHeadNames.ORIENTANY_RZ: orientany_rz,
+            FeatureFieldHeadNames.ORIENTANY_FOREGROUND: orientany_fg,
         }
 
     def forward(self, ray_samples: RaySamples, compute_normals: bool = False) -> Dict[FieldHeadNames, Tensor]:

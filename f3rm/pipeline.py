@@ -398,166 +398,95 @@ class FeaturePipeline(VanillaPipeline):
         # Get OrientAny GT from datamanager
         eval_offset = getattr(self.datamanager, "eval_offset", 0)
         global_idx = camera_index + (eval_offset if is_eval else 0)
-        orientany_gt = self.datamanager.orientany_loader[global_idx]  # (H, W, 8) - compact GT
+        orientany_gt_full = self.datamanager.orientany_loader[global_idx]  # (H, W, 9) - R_x(3), R_z(3), confidence(1), foreground(2)
 
-        h, w = orientany_gt.shape[:2]
-        orientany_img = orientany_gt.to(self.device).float()  # Convert to float32 for consistency
-        valid_mask = orientany_gt[..., 7] > 0.5  # OrientAny foreground mask
+        h, w = orientany_gt_full.shape[:2]
+        # Extract only R_x(3), R_z(3), confidence(1) for caching - no foreground
+        orientany_img = orientany_gt_full[..., :7].to(self.device).float()  # Convert to float32 for consistency
+        valid_mask = orientany_gt_full[..., 8] > 0.5  # OrientAny foreground mask from full GT
 
         # EMA blending with current predictions if allowed
-        if allow_blend and blend > 0.0 and "orientany_logits" in images:
-            # Get current OrientAny predictions (902D expanded logits)
-            pred_logits = images["orientany_logits"]  # (H, W, 902)
+        if allow_blend and blend > 0.0 and "orientany_rx" in images and "orientany_rz" in images:
+            # Get current OrientAny predictions
+            pred_rx = images["orientany_rx"]  # (H, W, 3)
+            pred_rz = images["orientany_rz"]  # (H, W, 3)
 
-            # Convert GT to expanded 902D form for blending
-            gt_expanded = self._convert_orientany_compact_to_expanded(orientany_img)
+            # Extract GT components from cached data (7D: R_x(3), R_z(3), confidence(1))
+            gt_rx = orientany_img[..., 0:3]  # R_x vector
+            gt_rz = orientany_img[..., 3:6]  # R_z vector
+            gt_confidence = orientany_img[..., 6]  # confidence
 
-            # Apply EMA blending in expanded form
-            blended_logits = blend * pred_logits + (1.0 - blend) * gt_expanded
+            # Get foreground from full GT data (not cached)
+            gt_fg = orientany_gt_full[..., 7:9]  # foreground one-hot
 
-            # Convert back to compact 8D form for caching
-            orientany_img = self._convert_orientany_expanded_to_compact(blended_logits)
+            # Get SAM2 instance masks for per-segment blending (same as centroid logic)
+            sam2 = self.datamanager.sam2_loader
+            eval_offset = getattr(self.datamanager, "eval_offset", 0)
+            global_idx = camera_index + (eval_offset if is_eval else 0)
+            auto_masks = sam2[global_idx]
+
+            if len(auto_masks) > 0:
+                # Convert to instance mask using same logic as centroid
+                inst_mask, _ = SAM2utils.auto_masks_to_instance_mask(
+                    auto_masks,
+                    min_iou=float(SAM2Args.pred_iou_thresh),
+                    min_area=float(SAM2Args.min_mask_region_area),
+                    assign_by="area",
+                    start_from="low",
+                )
+                if inst_mask is not None:
+                    ids = torch.from_numpy(inst_mask.copy()).to(orientany_img.device)
+                    unique_ids = torch.unique(ids)
+                    h, w = inst_mask.shape
+                    total = float(h * w)
+                    min_percent = getattr(self.model.config, "centroid_min_instance_percent", 1.0)
+
+                    # Build per-segment mean predictions for R_x and R_z vectors
+                    from nerfstudio.utils.math import safe_normalize
+
+                    pred_rx_seg_mean_img = torch.zeros_like(gt_rx)
+                    pred_rz_seg_mean_img = torch.zeros_like(gt_rz)
+
+                    for inst_id in unique_ids:
+                        iid = int(inst_id.item())
+                        if iid <= 0:
+                            continue
+                        mask = (ids == inst_id)
+                        count = int(mask.sum().item())
+                        if count <= 0:
+                            continue
+                        percent = (100.0 * count) / total
+                        if percent < min_percent:
+                            continue
+
+                        # Get segment predictions and compute mean
+                        seg_pred_rx = pred_rx[mask]
+                        seg_pred_rz = pred_rz[mask]
+                        if seg_pred_rx.numel() > 0 and seg_pred_rz.numel() > 0:
+                            seg_mean_rx = seg_pred_rx.mean(dim=0)
+                            seg_mean_rz = seg_pred_rz.mean(dim=0)
+                            pred_rx_seg_mean_img[mask] = seg_mean_rx
+                            pred_rz_seg_mean_img[mask] = seg_mean_rz
+
+                    # Apply EMA blending only on valid pixels (foreground AND high confidence)
+                    gt_fg_mask = gt_fg[..., 1] > 0.5  # foreground pixels
+                    high_conf_mask = gt_confidence > 0.85
+                    supervision_mask = gt_fg_mask & high_conf_mask
+
+                    if supervision_mask.any():
+                        # Blend R_x vectors using per-segment means
+                        blended_rx = blend * pred_rx_seg_mean_img + (1.0 - blend) * gt_rx
+                        blended_rx = safe_normalize(blended_rx)
+                        orientany_img[..., 0:3] = blended_rx
+
+                        # Blend R_z vectors using per-segment means
+                        blended_rz = blend * pred_rz_seg_mean_img + (1.0 - blend) * gt_rz
+                        blended_rz = safe_normalize(blended_rz)
+                        orientany_img[..., 3:6] = blended_rz
+
+            # Note: Foreground is NOT cached or blended - use directly from batch
 
         return orientany_img, valid_mask.unsqueeze(-1)
-
-    def _convert_orientany_compact_to_expanded(self, orientany_compact: torch.Tensor) -> torch.Tensor:
-        """Convert 8D compact OrientAny format to 902D expanded logits format."""
-        h, w = orientany_compact.shape[:2]
-        device = orientany_compact.device
-        dtype = orientany_compact.dtype
-
-        # Initialize expanded logits (use float32 for numerical stability)
-        expanded_logits = torch.zeros((h, w, 902), device=device, dtype=torch.float32)
-
-        # Get foreground mask
-        fg_mask = orientany_compact[..., 7] > 0.5
-
-        if fg_mask.any():
-            # Extract compact parameters for foreground pixels
-            ax_mean = orientany_compact[..., 0]  # azimuth mean
-            ax_kappa = orientany_compact[..., 1]  # azimuth kappa
-            pl_mean = orientany_compact[..., 2]  # polar mean
-            pl_std = orientany_compact[..., 3]   # polar std
-            ro_mean = orientany_compact[..., 4]  # roll mean
-            ro_kappa = orientany_compact[..., 5]  # roll kappa
-
-            # Vectorized conversion to expanded form
-            # Azimuth: von Mises distribution (0-359)
-            ax_logits = self._von_mises_to_logits_vectorized(ax_mean, ax_kappa, 360, fg_mask)
-            expanded_logits[fg_mask, 0:360] = ax_logits[fg_mask]
-
-            # Polar: normal distribution (0-179)
-            pl_logits = self._normal_to_logits_vectorized(pl_mean, pl_std, 180, fg_mask)
-            expanded_logits[fg_mask, 360:540] = pl_logits[fg_mask]
-
-            # Roll: von Mises distribution (0-359)
-            ro_logits = self._von_mises_to_logits_vectorized(ro_mean, ro_kappa, 360, fg_mask)
-            expanded_logits[fg_mask, 540:900] = ro_logits[fg_mask]
-
-            # Foreground logits: convert probabilities to logits
-            fg_probs = orientany_compact[..., 6:8]
-            fg_logits = torch.log(fg_probs + 1e-8)  # Add small epsilon for numerical stability
-            expanded_logits[..., 900:902] = fg_logits
-
-        return expanded_logits
-
-    def _convert_orientany_expanded_to_compact(self, expanded_logits: torch.Tensor) -> torch.Tensor:
-        """Convert 902D expanded logits format back to 8D compact format."""
-        h, w = expanded_logits.shape[:2]
-        device = expanded_logits.device
-        dtype = expanded_logits.dtype
-
-        # Initialize compact format (use float32 for consistency)
-        compact = torch.zeros((h, w, 8), device=device, dtype=torch.float32)
-
-        # Extract foreground predictions
-        fg_logits = expanded_logits[..., 900:902]
-        fg_probs = torch.softmax(fg_logits, dim=-1)
-        compact[..., 6:8] = fg_probs
-
-        # Get foreground mask
-        fg_mask = fg_probs[..., 1] > 0.5
-
-        if fg_mask.any():
-            # Extract orientation predictions for foreground pixels only
-            ax_logits = expanded_logits[..., 0:360]
-            pl_logits = expanded_logits[..., 360:540]
-            ro_logits = expanded_logits[..., 540:900]
-
-            # Get argmax predictions for the three angles
-            ax_pred = ax_logits.argmax(dim=-1).float()      # 0-359 (azimuth)
-            pl_pred = pl_logits.argmax(dim=-1).float()      # 0-179 (polar)
-            ro_pred = ro_logits.argmax(dim=-1).float()      # 0-359 (roll)
-
-            # Convert to compact format (mean, variance approximation)
-            compact[fg_mask, 0] = ax_pred[fg_mask]  # azimuth mean
-            compact[fg_mask, 1] = 1.0  # azimuth kappa (fixed variance)
-            compact[fg_mask, 2] = pl_pred[fg_mask]  # polar mean
-            compact[fg_mask, 3] = 1.0  # polar std (fixed variance)
-            compact[fg_mask, 4] = ro_pred[fg_mask]  # roll mean
-            compact[fg_mask, 5] = 1.0  # roll kappa (fixed variance)
-
-        return compact
-
-    def _von_mises_to_logits_vectorized(self, means: torch.Tensor, kappas: torch.Tensor, num_classes: int, fg_mask: torch.Tensor) -> torch.Tensor:
-        """Convert von Mises distribution parameters to logits (vectorized)."""
-        h, w = means.shape
-        device = means.device
-        angles = torch.arange(num_classes, device=device, dtype=torch.float32)
-
-        # Initialize output tensor
-        logits = torch.zeros((h, w, num_classes), device=device, dtype=torch.float32)
-
-        if fg_mask.any():
-            # Vectorized computation for foreground pixels
-            fg_means = means[fg_mask]  # (N,)
-            fg_kappas = kappas[fg_mask]  # (N,)
-
-            # Broadcast angles to match foreground pixels: (N, num_classes)
-            angles_broadcast = angles.unsqueeze(0).expand(fg_means.shape[0], -1)
-            means_broadcast = fg_means.unsqueeze(-1)  # (N, 1)
-            kappas_broadcast = fg_kappas.unsqueeze(-1)  # (N, 1)
-
-            # Von Mises log probability
-            log_probs = kappas_broadcast * torch.cos(angles_broadcast * 2 * torch.pi / num_classes - means_broadcast * 2 * torch.pi / 360)
-
-            # Normalize to logits
-            logits_fg = log_probs - log_probs.max(dim=-1, keepdim=True)[0]
-
-            # Store back in full tensor
-            logits[fg_mask] = logits_fg
-
-        return logits
-
-    def _normal_to_logits_vectorized(self, means: torch.Tensor, stds: torch.Tensor, num_classes: int, fg_mask: torch.Tensor) -> torch.Tensor:
-        """Convert normal distribution parameters to logits (vectorized)."""
-        h, w = means.shape
-        device = means.device
-        values = torch.arange(num_classes, device=device, dtype=torch.float32)
-
-        # Initialize output tensor
-        logits = torch.zeros((h, w, num_classes), device=device, dtype=torch.float32)
-
-        if fg_mask.any():
-            # Vectorized computation for foreground pixels
-            fg_means = means[fg_mask]  # (N,)
-            fg_stds = stds[fg_mask]  # (N,)
-
-            # Broadcast values to match foreground pixels: (N, num_classes)
-            values_broadcast = values.unsqueeze(0).expand(fg_means.shape[0], -1)
-            means_broadcast = fg_means.unsqueeze(-1)  # (N, 1)
-            stds_broadcast = fg_stds.unsqueeze(-1)  # (N, 1)
-
-            # Normal log probability
-            log_probs = -0.5 * ((values_broadcast - means_broadcast) / stds_broadcast) ** 2
-
-            # Normalize to logits
-            logits_fg = log_probs - log_probs.max(dim=-1, keepdim=True)[0]
-
-            # Store back in full tensor
-            logits[fg_mask] = logits_fg
-
-        return logits
 
     def _log_train_images_for_step(self, batch: Dict, step: int) -> None:
         # Choose one camera from current train batch to render full image
@@ -598,29 +527,25 @@ class FeaturePipeline(VanillaPipeline):
         images_dict["foreground_prob_vs_gt"] = torch.cat([outputs["foreground_prob_rgb"], fg_gt_rgb], dim=1)
 
         # Add OrientAny pred vs GT side-by-side using full-image GT from datamanager
-        if self.model.config.orientany_enable and ("orientany_rgb" in outputs):
+        if self.model.config.orientany_enable and ("orientany_rx_rgb" in outputs):
             # Get full OrientAny GT tensor (memory efficient, no gradients needed)
             with torch.no_grad():
                 ci_global = ci  # train split uses train indices directly
                 orientany_gt = self.datamanager.orientany_loader[ci_global].cpu()
 
-                # Convert GT distribution means to RGB (vectorized operations on CPU)
-                ax_mean_gt = orientany_gt[..., 0]  # azimuth mean
-                pl_mean_gt = orientany_gt[..., 2]  # polar mean
-                ro_mean_gt = orientany_gt[..., 4]  # roll mean
-                fg_gt = orientany_gt[..., 7] > 0.5  # foreground mask from GT
+                # Extract GT vectors: [R_x(3), R_z(3), confidence(1), foreground(2)]
+                gt_rx = orientany_gt[..., 0:3]  # R_x vector
+                gt_rz = orientany_gt[..., 3:6]  # R_z vector
+                fg_gt = orientany_gt[..., 8] > 0.5  # foreground mask from GT
 
-                orientany_gt_rgb = torch.stack([
-                    torch.clamp(ax_mean_gt / 359.0, 0, 1),
-                    torch.clamp(pl_mean_gt / 179.0, 0, 1),
-                    torch.clamp(ro_mean_gt / 359.0, 0, 1)
-                ], dim=-1)
+                # GT vector visualizations
+                orientany_gt_rx_rgb = self.model.vector_shader(gt_rx, fg_gt.unsqueeze(-1))
+                orientany_gt_rz_rgb = self.model.vector_shader(gt_rz, fg_gt.unsqueeze(-1))
 
-                # Only show colors for foreground pixels (set background to black)
-                orientany_gt_rgb[~fg_gt] = 0.0
-
-                images_dict["orientany_gt_rgb"] = orientany_gt_rgb
-                images_dict["orientany_vs_gt"] = torch.cat([outputs["orientany_rgb"], orientany_gt_rgb], dim=1)
+                images_dict["orientany_gt_rx_rgb"] = orientany_gt_rx_rgb
+                images_dict["orientany_gt_rz_rgb"] = orientany_gt_rz_rgb
+                images_dict["orientany_rx_vs_gt"] = torch.cat([outputs["orientany_rx_rgb"], orientany_gt_rx_rgb], dim=1)
+                images_dict["orientany_rz_vs_gt"] = torch.cat([outputs["orientany_rz_rgb"], orientany_gt_rz_rgb], dim=1)
         for key, img in images_dict.items():
             writer.put_image(name=f"Train Images/{key}", image=img, step=step)
         # Also log centroid cache if present (after cold start)
@@ -639,7 +564,7 @@ class FeaturePipeline(VanillaPipeline):
         return {k: (self._train_centroid_spread_cache[k], self._train_centroid_spread_valid[k]) for k in self._train_centroid_spread_cache}
 
     def get_last_train_orientany_cache(self) -> Dict[int, Tuple[torch.Tensor, torch.Tensor]]:
-        # Returns mapping to (orientany_img HxWx8, valid_mask HxWx1)
+        # Returns mapping to (orientany_img HxWx7, valid_mask HxWx1) - R_x(3), R_z(3), confidence(1)
         return {k: (self._train_orientany_cache[k], self._train_orientany_valid[k]) for k in self._train_orientany_cache}
 
     # Eval image metrics/images with a progress bar around rendering
@@ -678,29 +603,25 @@ class FeaturePipeline(VanillaPipeline):
         images_dict["foreground_prob_vs_gt"] = torch.cat([outputs["foreground_prob_rgb"], fg_gt_rgb], dim=1)
 
         # Add OrientAny pred vs GT side-by-side if available in eval batch
-        if self.model.config.orientany_enable and ("orientany_rgb" in outputs):
+        if self.model.config.orientany_enable and ("orientany_rx_rgb" in outputs):
             # Get full OrientAny GT tensor (memory efficient, no gradients needed)
             with torch.no_grad():
                 ci_global = int(image_idx) + getattr(self.datamanager, "eval_offset", 0)
                 orientany_gt = self.datamanager.orientany_loader[ci_global].cpu()
 
-                # Convert GT distribution means to RGB (vectorized operations on CPU)
-                ax_mean_gt = orientany_gt[..., 0]  # azimuth mean
-                pl_mean_gt = orientany_gt[..., 2]  # polar mean
-                ro_mean_gt = orientany_gt[..., 4]  # roll mean
-                fg_gt = orientany_gt[..., 7] > 0.5  # foreground mask from GT
+                # Extract GT vectors: [R_x(3), R_z(3), confidence(1), foreground(2)]
+                gt_rx = orientany_gt[..., 0:3]  # R_x vector
+                gt_rz = orientany_gt[..., 3:6]  # R_z vector
+                fg_gt = orientany_gt[..., 8] > 0.5  # foreground mask from GT
 
-                orientany_gt_rgb = torch.stack([
-                    torch.clamp(ax_mean_gt / 359.0, 0, 1),
-                    torch.clamp(pl_mean_gt / 179.0, 0, 1),
-                    torch.clamp(ro_mean_gt / 359.0, 0, 1)
-                ], dim=-1)
+                # GT vector visualizations
+                orientany_gt_rx_rgb = self.model.vector_shader(gt_rx, fg_gt.unsqueeze(-1))
+                orientany_gt_rz_rgb = self.model.vector_shader(gt_rz, fg_gt.unsqueeze(-1))
 
-                # Only show colors for foreground pixels (set background to black)
-                orientany_gt_rgb[~fg_gt] = 0.0
-
-                images_dict["orientany_gt_rgb"] = orientany_gt_rgb
-                images_dict["orientany_vs_gt"] = torch.cat([outputs["orientany_rgb"], orientany_gt_rgb], dim=1)
+                images_dict["orientany_gt_rx_rgb"] = orientany_gt_rx_rgb
+                images_dict["orientany_gt_rz_rgb"] = orientany_gt_rz_rgb
+                images_dict["orientany_rx_vs_gt"] = torch.cat([outputs["orientany_rx_rgb"], orientany_gt_rx_rgb], dim=1)
+                images_dict["orientany_rz_vs_gt"] = torch.cat([outputs["orientany_rz_rgb"], orientany_gt_rz_rgb], dim=1)
         assert "image_idx" not in metrics_dict
         metrics_dict["image_idx"] = image_idx
         assert "num_rays" not in metrics_dict

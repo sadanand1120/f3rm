@@ -665,8 +665,8 @@ class BatchFeatureLoader:
                 instance_features = json.load(f)
 
             h, w, _ = pixel_data.shape
-            full_features = np.zeros((h, w, 8), dtype=np.float16)
-            full_features[..., 6:8] = pixel_data[..., :2]
+            full_features = np.zeros((h, w, 9), dtype=np.float16)  # 7D features + 2D foreground
+            full_features[..., 7:9] = pixel_data[..., :2]  # foreground one-hot
             instance_ids = pixel_data[..., 2]
             unique_ids = np.unique(instance_ids)
             for instance_id in unique_ids:
@@ -678,7 +678,7 @@ class BatchFeatureLoader:
                     instance_feat = instance_features[instance_id_str]
                     if isinstance(instance_feat, list):
                         instance_feat = np.array(instance_feat, dtype=np.float16)
-                    full_features[mask, :6] = instance_feat
+                    full_features[mask, :7] = instance_feat  # 7D features: R_x, R_z, confidence
             t = torch.from_numpy(full_features)
             return t.pin_memory() if self._use_pinned else t
 
