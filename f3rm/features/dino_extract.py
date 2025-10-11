@@ -1,9 +1,12 @@
 import gc
 import asyncio
 import glob
+import os
 from typing import List
 
 import torch
+import cv2
+import numpy as np
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from PIL import Image
@@ -92,7 +95,38 @@ def extract_dino_features(image_paths: List[str], device: torch.device, verbose=
     return run_async_in_any_context(lambda: extractor.extract_batch_async(image_paths))
 
 
+def examine_saved(dino_feat_dir: str):
+    """Create .mp4 video of saved DINO features with PCA visualization."""
+    meta_path = os.path.join(dino_feat_dir, "meta.pt")
+    assert os.path.exists(meta_path), f"DINO meta not found at {meta_path}"
+
+    meta = torch.load(meta_path)
+    image_fnames = meta["image_fnames"]
+    n_images = len(image_fnames)
+
+    # Load first image to get dimensions
+    first_feat = np.load(os.path.join(dino_feat_dir, "image_000000.npy"))
+    H, W = first_feat.shape[:2]
+
+    video_path = os.path.join(dino_feat_dir, "features_viz.mp4")
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(video_path, fourcc, 2.0, (W, H))
+
+    for i in tqdm(range(n_images), desc="Creating DINO features video"):
+        feat_path = os.path.join(dino_feat_dir, f"image_{i:06d}.npy")
+        feat = torch.from_numpy(np.load(feat_path)).float()  # Convert half to float for PCA
+        pca_img = apply_pca_colormap(feat, niter=5, q_min=0.01, q_max=0.99)
+        frame = (pca_img.cpu().numpy() * 255).astype(np.uint8)
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        out.write(frame_bgr)
+
+    out.release()
+    assert os.path.exists(video_path), f"Video not created at {video_path}"
+
+
 if __name__ == "__main__":
+    # examine_saved("datasets/f3rm/opt/objaverse/car2/features/dino")
+
     image_dir = "datasets/f3rm/panda/scene_001/images"
     image_paths = sorted(glob.glob(f"{image_dir}/*.jpg") + glob.glob(f"{image_dir}/*.png"))
     image_paths = image_paths[:4]

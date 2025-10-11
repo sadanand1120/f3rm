@@ -9,6 +9,7 @@ import numpy as np
 from nerfstudio.pipelines.base_pipeline import VanillaPipeline, VanillaPipelineConfig
 from nerfstudio.data.datamanagers.base_datamanager import VanillaDataManager
 from nerfstudio.utils import colormaps, writer
+from nerfstudio.utils.math import safe_normalize
 from nerfstudio.utils import profiler
 from nerfstudio.utils.misc import step_check
 from rich.progress import Progress, BarColumn, TimeElapsedColumn, TextColumn
@@ -16,6 +17,7 @@ from PIL import Image
 
 from sam2.features.utils import SAM2utils
 from f3rm.features.sam2_extract import SAM2Args
+from f3rm.features.utils import vector_mode
 
 
 @dataclass
@@ -441,9 +443,7 @@ class FeaturePipeline(VanillaPipeline):
                     total = float(h * w)
                     min_percent = getattr(self.model.config, "centroid_min_instance_percent", 1.0)
 
-                    # Build per-segment mean predictions for R_x and R_z vectors
-                    from nerfstudio.utils.math import safe_normalize
-
+                    # Build per-segment mode predictions for R_x and R_z vectors
                     pred_rx_seg_mean_img = torch.zeros_like(gt_rx)
                     pred_rz_seg_mean_img = torch.zeros_like(gt_rz)
 
@@ -463,10 +463,15 @@ class FeaturePipeline(VanillaPipeline):
                         seg_pred_rx = pred_rx[mask]
                         seg_pred_rz = pred_rz[mask]
                         if seg_pred_rx.numel() > 0 and seg_pred_rz.numel() > 0:
+                            # TODO: mean works well, mode doesnt give good results on car2
                             seg_mean_rx = seg_pred_rx.mean(dim=0)
                             seg_mean_rz = seg_pred_rz.mean(dim=0)
                             pred_rx_seg_mean_img[mask] = seg_mean_rx
                             pred_rz_seg_mean_img[mask] = seg_mean_rz
+                            # seg_mode_rx = vector_mode(seg_pred_rx, radius_deg=32.0, max_anchors=512, unsigned=False)
+                            # seg_mode_rz = vector_mode(seg_pred_rz, radius_deg=32.0, max_anchors=512, unsigned=False)
+                            # pred_rx_seg_mean_img[mask] = seg_mode_rx
+                            # pred_rz_seg_mean_img[mask] = seg_mode_rz
 
                     # Apply EMA blending only on valid pixels (foreground AND high confidence)
                     gt_fg_mask = gt_fg[..., 1] > 0.5  # foreground pixels

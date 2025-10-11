@@ -31,12 +31,12 @@ from nerfstudio.data.dataparsers.nerfstudio_dataparser import NerfstudioDataPars
 from nerfstudio.utils.rich_utils import CONSOLE
 from tqdm.auto import tqdm
 
-from f3rm.features.clip_extract import CLIPArgs, CLIPExtractor
-from f3rm.features.dino_extract import DINOArgs, DINOExtractor
-from f3rm.features.sam2_extract import SAM2Args, SAM2Extractor
-from f3rm.features.clipsam_extract import CLIPSAMArgs, CLIPSAMExtractor, parse_clipsam_feature_type
-from f3rm.features.foreground_extract import FOREGROUNDArgs, FOREGROUNDExtractor, parse_foreground_feature_type
-from f3rm.features.orientany_extract import ORIENTANYArgs, ORIENTANYExtractor, parse_orientany_feature_type
+from f3rm.features.clip_extract import CLIPArgs, CLIPExtractor, examine_saved as examine_saved_clip
+from f3rm.features.dino_extract import DINOArgs, DINOExtractor, examine_saved as examine_saved_dino
+from f3rm.features.sam2_extract import SAM2Args, SAM2Extractor, examine_saved as examine_saved_sam2
+from f3rm.features.clipsam_extract import CLIPSAMArgs, CLIPSAMExtractor, parse_clipsam_feature_type, examine_saved as examine_saved_clipsam
+from f3rm.features.foreground_extract import FOREGROUNDArgs, FOREGROUNDExtractor, parse_foreground_feature_type, examine_saved as examine_saved_foreground
+from f3rm.features.orientany_extract import ORIENTANYArgs, ORIENTANYExtractor, parse_orientany_feature_type, examine_saved as examine_saved_orientany
 from f3rm.features.text_extract import TextArgs, TextExtractor
 from f3rm.features.utils import run_async_in_any_context, pack_auto_masks, unpack_auto_masks, BatchFeatureLoader, get_cache_paths
 
@@ -57,6 +57,55 @@ FEAT_TYPE_TO_EXTRACTOR_CLASS: Dict[str, Type] = {
     "SAM2": SAM2Extractor,
     "TEXT": TextExtractor,
 }
+
+# Mapping from feature types to their examine_saved functions
+FEAT_TYPE_TO_EXAMINE_FUNC = {
+    "CLIP": examine_saved_clip,
+    "DINO": examine_saved_dino,
+    "SAM2": examine_saved_sam2,
+}
+
+
+def get_examine_func_for_feature_type(feature_type: str):
+    """Get the appropriate examine_saved function for a feature type."""
+    if feature_type.startswith("CLIPSAM_"):
+        return examine_saved_clipsam
+    elif feature_type.startswith("FOREGROUND_"):
+        return examine_saved_foreground
+    elif feature_type.startswith("ORIENTANY_"):
+        return examine_saved_orientany
+    else:
+        return FEAT_TYPE_TO_EXAMINE_FUNC.get(feature_type)
+
+
+def create_feature_visualization(data_dir: Path, feature_type: str):
+    """Automatically create video visualization for extracted features."""
+    try:
+        examine_func = get_examine_func_for_feature_type(feature_type)
+        if examine_func is None:
+            CONSOLE.print(f"[yellow]No visualization available for feature type: {feature_type}")
+            return
+
+        # Determine the feature directory path
+        if feature_type.startswith("CLIPSAM_"):
+            feat_dir = data_dir / "features" / feature_type.lower()
+        elif feature_type.startswith("FOREGROUND_"):
+            feat_dir = data_dir / "features" / feature_type.lower()
+        elif feature_type.startswith("ORIENTANY_"):
+            feat_dir = data_dir / "features" / feature_type.lower()
+        else:
+            feat_dir = data_dir / "features" / feature_type.lower()
+
+        if not feat_dir.exists():
+            CONSOLE.print(f"[yellow]Feature directory not found: {feat_dir}")
+            return
+
+        CONSOLE.print(f"[blue]Creating visualization video for {feature_type}...")
+        examine_func(str(feat_dir))
+        CONSOLE.print(f"[green]✓ Video saved: {feat_dir}/features_viz.mp4")
+
+    except Exception as e:
+        CONSOLE.print(f"[red]Error creating visualization for {feature_type}: {e}")
 
 
 async def _save_per_image_generic(
@@ -371,6 +420,10 @@ def main():
         device=args.device,
         force=args.force,
     )
+
+    # Create visualization video
+    CONSOLE.print("Creating visualization video...")
+    create_feature_visualization(args.data, args.feature_type)
 
 
 if __name__ == "__main__":

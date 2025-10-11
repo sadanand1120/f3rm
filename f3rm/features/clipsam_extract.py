@@ -1,9 +1,11 @@
 import asyncio
 import gc
+import os
 from typing import List, Optional
 
 import numpy as np
 import torch
+import cv2
 from pathlib import Path
 from PIL import Image
 import matplotlib.pyplot as plt
@@ -279,7 +281,65 @@ async def process_single_image_clipsam_async(image_path: str, clipsam_client: As
     return await clipsam_client.filter_auto_masks_for_image_async(image_path)
 
 
+def examine_saved(clipsam_feat_dir: str):
+    """Create .mp4 video of saved CLIPSAM features with mask visualization."""
+    meta_path = os.path.join(clipsam_feat_dir, "meta.pt")
+    assert os.path.exists(meta_path), f"CLIPSAM meta not found at {meta_path}"
+
+    meta = torch.load(meta_path)
+    image_fnames = meta["image_fnames"]
+    n_images = len(image_fnames)
+
+    # Load first image to get dimensions
+    first_data = np.load(os.path.join(clipsam_feat_dir, "image_000000.npz"))
+    packed_data = {
+        "num_masks": int(first_data['num_masks']),
+        "mask_data": first_data['mask_data'],
+        "mask_shapes": first_data['mask_shapes'],
+        "bbox_data": first_data['bbox_data'],
+        "pred_iou_data": first_data['pred_iou_data'],
+        "area_data": first_data['area_data']
+    }
+    first_masks = unpack_auto_masks(packed_data)
+    H, W = first_masks[0]["segmentation"].shape
+
+    video_path = os.path.join(clipsam_feat_dir, "features_viz.mp4")
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(video_path, fourcc, 2.0, (W, H))
+
+    for i in tqdm(range(n_images), desc="Creating CLIPSAM features video"):
+        feat_path = os.path.join(clipsam_feat_dir, f"image_{i:06d}.npz")
+        data = np.load(feat_path)
+        packed_data = {
+            "num_masks": int(data['num_masks']),
+            "mask_data": data['mask_data'],
+            "mask_shapes": data['mask_shapes'],
+            "bbox_data": data['bbox_data'],
+            "pred_iou_data": data['pred_iou_data'],
+            "area_data": data['area_data']
+        }
+        auto_masks = unpack_auto_masks(packed_data)
+
+        # Create visualization
+        frame = np.zeros((H, W, 3), dtype=np.uint8)
+        colors = plt.cm.Set1(np.linspace(0, 1, max(1, len(auto_masks))))
+        for j, mask in enumerate(auto_masks):
+            seg = mask["segmentation"]
+            if seg.shape == (H, W):
+                color = (colors[j][:3] * 255).astype(np.uint8)  # Take only RGB, ignore alpha
+                frame[seg] = color
+
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        out.write(frame_bgr)
+
+    out.release()
+    assert os.path.exists(video_path), f"Video not created at {video_path}"
+
+
 if __name__ == "__main__":
+    # examine_saved("datasets/f3rm/opt/objaverse/car2/features/clipsam_")
+    # examine_saved("datasets/f3rm/opt/objaverse/car2/features/clipsam_car")
+
     # Demo: Full pipeline (extract -> save -> load -> visualize) for CLIPSAM
     data_root = Path("datasets/f3rm/opt/caterpillar")
     image_dir = data_root / "images"

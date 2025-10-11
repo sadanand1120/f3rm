@@ -1,4 +1,5 @@
 from typing import Optional, Tuple, Callable, Any, List, Dict
+import math
 from collections import OrderedDict
 import json
 
@@ -15,6 +16,7 @@ from PIL import Image
 from sam2.features.utils import SAM2utils
 
 from nerfstudio.cameras import camera_utils
+from nerfstudio.utils.math import safe_normalize
 
 
 def get_conf_temp_scaled_logits(logits, confidence, drop_exp_factor=6, eps=1e-8):
@@ -443,6 +445,45 @@ def run_async_in_any_context(coro_fn: Callable[[], Any]) -> Any:
             return fut.result()
     except RuntimeError:
         return asyncio.run(coro_fn())
+
+
+def vector_mode(points: torch.Tensor, radius_deg: float = 12.0, max_anchors: int = 512, unsigned: bool = False) -> torch.Tensor:
+    """Return unit vector mode of a set of 3D vectors using max-support within an angular neighborhood.
+
+    Args:
+        points: (N, 3) vectors (not necessarily unit). If empty, returns zeros(3).
+        radius_deg: Angular radius (degrees) for support region.
+        max_anchors: Subsample anchors for efficiency when N is large.
+        unsigned: If True, treats v and -v as same direction.
+    """
+    if points.numel() == 0:
+        return torch.zeros(3, device=points.device, dtype=points.dtype)
+
+    x = safe_normalize(points.reshape(-1, 3))
+    N = x.shape[0]
+    M = min(N, int(max_anchors))
+
+    if M < N:
+        idx = torch.linspace(0, N - 1, M, device=x.device, dtype=torch.float32).round().long()
+        anchors = x[idx]
+    else:
+        anchors = x
+
+    cos_thr = torch.cos(torch.tensor(radius_deg * math.pi / 180.0, device=x.device, dtype=x.dtype))
+
+    sims = x @ anchors.T
+    if unsigned:
+        sims = sims.abs()
+
+    counts = (sims >= cos_thr).sum(dim=0)
+    center = anchors[counts.argmax()]
+
+    sim_center = x @ center
+    if unsigned:
+        sim_center = sim_center.abs()
+    inliers = sim_center >= cos_thr
+    mode_vec = x[inliers].mean(dim=0)
+    return safe_normalize(mode_vec)
 
 
 def pack_auto_masks(auto_masks: List[dict]) -> dict:

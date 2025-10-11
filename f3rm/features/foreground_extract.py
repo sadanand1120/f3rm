@@ -1,9 +1,11 @@
 import gc
 import asyncio
+import os
 from typing import List, Optional
 
 import numpy as np
 import torch
+import cv2
 from pathlib import Path
 from PIL import Image
 from tqdm.auto import tqdm
@@ -238,7 +240,41 @@ async def process_single_image_foreground_async(image_path: str, fg_client: Asyn
     return await fg_client.compute_foreground_for_image_async(image_path)
 
 
+def examine_saved(foreground_feat_dir: str):
+    """Create .mp4 video of saved FOREGROUND features with visualization."""
+    meta_path = os.path.join(foreground_feat_dir, "meta.pt")
+    assert os.path.exists(meta_path), f"FOREGROUND meta not found at {meta_path}"
+
+    meta = torch.load(meta_path)
+    image_fnames = meta["image_fnames"]
+    n_images = len(image_fnames)
+
+    # Load first image to get dimensions
+    first_feat = np.load(os.path.join(foreground_feat_dir, "image_000000.npy"))
+    H, W = first_feat.shape[:2]
+
+    video_path = os.path.join(foreground_feat_dir, "features_viz.mp4")
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(video_path, fourcc, 2.0, (W, H))
+
+    for i in tqdm(range(n_images), desc="Creating FOREGROUND features video"):
+        feat_path = os.path.join(foreground_feat_dir, f"image_{i:06d}.npy")
+        feat = np.load(feat_path)  # Shape: (H, W, 2) - background/foreground one-hot
+
+        # Visualize foreground channel (index 1)
+        fg_map = feat[..., 1]  # Foreground channel
+        frame = (fg_map * 255).astype(np.uint8)
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        out.write(frame_bgr)
+
+    out.release()
+    assert os.path.exists(video_path), f"Video not created at {video_path}"
+
+
 if __name__ == "__main__":
+    # examine_saved("datasets/f3rm/opt/objaverse/car2/features/foreground_")
+    # examine_saved("datasets/f3rm/opt/objaverse/car2/features/foreground_car")
+
     data_root = Path("datasets/f3rm/opt/betaipad/small")
     image_dir = data_root / "images"
     image_paths = sorted(list(image_dir.glob("*.jpg")) + list(image_dir.glob("*.png")))

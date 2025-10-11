@@ -7,6 +7,7 @@ from typing import List, Optional, Dict, Any
 import numpy as np
 import torch
 import torch.nn.functional as F
+import cv2
 from pathlib import Path
 from PIL import Image
 from tqdm.auto import tqdm
@@ -28,13 +29,15 @@ from f3rm.features.utils import BatchFeatureLoader
 from f3rm.features.sam2_extract import SAM2Args
 from f3rm.features.orientany.orientany_main import OrientAny
 from f3rm.features.orientany.homography import Homography
+from f3rm.shaders import VectorShader
+from f3rm.manual.instance_axes_annotator import AxesAnnotator
 
 
 class ORIENTANYArgs:
     negative_texts: List[str] = ["object", "floor", "wall"]
     softmax_temp: float = 0.01
     top_mean_percent: float = 15.0
-    sim_thresh: float = 0.7   # make it 0.1 for debugging
+    sim_thresh: float = 0.7   # 0.7, make it 0.1 for debugging
     min_instance_percent: float = 1.0
     batch_size_per_gpu: int = 4
 
@@ -355,11 +358,153 @@ async def process_single_image_orientany_async(image_path: str, orientany_client
     return await orientany_client.compute_orientany_for_image_async(image_path, debug=debug)
 
 
+def examine_saved(orientany_feat_dir: str):
+    """Create .mp4 video of saved ORIENTANY features with side-by-side visualization."""
+    meta_path = os.path.join(orientany_feat_dir, "meta.pt")
+    assert os.path.exists(meta_path), f"ORIENTANY meta not found at {meta_path}"
+
+    meta = torch.load(meta_path)
+    image_fnames = meta["image_fnames"]
+    n_images = len(image_fnames)
+
+    # Get data directory from feature directory
+    data_dir = Path(orientany_feat_dir).parent.parent  # features/orientany_ -> data_dir
+
+    # Load transforms for coordinate conversion (same as in debug script)
+    transforms_path = data_dir / "transforms.json"
+    if not transforms_path.exists():
+        raise FileNotFoundError(f"transforms.json not found at {transforms_path}")
+
+    T_orig_to_final_nerf_world, scale = get_orig_to_final_nerf_world_transform_scale(str(transforms_path))
+    dataset_transforms_data = json.load(open(transforms_path, "r"))
+    transforms_lookup = build_transform_lookup(dataset_transforms_data["frames"])
+
+    # Load first image to get dimensions
+    first_pixel_path = os.path.join(orientany_feat_dir, "image_000000_pixel.npy")
+    first_inst_path = os.path.join(orientany_feat_dir, "image_000000_instances.json")
+    if not (os.path.exists(first_pixel_path) and os.path.exists(first_inst_path)):
+        raise FileNotFoundError(f"ORIENTANY feature files not found in {orientany_feat_dir}")
+
+    pixel_data = np.load(first_pixel_path)
+    H, W = pixel_data.shape[:2]
+
+    video_path = os.path.join(orientany_feat_dir, "features_viz.mp4")
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    # Side-by-side: axes + rx + rz = 3 * width
+    out = cv2.VideoWriter(video_path, fourcc, 2.0, (W * 3, H))
+    vector_shader = VectorShader()
+
+    for i in tqdm(range(n_images), desc="Creating ORIENTANY features video"):
+        # Load pixel data and instance features
+        pixel_path = os.path.join(orientany_feat_dir, f"image_{i:06d}_pixel.npy")
+        inst_path = os.path.join(orientany_feat_dir, f"image_{i:06d}_instances.json")
+
+        if not (os.path.exists(pixel_path) and os.path.exists(inst_path)):
+            continue
+
+        pixel_data = np.load(pixel_path)
+        with open(inst_path, 'r') as f:
+            instance_features = json.load(f)
+
+        # Get original image
+        image_path = image_fnames[i]
+        if not os.path.exists(image_path):
+            continue
+        img = Image.open(image_path).convert('RGB')
+        img_array = np.array(img)
+
+        # Get foreground mask
+        fg_mask = pixel_data[..., 1] > 0.5
+
+        if not np.any(fg_mask):
+            # No foreground, create empty frame
+            empty_frame = np.zeros((H, W * 3, 3), dtype=np.uint8)
+            frame_bgr = cv2.cvtColor(empty_frame, cv2.COLOR_RGB2BGR)
+            out.write(frame_bgr)
+            continue
+
+        # Reconstruct full features for visualization
+        full_features = np.zeros((H, W, 9), dtype=np.float16)
+        full_features[..., 7:9] = pixel_data[..., :2]  # foreground one-hot
+
+        # Assign instance features to pixels
+        for instance_id, instance_feat in instance_features.items():
+            instance_id = int(instance_id)
+            mask = (pixel_data[..., 2] == instance_id)
+            if np.any(mask) and isinstance(instance_feat, list):
+                instance_feat = np.array(instance_feat, dtype=np.float16)
+                full_features[mask, :7] = instance_feat
+
+        # Extract R_x and R_z vectors
+        R_x = full_features[..., :3]
+        R_z = full_features[..., 3:6]
+
+        # Create three visualizations, TODO: generalize to multiple instances
+        # 1. Axes visualization (use first instance for center)
+        ys, xs = np.where(fg_mask)
+        mask_center = (int(xs.mean()), int(ys.mean()))
+
+        # Get rotation matrix from first instance (transform from final NeRF world to camera coords)
+        axes_frame = img_array.copy()
+        if instance_features:
+            first_instance_feat = list(instance_features.values())[0]
+            if isinstance(first_instance_feat, list):
+                first_instance_feat = np.array(first_instance_feat, dtype=np.float16)
+
+            # Stored features are in final NeRF world coordinates
+            u_x_world = first_instance_feat[:3]
+            u_z_world = first_instance_feat[3:6]
+            u_y_world = np.cross(u_z_world, u_x_world)
+            u_y_world = u_y_world / np.linalg.norm(u_y_world)
+            R_objw_to_final_nerf_world = np.column_stack([u_x_world, u_y_world, u_z_world])
+
+            # Transform to camera coordinate system (same as debug script)
+            nerf_ccs1_to_orig_nerf_world = get_nerf_ccs_to_orig_nerf_world(Path(image_path).name, transforms_lookup)
+            nerf_ccs1_to_final_nerf_world = T_orig_to_final_nerf_world @ nerf_ccs1_to_orig_nerf_world
+            nerf_ccs1_to_final_nerf_world[:3, 3] *= scale
+
+            R_final_nerf_world_to_nerf_ccs1 = nerf_ccs1_to_final_nerf_world[:3, :3].T
+            R_objw_to_nerf_ccs1 = R_final_nerf_world_to_nerf_ccs1 @ R_objw_to_final_nerf_world
+
+            axes_frame = AxesAnnotator.visualize_rotation_matrix(
+                cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR),
+                mask_center,
+                R_objw_to_nerf_ccs1,
+                axis_length=90,
+                axis_thickness=4
+            )
+            axes_frame = cv2.cvtColor(axes_frame, cv2.COLOR_BGR2RGB)
+
+        # 2. R_x vector visualization
+        R_x_tensor = torch.from_numpy(R_x).float()
+        fg_tensor = torch.from_numpy(fg_mask).float().unsqueeze(-1)
+        rx_rgb = vector_shader(R_x_tensor, valid_mask=fg_tensor)
+        rx_rgb = (rx_rgb * 255).clamp(0, 255).byte().numpy()
+
+        # 3. R_z vector visualization
+        R_z_tensor = torch.from_numpy(R_z).float()
+        rz_rgb = vector_shader(R_z_tensor, valid_mask=fg_tensor)
+        rz_rgb = (rz_rgb * 255).clamp(0, 255).byte().numpy()
+
+        # Stack frames side by side
+        side_by_side = np.hstack([axes_frame, rx_rgb, rz_rgb])
+
+        # Convert to BGR for video
+        frame_bgr = cv2.cvtColor(side_by_side, cv2.COLOR_RGB2BGR)
+        out.write(frame_bgr)
+
+    out.release()
+    assert os.path.exists(video_path), f"Video not created at {video_path}"
+
+
 if __name__ == "__main__":
+    # examine_saved("datasets/f3rm/opt/objaverse/car2/features/orientany_")
+    # examine_saved("datasets/f3rm/opt/objaverse/car2/features/orientany_car")
+
     data_root = Path("datasets/f3rm/opt/objaverse/car2")
     image_dir = data_root / "images"
     image_paths = sorted(list(image_dir.glob("*.jpg")) + list(image_dir.glob("*.png")))
-    image_paths = [str(p) for p in image_paths[8:11]]  # Just 3 for demo
+    image_paths = [str(p) for p in image_paths[:3]]  # Just 3 for demo
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Extract orientation features using global prompts (with debug info)
@@ -421,14 +566,13 @@ if __name__ == "__main__":
             R_z = features[i][..., 3:6]  # R_z vector (next 3 channels)
             conf = features[i][..., 6]  # confidence (7th channel)
 
-            # Convert to RGB using R_x vector components
-            orient_rgb = np.zeros((*fg.shape, 3), dtype=np.uint8)
-            orient_rgb[..., 0] = np.clip((R_x[..., 0] + 1) / 2.0 * 255, 0, 255).astype(np.uint8)  # R: R_x[0]
-            orient_rgb[..., 1] = np.clip((R_x[..., 1] + 1) / 2.0 * 255, 0, 255).astype(np.uint8)  # G: R_x[1]
-            orient_rgb[..., 2] = np.clip((R_x[..., 2] + 1) / 2.0 * 255, 0, 255).astype(np.uint8)  # B: R_x[2]
+            # Convert to RGB using VectorShader
+            vector_shader = VectorShader()
+            R_x_tensor = torch.from_numpy(R_x).float()
+            fg_tensor = torch.from_numpy(fg).float().unsqueeze(-1)
+            orient_rgb = vector_shader(R_x_tensor, valid_mask=fg_tensor)
+            orient_rgb = (orient_rgb * 255).clamp(0, 255).byte().numpy()
 
-            # Only show colors for foreground pixels
-            orient_rgb[~fg.astype(bool)] = 0
             axes[2, i].imshow(orient_rgb)
             axes[2, i].set_title("Orientation RGB (R_x vector)")
         axes[2, i].axis('off')
