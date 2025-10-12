@@ -636,8 +636,8 @@ def visualize_auto_masks_demo(auto_masks_list: List[List[dict]], image_paths: Li
         # Generate and display mask
         inst_mask, _ = SAM2utils.auto_masks_to_instance_mask(
             auto_masks,
-            min_iou=float(pred_iou_thresh),
-            min_area=float(min_mask_region_area),
+            min_iou=float(pred_iou_thresh) if pred_iou_thresh is not None else 0.0,
+            min_area=float(min_mask_region_area) if min_mask_region_area is not None else 0.0,
             assign_by="area",
             start_from="low",
         )

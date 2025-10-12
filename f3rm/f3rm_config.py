@@ -67,7 +67,7 @@ f3rm_method = MethodSpecification(
                 orientany_loss_weight=1e-4,
                 orientany_hidden_dim=64,
                 orientany_num_layers=2,
-                orientany_use_xyz_encoding=True,  # xyz encoding (True) or encoded centroid prediction (False)
+                orientany_use_xyz_encoding=False,  # xyz encoding (True) or encoded centroid prediction (False)
                 enable_orientany_perp_loss=True,
             ),
             steps_per_train_cache_update=0,

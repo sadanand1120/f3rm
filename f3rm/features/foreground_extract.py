@@ -100,8 +100,8 @@ class FOREGROUNDWorker:
         # Instance mask from SAM2
         inst_mask, _ = SAM2utils.auto_masks_to_instance_mask(
             raw_auto_masks,
-            min_iou=float(SAM2Args.pred_iou_thresh),
-            min_area=float(SAM2Args.min_mask_region_area),
+            min_iou=float(SAM2Args.pred_iou_thresh) if SAM2Args.pred_iou_thresh is not None else 0.0,
+            min_area=float(SAM2Args.min_mask_region_area) if SAM2Args.min_mask_region_area is not None else 0.0,
             assign_by="area",
             start_from="low",
         )

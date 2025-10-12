@@ -22,15 +22,18 @@ from f3rm.features.utils import resolve_devices_and_workers, run_async_in_any_co
 class SAM2Args:
     points_per_side: int = 64
     points_per_batch: int = 128
-    pred_iou_thresh: float = 0.8
-    stability_score_thresh: float = 0.9
-    min_mask_region_area: int = 0
+    pred_iou_thresh: float = None
+    stability_score_thresh: float = None
+    stability_score_offset: float = None
+    box_nms_thresh: float = None
+    min_mask_region_area: int = None
+    use_m2m: bool = True
     preset: Optional[str] = "coarse"
     load_size: int = 2048   # final save is still at image size
     model_cfg: str = "/robodata/smodak/repos/sam2/sam2/configs/sam2.1/sam2.1_hiera_l.yaml"
     checkpoint_path: str = "/robodata/smodak/repos/sam2/checkpoints/sam2.1_hiera_large.pt"
     batch_size_per_gpu: int = 4
-    use_object_masks: bool = True
+    use_object_masks: bool = False
 
     @classmethod
     def id_dict(cls):
@@ -40,7 +43,10 @@ class SAM2Args:
             "points_per_batch": cls.points_per_batch,
             "pred_iou_thresh": cls.pred_iou_thresh,
             "stability_score_thresh": cls.stability_score_thresh,
+            "stability_score_offset": cls.stability_score_offset,
+            "box_nms_thresh": cls.box_nms_thresh,
             "min_mask_region_area": cls.min_mask_region_area,
+            "use_m2m": cls.use_m2m,
             "preset": cls.preset,
             "load_size": cls.load_size,
             "model_cfg": cls.model_cfg,
@@ -111,7 +117,10 @@ async def process_single_image_async(image_path: str, sam2: AsyncMultiWrapper, d
         points_per_batch=SAM2Args.points_per_batch,
         pred_iou_thresh=SAM2Args.pred_iou_thresh,
         stability_score_thresh=SAM2Args.stability_score_thresh,
+        stability_score_offset=SAM2Args.stability_score_offset,
         min_mask_region_area=SAM2Args.min_mask_region_area,
+        box_nms_thresh=SAM2Args.box_nms_thresh,
+        use_m2m=SAM2Args.use_m2m,
         output_mode="binary_mask",
     )
     # Upscale to original size if needed using utility
@@ -147,7 +156,10 @@ class SAM2Extractor:
                     points_per_batch=8,
                     pred_iou_thresh=SAM2Args.pred_iou_thresh,
                     stability_score_thresh=SAM2Args.stability_score_thresh,
+                    stability_score_offset=SAM2Args.stability_score_offset,
+                    box_nms_thresh=SAM2Args.box_nms_thresh,
                     min_mask_region_area=0,
+                    use_m2m=SAM2Args.use_m2m,
                     output_mode="binary_mask",
                 )
 
@@ -230,9 +242,9 @@ if __name__ == "__main__":
     # image_dir = "datasets/f3rm/panda/scene_001/images"
     image_dir = "datasets/f3rm/opt/objaverse/car2/images"
     data_dir = Path("datasets/f3rm/opt/objaverse/car2")
-    SAM2Args.use_object_masks = True
+    SAM2Args.use_object_masks = False
     image_paths = sorted(glob.glob(f"{image_dir}/*.jpg") + glob.glob(f"{image_dir}/*.png"))
-    image_paths = image_paths[:10]
+    image_paths = image_paths[32:36]
     print(f"Found {len(image_paths)} images in {image_dir}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
