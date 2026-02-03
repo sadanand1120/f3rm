@@ -588,19 +588,20 @@ class FeatureFieldModel(NerfactoModel):
             orientany_rz = outputs["orientany_rz"]  # (H, W, 3) - already on CPU
             orientany_fg_logits = outputs["orientany_foreground_logits"]  # (H, W, 2) - already on CPU
 
-            # Get foreground mask from predictions
-            orientany_fg_probs = torch.softmax(orientany_fg_logits, dim=-1)
-            orientany_fg_mask = orientany_fg_probs[..., 1] > 0.5  # foreground pixels
+            # Get foreground mask from separate foreground head (not OrientAny foreground head)
+            fg_probs = torch.softmax(outputs["foreground_logits"], dim=-1)
+            fg_mask = fg_probs[..., 1] > 0.5  # foreground pixels
 
             # OrientAny foreground visualization
+            orientany_fg_probs = torch.softmax(orientany_fg_logits, dim=-1)
             outputs["orientany_foreground_prob_rgb"] = self.prob_from_probs_shader(orientany_fg_probs[..., 1:2])
 
             # R_x vector visualization (rainbow colormap)
-            orientany_rx_rgb = self.vector_shader(orientany_rx, orientany_fg_mask.unsqueeze(-1))
+            orientany_rx_rgb = self.vector_shader(orientany_rx, fg_mask.unsqueeze(-1))
             outputs["orientany_rx_rgb"] = orientany_rx_rgb
 
             # R_z vector visualization (rainbow colormap)
-            orientany_rz_rgb = self.vector_shader(orientany_rz, orientany_fg_mask.unsqueeze(-1))
+            orientany_rz_rgb = self.vector_shader(orientany_rz, fg_mask.unsqueeze(-1))
             outputs["orientany_rz_rgb"] = orientany_rz_rgb
 
         # Nothing else to do if not CLIP features or no positives

@@ -21,7 +21,8 @@ dependencies = [
     "gdown",
     "matplotlib",
     # Last release before v1.0.0 which breaks things
-    "nerfstudio==0.3.4",
+    # "nerfstudio==0.3.4",
+    "nerfstudio==1.1.5",
     "numpy",
     "pillow",
     "regex",
@@ -36,7 +37,7 @@ dev = [
 ]
 robot = [
     "open3d",
-    "params-proto",
+    "params-proto<3.0.0",  # v3.x has breaking API changes
     "PyMCubes",
     "python-slugify",
     "viser",

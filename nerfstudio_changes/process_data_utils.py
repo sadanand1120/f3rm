@@ -15,6 +15,7 @@
 """Helper utils for processing data into the nerfstudio format."""
 
 import math
+import random
 import re
 import shutil
 import sys
@@ -24,8 +25,13 @@ from typing import List, Literal, Optional, OrderedDict, Tuple, Union
 
 import cv2
 import imageio
+
+try:
+    import rawpy
+except ImportError:
+    import newrawpy as rawpy  # type: ignore
+
 import numpy as np
-import rawpy
 
 from nerfstudio.utils.rich_utils import CONSOLE, status
 from nerfstudio.utils.scripts import run_command
@@ -44,25 +50,31 @@ class CameraModel(Enum):
     OPENCV = "OPENCV"
     OPENCV_FISHEYE = "OPENCV_FISHEYE"
     EQUIRECTANGULAR = "EQUIRECTANGULAR"
+    PINHOLE = "PINHOLE"
+    SIMPLE_PINHOLE = "SIMPLE_PINHOLE"
 
 
 CAMERA_MODELS = {
     "perspective": CameraModel.OPENCV,
     "fisheye": CameraModel.OPENCV_FISHEYE,
     "equirectangular": CameraModel.EQUIRECTANGULAR,
+    "pinhole": CameraModel.PINHOLE,
+    "simple_pinhole": CameraModel.SIMPLE_PINHOLE,
 }
 
 
-def list_images(data: Path) -> List[Path]:
+def list_images(data: Path, recursive: bool = True) -> List[Path]:
     """Lists all supported images in a directory
 
     Args:
         data: Path to the directory of images.
+        recursive: Whether to search check nested folders in `data`.
     Returns:
         Paths to images contained in the directory
     """
     allowed_exts = [".jpg", ".jpeg", ".png", ".tif", ".tiff"] + ALLOWED_RAW_EXTS
-    image_paths = sorted([p for p in data.glob("[!.]*") if p.suffix.lower() in allowed_exts])
+    glob_str = "**/[!.]*" if recursive else "[!.]*"
+    image_paths = sorted([p for p in data.glob(glob_str) if p.suffix.lower() in allowed_exts])
     return image_paths
 
 
@@ -115,6 +127,7 @@ def convert_video_to_images(
     verbose: bool = False,
     image_prefix: str = "frame_",
     keep_image_dir: bool = False,
+    random_seed: Optional[int] = None,
 ) -> Tuple[List[str], int]:
     """Converts a video into a sequence of images.
 
@@ -127,6 +140,7 @@ def convert_video_to_images(
         verbose: If True, logs the output of the command.
         image_prefix: Prefix to use for the image filenames.
         keep_image_dir: If True, don't delete the output directory if it already exists.
+        random_seed: If set, the seed used to choose the frames of the video
     Returns:
         A tuple containing summary of the conversion and the number of extracted frames.
     """
@@ -191,8 +205,6 @@ def convert_video_to_images(
             start_y = crop_factor[0]
             crop_cmd = f"crop=w=iw*{width}:h=ih*{height}:x=iw*{start_x}:y=ih*{start_y},"
 
-        spacing = num_frames // num_frames_target
-
         downscale_chains = [f"[t{i}]scale=iw/{2**i}:ih/{2**i}[out{i}]" for i in range(num_downscales + 1)]
         downscale_dirs = [Path(str(image_dir) + (f"_{2**i}" if i > 0 else "")) for i in range(num_downscales + 1)]
         downscale_paths = [downscale_dirs[i] / f"{image_prefix}%05d.png" for i in range(num_downscales + 1)]
@@ -209,8 +221,15 @@ def convert_video_to_images(
 
         ffmpeg_cmd += " -vsync vfr"
 
-        if spacing > 1:
-            CONSOLE.print("Number of frames to extract:", math.ceil(num_frames / spacing))
+        # Evenly distribute frame selection if random seed does not exist
+        spacing = num_frames // num_frames_target
+        if random_seed:
+            random.seed(random_seed)
+            frame_indices = sorted(random.sample(range(num_frames), num_frames_target))
+            select_cmd = "select='" + "+".join([f"eq(n\,{idx})" for idx in frame_indices]) + "',setpts=N/TB,"
+            CONSOLE.print(f"Extracting {num_frames_target} frames using seed {random_seed} random selection.")
+        elif spacing > 1:
+            CONSOLE.print(f"Extracting {math.ceil(num_frames / spacing)} frames in evenly spaced intervals")
             select_cmd = f"thumbnail={spacing},setpts=N/TB,"
         else:
             CONSOLE.print("[bold red]Can't satisfy requested number of frames. Extracting all frames.")
@@ -319,7 +338,7 @@ def copy_images_list(
     # (Unfortunately, that is much slower.)
     for framenum in range(1, (1 if same_dimensions else num_frames) + 1):
         framename = f"{image_prefix}%05d" if same_dimensions else f"{image_prefix}{framenum:05d}"
-        ffmpeg_cmd = f'ffmpeg -y -noautorotate -i "{image_dir / f"{framename}{copied_image_paths[0].suffix}"}" -q:v 2 '
+        ffmpeg_cmd = f'ffmpeg -y -noautorotate -i "{image_dir / f"{framename}{copied_image_paths[0].suffix}"}" '
 
         crop_cmd = ""
         if crop_border_pixels is not None:
@@ -337,7 +356,7 @@ def copy_images_list(
 
         downscale_cmd = f' -filter_complex "{select_cmd}{crop_cmd}{downscale_chain}"' + "".join(
             [
-                f' -map "[out{i}]" "{downscale_dirs[i] / f"{framename}{copied_image_paths[0].suffix}"}"'
+                f' -map "[out{i}]" -q:v 2 "{downscale_dirs[i] / f"{framename}{copied_image_paths[0].suffix}"}"'
                 for i in range(num_downscales + 1)
             ]
         )
@@ -376,7 +395,11 @@ def copy_and_upscale_polycam_depth_maps_list(
     depth_dir.mkdir(parents=True, exist_ok=True)
 
     # copy and upscale them to new directory
-    with status(msg="[bold yellow] Upscaling depth maps...", spinner="growVertical", verbose=verbose):
+    with status(
+        msg="[bold yellow] Upscaling depth maps...",
+        spinner="growVertical",
+        verbose=verbose,
+    ):
         upscale_factor = 2**POLYCAM_UPSCALING_TIMES
         assert upscale_factor > 1
         assert isinstance(upscale_factor, int)
@@ -461,7 +484,11 @@ def downscale_images(
     if num_downscales == 0:
         return "No downscaling performed."
 
-    with status(msg="[bold yellow]Downscaling images...", spinner="growVertical", verbose=verbose):
+    with status(
+        msg="[bold yellow]Downscaling images...",
+        spinner="growVertical",
+        verbose=verbose,
+    ):
         downscale_factors = [2**i for i in range(num_downscales + 1)[1:]]
         for downscale_factor in downscale_factors:
             assert downscale_factor > 1
@@ -501,7 +528,16 @@ def find_tool_feature_matcher_combination(
         "disk",
     ],
     matcher_type: Literal[
-        "any", "NN", "superglue", "superglue-fast", "NN-superpoint", "NN-ratio", "NN-mutual", "adalam"
+        "any",
+        "NN",
+        "superglue",
+        "superglue-fast",
+        "NN-superpoint",
+        "NN-ratio",
+        "NN-mutual",
+        "adalam",
+        "disk+lightglue",
+        "superpoint+lightglue",
     ],
 ) -> Union[
     Tuple[None, None, None],
@@ -517,7 +553,17 @@ def find_tool_feature_matcher_combination(
             "sosnet",
             "disk",
         ],
-        Literal["NN", "superglue", "superglue-fast", "NN-superpoint", "NN-ratio", "NN-mutual", "adalam"],
+        Literal[
+            "NN",
+            "superglue",
+            "superglue-fast",
+            "NN-superpoint",
+            "NN-ratio",
+            "NN-mutual",
+            "adalam",
+            "disk+lightglue",
+            "superpoint+lightglue",
+        ],
     ],
 ]:
     """Find a valid combination of sfm tool, feature type, and matcher type.
@@ -605,7 +651,10 @@ def generate_crop_mask(height: int, width: int, crop_factor: Tuple[float, float,
 
 
 def generate_mask(
-    height: int, width: int, crop_factor: Tuple[float, float, float, float], percent_radius: float
+    height: int,
+    width: int,
+    crop_factor: Tuple[float, float, float, float],
+    percent_radius: float,
 ) -> Optional[np.ndarray]:
     """generate a mask of the given size.
 

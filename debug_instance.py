@@ -5,7 +5,7 @@ from PIL import Image
 import matplotlib.pyplot as plt
 from sam2.features.utils import SAM2utils
 from sam2.features.clip_main import CLIPfeatures
-from f3rm.features.utils import LazyFeatures, SAM2LazyAutoMasks
+from f3rm.features.utils import BatchFeatureLoader
 from f3rm.features.sam2_extract import SAM2Args
 
 
@@ -13,11 +13,25 @@ class CLIPSAMInstanceSegmenter:
     def __init__(self, data_dir: str):
         self.data_dir = Path(data_dir)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Load image filenames from metadata
         feat_root = self.data_dir / "features"
         clip_meta = torch.load(feat_root / "clip" / "meta.pt")
         self.feat_image_fnames = clip_meta["image_fnames"]
-        self.clip_features = LazyFeatures(sorted(feat_root.glob("clip/chunk_*.npy")))
-        self.sam2_masks = SAM2LazyAutoMasks(sorted(feat_root.glob("sam2/chunk_*.npz")))
+
+        # Use new BatchFeatureLoader system
+        self.clip_features = BatchFeatureLoader(
+            data_dir=self.data_dir,
+            feature_type="CLIP",
+            image_fnames=self.feat_image_fnames,
+            device=self.device
+        )
+        self.sam2_masks = BatchFeatureLoader(
+            data_dir=self.data_dir,
+            feature_type="SAM2",
+            image_fnames=self.feat_image_fnames,
+            device=self.device
+        )
         self.clip_model = CLIPfeatures(device=self.device)
 
     def _filter_sam2_inst_mask(self, inst_mask: np.ndarray, min_instance_percent: float) -> np.ndarray:
@@ -36,8 +50,8 @@ class CLIPSAMInstanceSegmenter:
             return []
         inst_mask, _ = SAM2utils.auto_masks_to_instance_mask(
             auto_masks,
-            min_iou=float(SAM2Args.pred_iou_thresh),
-            min_area=float(SAM2Args.min_mask_region_area),
+            min_iou=float(SAM2Args.pred_iou_thresh) if SAM2Args.pred_iou_thresh is not None else 0.0,
+            min_area=float(SAM2Args.min_mask_region_area) if SAM2Args.min_mask_region_area is not None else 0.0,
             assign_by="area",
             start_from="low",
         )
@@ -83,11 +97,11 @@ class CLIPSAMInstanceSegmenter:
 
         segment_sim_maps = []
         for text_prompt in text_prompts:
-            text_emb = self.clip_model.encode_text(text_prompt)
-            neg_text_embs = torch.stack([self.clip_model.encode_text(neg_text) for neg_text in negative_texts], dim=0)
+            text_emb = self.clip_model.encode_text(text_prompt).half()
+            neg_text_embs = torch.stack([self.clip_model.encode_text(neg_text).half() for neg_text in negative_texts], dim=0)
             sim_map = self.clip_model.compute_similarity(clip_patch_feats, text_emb, neg_text_embs=neg_text_embs,
                                                          softmax_temp=softmax_temp, normalize=True)
-            sim_map_upscaled = np.array(Image.fromarray(sim_map.cpu().numpy()).resize((w, h), Image.BILINEAR))
+            sim_map_upscaled = np.array(Image.fromarray(sim_map.cpu().numpy().astype(np.float32)).resize((w, h), Image.BILINEAR))
 
             segment_sim_map = np.zeros_like(sim_map_upscaled)
             for mask_dict in auto_masks:
@@ -119,17 +133,18 @@ class CLIPSAMInstanceSegmenter:
 
 
 if __name__ == "__main__":
-    DATA_DIR = "datasets/f3rm/custom/betaipad/small"
-    IMAGE_PATH = "datasets/f3rm/custom/betaipad/small/images/frame_00043.png"
-    TEXT_PROMPTS = ['ipad']
+    DATA_DIR = "datasets/f3rm/opt/betaipad/small"
+    IMAGE_PATH = "datasets/f3rm/opt/betaipad/small/images/frame_00115.png"
+    TEXT_PROMPTS = ['table']
     NEGATIVE_TEXTS = ["object", "floor", "wall"]
     SOFTMAX_TEMP = 0.01
-    MIN_INSTANCE_PERCENT = 1.0
-    TOP_MEAN_PERCENT = 5
-    SIM_THRESH = 0.4
+    MIN_INSTANCE_PERCENT = 10.0
+    TOP_MEAN_PERCENT = 15
+    SIM_THRESH = 0.7
 
     segmenter = CLIPSAMInstanceSegmenter(DATA_DIR)
     feat_image_index = segmenter.feat_image_fnames.index(IMAGE_PATH)
+    # Load SAM2 masks from BatchFeatureLoader (already unpacked)
     raw_auto_masks = segmenter.sam2_masks[feat_image_index]
     prefiltered_masks = segmenter.prefilter_and_pack_auto_masks(raw_auto_masks, MIN_INSTANCE_PERCENT)
     filtered_auto_masks = segmenter.filter_auto_masks_by_similarity(
@@ -149,8 +164,8 @@ if __name__ == "__main__":
 
     # Generate and display mask
     filtered_inst_mask, _ = SAM2utils.auto_masks_to_instance_mask(filtered_auto_masks,
-                                                                  min_iou=float(SAM2Args.pred_iou_thresh),
-                                                                  min_area=float(SAM2Args.min_mask_region_area),
+                                                                  min_iou=float(SAM2Args.pred_iou_thresh) if SAM2Args.pred_iou_thresh is not None else 0.0,
+                                                                  min_area=float(SAM2Args.min_mask_region_area) if SAM2Args.min_mask_region_area is not None else 0.0,
                                                                   assign_by="area", start_from="low")
     if filtered_inst_mask is None:
         # No valid masks found, create empty instance mask

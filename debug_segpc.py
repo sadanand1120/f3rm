@@ -178,14 +178,18 @@ def create_frustum_mesh(scale: float = 1.0) -> o3d.geometry.TriangleMesh:
 
 
 @torch.no_grad()
-def process_single_image_pointcloud(segmenter, clip_model, image_path, text_prompt, negative_texts, softmax_temp, min_instance_percent, top_mean_percent, pc_thresh, device, render_features: bool = False, render_centroid: bool = True, render_spread: bool = True, render_foreground: bool = True):
+def process_single_image_pointcloud(segmenter, clip_model, image_path, text_prompt, negative_texts, softmax_temp, min_instance_percent, top_mean_percent, pc_thresh, device, render_features: bool = False, render_orientany: bool = True):
     feat_image_index, image_path, split, local_cam_idx = segmenter.get_cam_info(image_path=image_path)
     clip_patch_feats = segmenter.clip_features[feat_image_index].to(device)
-    text_emb = clip_model.encode_text(text_prompt)
-    neg_text_embs = torch.stack([clip_model.encode_text(neg_text) for neg_text in negative_texts], dim=0)
+    text_emb = clip_model.encode_text(text_prompt).half()
+    neg_text_embs = torch.stack([clip_model.encode_text(neg_text).half() for neg_text in negative_texts], dim=0)
     sim_map = clip_model.compute_similarity(clip_patch_feats, text_emb, neg_text_embs=neg_text_embs, softmax_temp=softmax_temp, normalize=True)
+    # Load SAM2 masks from BatchFeatureLoader (already unpacked)
     auto_masks = segmenter.sam2_masks[feat_image_index]
-    inst_mask, _ = SAM2utils.auto_masks_to_instance_mask(auto_masks, min_iou=float(SAM2Args.pred_iou_thresh), min_area=float(SAM2Args.min_mask_region_area), assign_by="area", start_from="low")
+    inst_mask, _ = SAM2utils.auto_masks_to_instance_mask(auto_masks,
+                                                         min_iou=float(SAM2Args.pred_iou_thresh) if SAM2Args.pred_iou_thresh is not None else 0.0,
+                                                         min_area=float(SAM2Args.min_mask_region_area) if SAM2Args.min_mask_region_area is not None else 0.0,
+                                                         assign_by="area", start_from="low")
     if inst_mask is None:
         # No valid masks found, create empty instance mask
         if auto_masks:
@@ -196,35 +200,38 @@ def process_single_image_pointcloud(segmenter, clip_model, image_path, text_prom
             h, w = img.height, img.width
         inst_mask = np.zeros((h, w), dtype=np.uint16)
     inst_mask = segmenter.filter_sam2_inst_mask(inst_mask, min_instance_percent)
-    sim_map_upscaled = np.array(Image.fromarray(sim_map.cpu().numpy()).resize((inst_mask.shape[1], inst_mask.shape[0]), Image.BILINEAR))
+    sim_map_upscaled = np.array(Image.fromarray(sim_map.cpu().numpy().astype(np.float32)).resize((inst_mask.shape[1], inst_mask.shape[0]), Image.BILINEAR))
     segment_sim_map = segmenter.compute_segment_similarity(sim_map_upscaled, inst_mask, top_mean_percent)
     pipeline_outputs, camera_ray_bundle, optimized_c2w = segmenter.get_pipeline_outputs(
         split,
         local_cam_idx,
         render_features=render_features,
-        render_centroid=render_centroid,
-        render_spread=render_spread,
-        render_foreground=render_foreground,
+        render_orientany=render_orientany,
     )
     points_3d, colors_3d = segmenter.generate_pointcloud_from_clipsam(segment_sim_map, pipeline_outputs["depth_raw"], camera_ray_bundle, pipeline_outputs["pred_rgb"], pc_thresh=pc_thresh)
-    centroid_pred = pipeline_outputs.get("centroid_pred", None)
+    centroid_pred = pipeline_outputs["centroid_pred"]  # Always available now
     pred_centroids_per_instance: list[np.ndarray] = []
-    if centroid_pred is not None:
-        binary_mask = (segment_sim_map > pc_thresh)
-        # Build instance mask (same as earlier computation)
-        auto_masks = segmenter.sam2_masks[feat_image_index]
-        inst_mask, _ = SAM2utils.auto_masks_to_instance_mask(auto_masks, min_iou=float(SAM2Args.pred_iou_thresh), min_area=float(SAM2Args.min_mask_region_area), assign_by="area", start_from="low")
-        if inst_mask is None:
-            inst_mask = np.zeros_like(binary_mask, dtype=np.uint16)
-        inst_ids = np.unique(inst_mask)
-        for inst_id in inst_ids:
-            if inst_id <= 0:
-                continue
-            seg_mask = (inst_mask == inst_id) & binary_mask
-            if np.any(seg_mask):
-                preds = centroid_pred[seg_mask].cpu().numpy()
-                if preds.size > 0:
-                    pred_centroids_per_instance.append(preds)
+    binary_mask = (segment_sim_map > pc_thresh)
+    # Build instance mask (same as earlier computation)
+    # Load SAM2 masks from BatchFeatureLoader (already unpacked)
+    auto_masks = segmenter.sam2_masks[feat_image_index]
+    inst_mask, _ = SAM2utils.auto_masks_to_instance_mask(auto_masks,
+                                                        min_iou=float(SAM2Args.pred_iou_thresh) if SAM2Args.pred_iou_thresh is not None else 0.0,
+                                                        min_area=float(SAM2Args.min_mask_region_area) if SAM2Args.min_mask_region_area is not None else 0.0,
+                                                        assign_by="area",
+                                                        start_from="low",
+                                                        )
+    if inst_mask is None:
+        inst_mask = np.zeros_like(binary_mask, dtype=np.uint16)
+    inst_ids = np.unique(inst_mask)
+    for inst_id in inst_ids:
+        if inst_id <= 0:
+            continue
+        seg_mask = (inst_mask == inst_id) & binary_mask
+        if np.any(seg_mask):
+            preds = centroid_pred[seg_mask].cpu().numpy().astype(np.float32)
+            if preds.size > 0:
+                pred_centroids_per_instance.append(preds)
     return points_3d, colors_3d, optimized_c2w, pred_centroids_per_instance
 
 
@@ -304,32 +311,36 @@ def visualize_clipsam_pointcloud(data_dir: str):
 
 
 if __name__ == "__main__":
+    # INPUT_IMAGES = [
+    #     "datasets/f3rm/opt/betamulti1/small/images/frame_00176.png",  # 1, 71, 91, 101 for book; 43, 74, 91, 115 for ipad
+    #     # "datasets/f3rm/custom/betaipad/small/images/frame_00074.png",  # 3, 66, 92, 105 for table in betabook_small
+    #     # "datasets/f3rm/custom/betaipad/small/images/frame_00091.png",
+    #     # "datasets/f3rm/custom/betaipad/small/images/frame_00115.png",
+    # ]
     INPUT_IMAGES = [
-        "datasets/f3rm/custom/betamulti1/small/images/frame_00037.png",  # 1, 71, 91, 101 for book; 43, 74, 91, 115 for ipad
-        # "datasets/f3rm/custom/betaipad/small/images/frame_00074.png",  # 3, 66, 92, 105 for table in betabook_small
-        # "datasets/f3rm/custom/betaipad/small/images/frame_00091.png",
-        # "datasets/f3rm/custom/betaipad/small/images/frame_00115.png",
+        "datasets/f3rm/opt/betaipad/small/images/frame_00043.png",
+        "datasets/f3rm/opt/betaipad/small/images/frame_00074.png",
+        "datasets/f3rm/opt/betaipad/small/images/frame_00091.png",
+        "datasets/f3rm/opt/betaipad/small/images/frame_00115.png",
     ]
-    CONFIG_PATH = "cent7_outputs/betam1_small_cstext_lang32_loss8e3_trunk0F_fg64x2/f3rm/2025-08-27_152754/config.yml"
+    CONFIG_PATH = "centopt1_outputs/bipad_small_cstext_noori_emasched/f3rm/2025-09-10_120343/config.yml"
     DATA_DIR = Path(INPUT_IMAGES[0]).parent.parent
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    TEXT_PROMPT = "notebook"
+    TEXT_PROMPT = "ipad"
     NEGATIVE_TEXTS = ["object", "floor", "wall"]
     SOFTMAX_TEMP = 0.01
     MIN_INSTANCE_PERCENT = 1.0
-    TOP_MEAN_PERCENT = 15
+    TOP_MEAN_PERCENT = 5
 
-    PC_THRESH = 0.7  # 0.7 for book, 0.4 for ipad
+    PC_THRESH = 0.4  # 0.7 for book, 0.4 for ipad
     OUTPUT_DIR = Path("clipsam_pointcloud_output")
     MEAN_POINT_SCALE, FRUSTUM_SCALE = -80, 0.4  # MEAN_POINT_SCALE: -bla for dynamic sizing based on pointcloud spread bla%, otherwise fixed radius
     POINTCLOUD_POINT_SIZE, POINTCLOUD_OPACITY = 1.0, 0.6
     SHOW_PC = True
     SHOW_PRED_CENTROIDS = True
     RENDER_FEATURES = False
-    RENDER_CENTROID = True
-    RENDER_SPREAD = True
-    RENDER_FOREGROUND = False
+    RENDER_ORIENTANY = False
     SPHERE_FROM_PRED = True  # False: spheres at GT mean of points; True: spheres at mean of predicted centroids
 
     segmenter = CLIPSAMSegmenter(data_dir=DATA_DIR, config_path=CONFIG_PATH, debug=False)
@@ -349,7 +360,7 @@ if __name__ == "__main__":
         points_3d, colors_3d, camera_pose, pred_centroids_per_instance = process_single_image_pointcloud(
             segmenter, clip_model, image_path, TEXT_PROMPT, NEGATIVE_TEXTS,
             SOFTMAX_TEMP, MIN_INSTANCE_PERCENT, TOP_MEAN_PERCENT, PC_THRESH, DEVICE,
-            render_features=RENDER_FEATURES, render_centroid=RENDER_CENTROID, render_spread=RENDER_SPREAD, render_foreground=RENDER_FOREGROUND
+            render_features=RENDER_FEATURES, render_orientany=RENDER_ORIENTANY
         )
         if len(points_3d) > 0:
             sampled_points, sampled_colors = downsample_points(points_3d, colors_3d, len(INPUT_IMAGES))

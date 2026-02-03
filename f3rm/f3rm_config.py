@@ -25,7 +25,7 @@ f3rm_method = MethodSpecification(
         steps_per_eval_all_images=100000,  # HACK TODO: for rapid testing, since its too slow
         save_only_latest_checkpoint=True,
         steps_per_save=5000,
-        max_num_iterations=30000,
+        max_num_iterations=80000,
         mixed_precision=True,
         pipeline=FeaturePipelineConfig(
             datamanager=FeatureDataManagerConfig(
@@ -37,18 +37,14 @@ f3rm_method = MethodSpecification(
                 gpu_feature_cache_images=128,
                 dataparser=NerfstudioDataParserConfig(train_split_fraction=0.95),
                 train_num_rays_per_batch=1 << 13,
-                train_num_images_to_sample_from=64,
-                train_num_times_to_repeat_images=512,
+                train_num_images_to_sample_from=32,
+                train_num_times_to_repeat_images=1024,
                 eval_num_rays_per_batch=1 << 12,
-                eval_num_images_to_sample_from=64,
-                eval_num_times_to_repeat_images=512,
-                camera_optimizer=CameraOptimizerConfig(
-                    mode="SO3xR3",    # "SO3xR3" or "off"
-                    optimizer=AdamOptimizerConfig(lr=1e-4, eps=1e-8, weight_decay=0.0, max_norm=0.5),
-                    scheduler=ExponentialDecaySchedulerConfig(lr_final=1e-5, warmup_steps=3000, max_steps=15000),
-                ),
+                eval_num_images_to_sample_from=32,
+                eval_num_times_to_repeat_images=1024,
             ),
             model=FeatureFieldModelConfig(
+                camera_optimizer=CameraOptimizerConfig(mode="SO3xR3"),  # "SO3xR3" or "off"
                 eval_num_rays_per_chunk=1 << 14,
                 predict_normals=True,
                 num_proposal_iterations=2,  # May reduce proposal iterations for speed
@@ -56,8 +52,8 @@ f3rm_method = MethodSpecification(
                 centroid_hidden_dim=64,
                 centroid_num_layers=2,
                 centroid_min_accum=0.0,   # TODO: maybe make it 0.3 for more better filtering
-                centroid_blend_after_steps=17000,
-                centroid_blend_until_steps=34000,
+                centroid_blend_after_steps=34000,
+                centroid_blend_until_steps=52000,
                 centroid_blend_start_value=0.0,
                 centroid_blend_end_value=1.0,
                 foreground_loss_weight=1e-3,
@@ -71,7 +67,7 @@ f3rm_method = MethodSpecification(
                 enable_orientany_perp_loss=True,
             ),
             steps_per_train_cache_update=0,
-            train_cache_cold_start_skip_steps=3000,
+            train_cache_cold_start_skip_steps=6000,
             steps_per_train_image_viz=8000,
         ),
         optimizers={
@@ -86,6 +82,10 @@ f3rm_method = MethodSpecification(
             "feature_field": {
                 "optimizer": AdamOptimizerConfig(lr=5e-3, eps=1e-15, max_norm=1.0),
                 "scheduler": ExponentialDecaySchedulerConfig(lr_final=6e-5, warmup_steps=1000, max_steps=28000),
+            },
+            "camera_opt": {
+                "optimizer": AdamOptimizerConfig(lr=1e-4, eps=1e-8, weight_decay=0.0, max_norm=0.5),
+                "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-5, warmup_steps=3000, max_steps=15000),
             },
         },
         viewer=ViewerConfig(num_rays_per_chunk=1 << 15),

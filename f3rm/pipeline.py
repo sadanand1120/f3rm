@@ -99,16 +99,7 @@ class FeaturePipeline(VanillaPipeline):
         self._maybe_update_train_centroid_cache(batch, step)
         model_outputs = self._model(ray_bundle)  # train distributed data parallel model if world_size > 1
         metrics_dict = self.model.get_metrics_dict(model_outputs, batch)
-
-        if self.config.datamanager.camera_optimizer is not None:
-            camera_opt_param_group = self.config.datamanager.camera_optimizer.param_group
-            if camera_opt_param_group in self.datamanager.get_param_groups():
-                metrics_dict["camera_opt_translation"] = (
-                    self.datamanager.get_param_groups()[camera_opt_param_group][0].data[:, :3].norm()
-                )
-                metrics_dict["camera_opt_rotation"] = (
-                    self.datamanager.get_param_groups()[camera_opt_param_group][0].data[:, 3:].norm()
-                )
+        # Note: camera_optimizer metrics are now added by model.get_metrics_dict() via NerfactoModel
 
         # Compute loss (centroid loss only applies after cold start and when cache exists)
         loss_dict = self.model.get_loss_dict(model_outputs, batch, metrics_dict)
@@ -229,7 +220,7 @@ class FeaturePipeline(VanillaPipeline):
         cams = self.datamanager.train_ray_generator.cameras
         # camera_opt_to_camera transform for this camera; broadcasted inside generate_rays
         c_tensor = torch.tensor([camera_index], device=cams.device)
-        camera_opt_to_camera = self.datamanager.train_camera_optimizer(c_tensor)
+        camera_opt_to_camera = self.model.camera_optimizer(c_tensor)
         camera_ray_bundle = cams.generate_rays(camera_indices=int(camera_index), camera_opt_to_camera=camera_opt_to_camera)
         # Progress for single image render (cache rendering doesn't need gradients)
         with torch.no_grad():
@@ -507,7 +498,7 @@ class FeaturePipeline(VanillaPipeline):
         # Build full-image ray bundle for the selected train camera
         cams = self.datamanager.train_ray_generator.cameras
         c_tensor = torch.tensor([ci], device=cams.device)
-        camera_opt_to_camera = self.datamanager.train_camera_optimizer(c_tensor)
+        camera_opt_to_camera = self.model.camera_optimizer(c_tensor)
         camera_ray_bundle = cams.generate_rays(camera_indices=ci, camera_opt_to_camera=camera_opt_to_camera)
         # Render outputs with a small progress bar (use no_grad for memory efficiency)
         with torch.no_grad():

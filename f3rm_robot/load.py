@@ -106,7 +106,7 @@ def load_nerfstudio_outputs(exp_config_path: str) -> LoadState:
 
     # Load and apply the camera optimizer offset. It's slightly confusing, as the final Nerfstudio model actually
     # lives in the 'offset' coordinate system, but we will call it nerf_to_world for simplicity.
-    nerf_to_offset = load_nerf_to_offset(camera_optimizer=pipeline.datamanager.train_camera_optimizer)
+    nerf_to_offset = load_nerf_to_offset(camera_optimizer=pipeline.model.camera_optimizer)
     nerf_to_offset = nerf_to_offset.to(pipeline.device)
     offset_to_nerf = nerf_to_offset.inverse()
 

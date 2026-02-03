@@ -1,7 +1,12 @@
 colmap model_converter --input_path sparse/0 --output_path sparse/0_text --output_type TXT
 
 
-ffmpeg -i video.MOV -vf "scale=iw/2:ih/2:flags=lanczos" -c:v libx264 -crf 20 -preset fast -pix_fmt yuv420p -an video_downsized2x.mp4
+
+ffmpeg -i video.MOV -vf "scale=iw/1.5:ih/1.5:flags=lanczos" -c:v libx264 -crf 20 -preset fast -pix_fmt yuv420p -an video_downsized.mp4
+
+mkdir -p images_out && mogrify -path images_out -filter Lanczos -resize "66.66%" images/*.png
+
+ls | sort | awk 'NR % 2 == 0' | xargs -d '\n' rm
 
 
 export HLOC_WORKERS=24 && export CUDA_VISIBLE_DEVICES='0' && export HLOC_LOG_LEVEL=3 && ns-process-data images --data datasets/f3rm/custom/besthome/rawdata/rgb --output-dir datasets/f3rm/custom/besthome/besthome_colmap_all --matching-method vocab_tree --sfm-tool hloc --feature-type superpoint_inloc --matcher-type superglue --num-downscales 0 --no-skip-colmap --no-skip-image-processing --gpu --same-dimensions --verbose --use-sfm-depth

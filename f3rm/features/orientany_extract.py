@@ -439,41 +439,51 @@ def examine_saved(orientany_feat_dir: str):
         R_x = full_features[..., :3]
         R_z = full_features[..., 3:6]
 
-        # Create three visualizations, TODO: generalize to multiple instances
-        # 1. Axes visualization (use first instance for center)
-        ys, xs = np.where(fg_mask)
-        mask_center = (int(xs.mean()), int(ys.mean()))
+        # Create three visualizations
+        # 1. Axes visualization (per instance)
+        axes_frame = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)  # Convert to BGR once at start
 
-        # Get rotation matrix from first instance (transform from final NeRF world to camera coords)
-        axes_frame = img_array.copy()
-        if instance_features:
-            first_instance_feat = list(instance_features.values())[0]
-            if isinstance(first_instance_feat, list):
-                first_instance_feat = np.array(first_instance_feat, dtype=np.float16)
+        # Get camera transform for this image (same for all instances)
+        nerf_ccs1_to_orig_nerf_world = get_nerf_ccs_to_orig_nerf_world(Path(image_path).name, transforms_lookup)
+        nerf_ccs1_to_final_nerf_world = T_orig_to_final_nerf_world @ nerf_ccs1_to_orig_nerf_world
+        nerf_ccs1_to_final_nerf_world[:3, 3] *= scale
+        R_final_nerf_world_to_nerf_ccs1 = nerf_ccs1_to_final_nerf_world[:3, :3].T
+
+        # Draw axes for each instance
+        for instance_id, instance_feat in instance_features.items():
+            instance_id = int(instance_id)
+            if isinstance(instance_feat, list):
+                instance_feat = np.array(instance_feat, dtype=np.float16)
+
+            # Get instance mask
+            instance_mask = (pixel_data[..., 2] == instance_id)
+            if not np.any(instance_mask):
+                continue
+
+            # Calculate instance center
+            ys, xs = np.where(instance_mask)
+            instance_center = (int(xs.mean()), int(ys.mean()))
 
             # Stored features are in final NeRF world coordinates
-            u_x_world = first_instance_feat[:3]
-            u_z_world = first_instance_feat[3:6]
+            u_x_world = instance_feat[:3]
+            u_z_world = instance_feat[3:6]
             u_y_world = np.cross(u_z_world, u_x_world)
             u_y_world = u_y_world / np.linalg.norm(u_y_world)
             R_objw_to_final_nerf_world = np.column_stack([u_x_world, u_y_world, u_z_world])
 
-            # Transform to camera coordinate system (same as debug script)
-            nerf_ccs1_to_orig_nerf_world = get_nerf_ccs_to_orig_nerf_world(Path(image_path).name, transforms_lookup)
-            nerf_ccs1_to_final_nerf_world = T_orig_to_final_nerf_world @ nerf_ccs1_to_orig_nerf_world
-            nerf_ccs1_to_final_nerf_world[:3, 3] *= scale
-
-            R_final_nerf_world_to_nerf_ccs1 = nerf_ccs1_to_final_nerf_world[:3, :3].T
+            # Transform to camera coordinate system
             R_objw_to_nerf_ccs1 = R_final_nerf_world_to_nerf_ccs1 @ R_objw_to_final_nerf_world
 
+            # Draw axes for this instance (axes_frame is already in BGR format)
             axes_frame = AxesAnnotator.visualize_rotation_matrix(
-                cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR),
-                mask_center,
+                axes_frame,  # Already BGR, no conversion needed
+                instance_center,
                 R_objw_to_nerf_ccs1,
-                axis_length=90,
+                axis_length=70,  # Smaller axes to avoid crowding
                 axis_thickness=4
             )
-            axes_frame = cv2.cvtColor(axes_frame, cv2.COLOR_BGR2RGB)
+
+        axes_frame = cv2.cvtColor(axes_frame, cv2.COLOR_BGR2RGB)  # Convert back to RGB once at end
 
         # 2. R_x vector visualization
         R_x_tensor = torch.from_numpy(R_x).float()
@@ -499,7 +509,6 @@ def examine_saved(orientany_feat_dir: str):
 
 if __name__ == "__main__":
     # examine_saved("datasets/f3rm/opt/objaverse/car2/features/orientany_")
-    # examine_saved("datasets/f3rm/opt/objaverse/car2/features/orientany_car")
 
     data_root = Path("datasets/f3rm/opt/objaverse/car2")
     image_dir = data_root / "images"
@@ -508,44 +517,28 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Extract orientation features using global prompts (with debug info)
-    extractor = ORIENTANYExtractor(device=device, data_dir=data_root, text_prompts=["car"], verbose=True)
+    extractor = ORIENTANYExtractor(device=device, data_dir=data_root, text_prompts=None, verbose=True)
     features_data = run_async_in_any_context(lambda: extractor.extract_batch_async(image_paths, debug=True))
     print(f"Extracted {len(features_data)} feature maps")
 
-    # Convert to full feature arrays for visualization
-    features = []
-    for data in features_data:
-        pixel_data = data['pixel_data']  # (H, W, 3)
-        instance_features = data['instance_features']  # {instance_id: 7D_R_x_R_z_confidence}
-
-        # Reconstruct full feature array (H, W, 9) - R_x, R_z, confidence + foreground
-        h, w, _ = pixel_data.shape
-        full_features = np.zeros((h, w, 9), dtype=np.float16)  # Use fp16 for VRAM efficiency
-
-        # Set foreground one-hot at the end
-        full_features[..., 7:9] = pixel_data[..., :2]  # foreground one-hot
-
-        # For each foreground pixel, get its instance features (7D R_x, R_z, confidence)
-        for instance_id, instance_feat in instance_features.items():
-            instance_id = int(instance_id)
-            mask = (pixel_data[..., 2] == instance_id)
-            if np.any(mask):
-                # Convert list back to numpy array if needed
-                if isinstance(instance_feat, list):
-                    instance_feat = np.array(instance_feat, dtype=np.float16)  # Use fp16 for VRAM efficiency
-                full_features[mask, :7] = instance_feat
-
-        features.append(full_features)
-
-    print(f"Sample shape: {features[0].shape if features else None}")
-
-    # Visualize results
+    # Visualize results with instance-based axes
     vis_count = min(2, len(image_paths))
     fig, axes = plt.subplots(3, vis_count, figsize=(6 * vis_count, 12))
     if vis_count == 1:
         axes = axes.reshape(3, 1)
 
+    # Load transforms for coordinate conversion
+    transforms_path = data_root / "transforms.json"
+    T_orig_to_final_nerf_world, scale = get_orig_to_final_nerf_world_transform_scale(str(transforms_path))
+    dataset_transforms_data = json.load(open(transforms_path, "r"))
+    transforms_lookup = build_transform_lookup(dataset_transforms_data["frames"])
+    vector_shader = VectorShader()
+
     for i in tqdm(range(vis_count), desc="Visualizing results"):
+        data = features_data[i]
+        pixel_data = data['pixel_data']
+        instance_features = data['instance_features']
+
         # RGB image
         rgb = Image.open(image_paths[i]).convert("RGB")
         axes[0, i].imshow(rgb)
@@ -553,28 +546,77 @@ if __name__ == "__main__":
         axes[0, i].axis('off')
 
         # Foreground mask
-        fg = features[i][..., -1] if i < len(features) else None
-        if fg is not None:
-            axes[1, i].imshow(fg, cmap='gray', vmin=0, vmax=1)
-            axes[1, i].set_title("Foreground Mask")
+        fg = pixel_data[..., 1]
+        axes[1, i].imshow(fg, cmap='gray', vmin=0, vmax=1)
+        axes[1, i].set_title("Foreground Mask")
         axes[1, i].axis('off')
 
-        # Orientation RGB
-        if fg is not None:
-            # Get R_x and R_z vectors (from new compact representation)
-            R_x = features[i][..., :3]  # R_x vector (first 3 channels)
-            R_z = features[i][..., 3:6]  # R_z vector (next 3 channels)
-            conf = features[i][..., 6]  # confidence (7th channel)
+        # Orientation RGB with instance axes
+        if instance_features:
+            # Reconstruct full features for visualization
+            h, w, _ = pixel_data.shape
+            full_features = np.zeros((h, w, 9), dtype=np.float16)
+            full_features[..., 7:9] = pixel_data[..., :2]  # foreground one-hot
 
-            # Convert to RGB using VectorShader
-            vector_shader = VectorShader()
+            for instance_id, instance_feat in instance_features.items():
+                instance_id = int(instance_id)
+                mask = (pixel_data[..., 2] == instance_id)
+                if np.any(mask) and isinstance(instance_feat, list):
+                    instance_feat = np.array(instance_feat, dtype=np.float16)
+                    full_features[mask, :7] = instance_feat
+
+            # Get R_x vector for visualization
+            R_x = full_features[..., :3]
             R_x_tensor = torch.from_numpy(R_x).float()
             fg_tensor = torch.from_numpy(fg).float().unsqueeze(-1)
             orient_rgb = vector_shader(R_x_tensor, valid_mask=fg_tensor)
             orient_rgb = (orient_rgb * 255).clamp(0, 255).byte().numpy()
 
+            # Draw instance axes on orientation visualization
+            # Convert orient_rgb to BGR for axes drawing
+            orient_bgr = cv2.cvtColor(orient_rgb, cv2.COLOR_RGB2BGR)
+
+            nerf_ccs1_to_orig_nerf_world = get_nerf_ccs_to_orig_nerf_world(Path(image_paths[i]).name, transforms_lookup)
+            nerf_ccs1_to_final_nerf_world = T_orig_to_final_nerf_world @ nerf_ccs1_to_orig_nerf_world
+            nerf_ccs1_to_final_nerf_world[:3, 3] *= scale
+            R_final_nerf_world_to_nerf_ccs1 = nerf_ccs1_to_final_nerf_world[:3, :3].T
+
+            for instance_id, instance_feat in instance_features.items():
+                instance_id = int(instance_id)
+                if isinstance(instance_feat, list):
+                    instance_feat = np.array(instance_feat, dtype=np.float16)
+
+                instance_mask = (pixel_data[..., 2] == instance_id)
+                if not np.any(instance_mask):
+                    continue
+
+                ys, xs = np.where(instance_mask)
+                instance_center = (int(xs.mean()), int(ys.mean()))
+
+                u_x_world = instance_feat[:3]
+                u_z_world = instance_feat[3:6]
+                u_y_world = np.cross(u_z_world, u_x_world)
+                u_y_world = u_y_world / np.linalg.norm(u_y_world)
+                R_objw_to_final_nerf_world = np.column_stack([u_x_world, u_y_world, u_z_world])
+                R_objw_to_nerf_ccs1 = R_final_nerf_world_to_nerf_ccs1 @ R_objw_to_final_nerf_world
+
+                # Draw axes in BGR space
+                orient_bgr = AxesAnnotator.visualize_rotation_matrix(
+                    orient_bgr,
+                    instance_center,
+                    R_objw_to_nerf_ccs1,
+                    axis_length=70,  # Even smaller for visualization
+                    axis_thickness=4
+                )
+
+            # Convert back to RGB for display
+            orient_rgb = cv2.cvtColor(orient_bgr, cv2.COLOR_BGR2RGB)
+
             axes[2, i].imshow(orient_rgb)
-            axes[2, i].set_title("Orientation RGB (R_x vector)")
+            axes[2, i].set_title("Orientation RGB + Instance Axes")
+        else:
+            axes[2, i].text(0.5, 0.5, 'No instances', ha='center', va='center', transform=axes[2, i].transAxes)
+            axes[2, i].set_title("No Instances Found")
         axes[2, i].axis('off')
 
     plt.tight_layout()

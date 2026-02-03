@@ -20,19 +20,19 @@ from f3rm.features.utils import resolve_devices_and_workers, run_async_in_any_co
 
 
 class SAM2Args:
-    points_per_side: int = 64
+    points_per_side: int = 4   # TEMP changed from 64 to 4 for faccchairs to work
     points_per_batch: int = 128
     pred_iou_thresh: float = None
     stability_score_thresh: float = None
     stability_score_offset: float = None
     box_nms_thresh: float = None
     min_mask_region_area: int = None
-    use_m2m: bool = True
+    use_m2m: bool = False   # TEMP turned off for faccchairs to work
     preset: Optional[str] = "coarse"
-    load_size: int = 2048   # final save is still at image size
+    load_size: int = 512   # final save is still at image size, # TEMP changed 2048 -> 512 for faccchairs to work
     model_cfg: str = "/robodata/smodak/repos/sam2/sam2/configs/sam2.1/sam2.1_hiera_l.yaml"
     checkpoint_path: str = "/robodata/smodak/repos/sam2/checkpoints/sam2.1_hiera_large.pt"
-    batch_size_per_gpu: int = 4
+    batch_size_per_gpu: int = 2
     use_object_masks: bool = False
 
     @classmethod
