@@ -701,7 +701,14 @@ class AxesAnnotator:
         }
 
     @staticmethod
-    def visualize_rotation_matrix(image, center, rotation_matrix, axis_length=80, axis_thickness=6):
+    def visualize_rotation_matrix(
+        image,
+        center,
+        rotation_matrix,
+        axis_length=80,
+        axis_thickness=6,
+        axes_to_draw=None,
+    ):
         """
         Simple utility to draw 3D axes on an image given a rotation matrix
 
@@ -711,6 +718,8 @@ class AxesAnnotator:
             rotation_matrix (np.ndarray): 3x3 rotation matrix, ie, R_objtarget_to_nerf_ccs
             axis_length (int): Length of axes in pixels
             axis_thickness (int): Thickness of axes lines
+            axes_to_draw (Optional[Iterable[str|int]]): Subset of axes to draw.
+                Supports {"x","y","z"} or {0,1,2}. Default draws all.
 
         Returns:
             np.ndarray: Image with axes drawn
@@ -747,6 +756,20 @@ class AxesAnnotator:
             'z': (255, 0, 0)     # BLUE for Z-axis
         }
 
+        # Default behavior keeps legacy behavior: draw all three axes.
+        if axes_to_draw is None:
+            selected_axes = {"x", "y", "z"}
+        else:
+            idx_to_name = {0: "x", 1: "y", 2: "z"}
+            selected_axes = set()
+            for a in axes_to_draw:
+                if isinstance(a, str):
+                    a_l = a.lower()
+                    if a_l in {"x", "y", "z"}:
+                        selected_axes.add(a_l)
+                elif isinstance(a, int) and a in idx_to_name:
+                    selected_axes.add(idx_to_name[a])
+
         # Draw axes (back to front based on Z-depth)
         axes_data = [
             ('z', z_end, z_3d[2]),
@@ -756,6 +779,8 @@ class AxesAnnotator:
         axes_data.sort(key=lambda x: x[2])  # Sort by depth
 
         for axis_name, end_point, _ in axes_data:
+            if axis_name not in selected_axes:
+                continue
             cv2.arrowedLine(
                 image,
                 tuple(center.astype(int)),

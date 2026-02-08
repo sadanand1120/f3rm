@@ -1,55 +1,124 @@
 import gc
-import asyncio
 import json
 import os
-from typing import List, Optional, Dict, Any
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
+import cv2
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import torch.nn.functional as F
-import cv2
-from pathlib import Path
 from PIL import Image
 from tqdm.auto import tqdm
-import matplotlib.pyplot as plt
 
-from sam2.features.utils import SAM2utils
-from sam2.features.clip_main import CLIPfeatures
 from sam2.features.utils import AsyncMultiWrapper
 
-from f3rm.features.utils import (
-    run_async_in_any_context,
-    resolve_devices_and_workers,
-    get_nerf_ccs_to_normal_ccs_T,
-    build_transform_lookup,
-    get_nerf_ccs_to_orig_nerf_world,
-    get_orig_to_final_nerf_world_transform_scale
-)
-from f3rm.features.utils import BatchFeatureLoader
-from f3rm.features.sam2_extract import SAM2Args
-from f3rm.features.orientany.orientany_main import OrientAny
 from f3rm.features.orientany.homography import Homography
-from f3rm.shaders import VectorShader
+from f3rm.features.orientany.orientany_main import OrientAny
+from f3rm.features.utils import (
+    BatchFeatureLoader,
+    build_transform_lookup,
+    get_nerf_ccs_to_normal_ccs_T,
+    get_nerf_ccs_to_orig_nerf_world,
+    get_orig_to_final_nerf_world_transform_scale,
+    resolve_devices_and_workers,
+    run_async_in_any_context,
+)
 from f3rm.manual.instance_axes_annotator import AxesAnnotator
+from f3rm.shaders import VectorShader
 
 
 class ORIENTANYArgs:
-    negative_texts: List[str] = ["object", "floor", "wall"]
-    softmax_temp: float = 0.01
-    top_mean_percent: float = 15.0
-    sim_thresh: float = 0.7   # 0.7, make it 0.1 for debugging
     min_instance_percent: float = 1.0
-    batch_size_per_gpu: int = 4
+    batch_size_per_gpu: int = 8
 
     @classmethod
     def id_dict(cls):
         return {
-            "negative_texts": list(cls.negative_texts),
-            "softmax_temp": float(cls.softmax_temp),
-            "top_mean_percent": float(cls.top_mean_percent),
-            "sim_thresh": float(cls.sim_thresh),
             "min_instance_percent": float(cls.min_instance_percent),
         }
+
+
+def _filter_masks_by_size(masks: np.ndarray, min_percent: float) -> List[np.ndarray]:
+    """Filter masks by minimum size percentage."""
+    if masks.ndim < 2:
+        return []
+
+    h, w = masks.shape[-2:]
+    total_pixels = max(1, h * w)
+    kept_masks = []
+
+    for mask in masks:
+        if mask.shape != (h, w) or not np.any(mask):
+            continue
+        percent = (np.sum(mask) / total_pixels) * 100.0
+        if percent >= min_percent:
+            kept_masks.append(mask)
+
+    return kept_masks
+
+
+def _get_camera_transforms(image_path: str, transforms_lookup: Dict, T_orig_to_final_nerf_world: np.ndarray,
+                           orig_to_final_nerf_world_scale: float) -> Tuple[np.ndarray, np.ndarray]:
+    """Get camera transforms for coordinate conversion."""
+    nerf_ccs1_to_orig_nerf_world = get_nerf_ccs_to_orig_nerf_world(Path(image_path).name, transforms_lookup)
+    nerf_ccs1_to_final_nerf_world = T_orig_to_final_nerf_world @ nerf_ccs1_to_orig_nerf_world
+    nerf_ccs1_to_final_nerf_world[:3, 3] *= orig_to_final_nerf_world_scale
+    R_final_nerf_world_to_nerf_ccs1 = nerf_ccs1_to_final_nerf_world[:3, :3].T
+    return nerf_ccs1_to_final_nerf_world, R_final_nerf_world_to_nerf_ccs1
+
+
+def _compute_object_orientation_features(phi: float, theta_elev: float, delta: float,
+                                         nerf_ccs1_to_final_nerf_world: np.ndarray) -> np.ndarray:
+    """Compute object orientation features in final NeRF world coordinates."""
+    # Get rotation from object to normal camera coordinate system
+    R_objw_to_normal_ccs1 = OrientAny.get_R_objw2cam(phi, theta_elev, delta)
+
+    # Transform to NeRF coordinate system
+    R_objw_to_nerf_ccs1 = get_nerf_ccs_to_normal_ccs_T()[:3, :3].T @ R_objw_to_normal_ccs1
+
+    # Transform to final NeRF world coordinates
+    R_objw_to_final_nerf_world = nerf_ccs1_to_final_nerf_world[:3, :3] @ R_objw_to_nerf_ccs1
+
+    # Create transform matrix and project reference points
+    T_objw_to_final_nerf_world = OrientAny.get_T_from_R(R_objw_to_final_nerf_world)
+    objw_pts = [
+        np.array([0, 0, 0]),  # origin
+        np.array([1, 0, 0]),  # +X
+        np.array([0, 1, 0]),  # +Y (computed via cross product)
+        np.array([0, 0, 1]),  # +Z
+    ]
+    final_nerf_world_pts = Homography.general_project_A_to_B(objw_pts, T_objw_to_final_nerf_world)
+
+    # Extract and normalize orientation vectors
+    u_x = final_nerf_world_pts[1] - final_nerf_world_pts[0]  # X-axis vector
+    u_z = final_nerf_world_pts[3] - final_nerf_world_pts[0]  # Z-axis vector
+    u_x = u_x / np.linalg.norm(u_x)
+    u_z = u_z / np.linalg.norm(u_z)
+
+    return np.concatenate([u_x, u_z], axis=0)
+
+
+def _create_pixel_data(h: int, w: int, obj_masks: List[np.ndarray]) -> np.ndarray:
+    """Create pixel data array with object masks and instance assignments."""
+    pixel_data = np.zeros((h, w, 3), dtype=np.float16)
+
+    # Create combined object mask (any object = True, background = False)
+    if obj_masks:
+        obj_mask_combined = np.logical_or.reduce(obj_masks)
+        pixel_data[..., 1] = obj_mask_combined.astype(np.float16)  # object channel
+        pixel_data[..., 0] = (~obj_mask_combined).astype(np.float16)  # background channel
+
+        # Assign instance IDs to pixels
+        next_instance_id = 1
+        for mask in obj_masks:
+            pixel_data[mask, 2] = float(next_instance_id)
+            next_instance_id += 1
+    else:
+        # No objects - all background
+        pixel_data[..., 0] = 1.0  # background channel
+
+    return pixel_data
 
 
 def parse_orientany_feature_type(feature_type: str) -> List[str]:
@@ -61,34 +130,83 @@ def parse_orientany_feature_type(feature_type: str) -> List[str]:
     return [w.lower() for w in prompts_part.split("_") if w.strip()]
 
 
+def _build_orientany_full_features(pixel_data: np.ndarray, instance_features: Dict[Any, Any]) -> np.ndarray:
+    """Reconstruct dense ORIENTANY feature map from pixel ids and per-instance vectors."""
+    h, w, _ = pixel_data.shape
+    full_features = np.zeros((h, w, 9), dtype=np.float16)  # 7D features + 2D foreground
+    full_features[..., 7:9] = pixel_data[..., :2]  # background/object one-hot
+
+    for instance_id, instance_feat in instance_features.items():
+        mask = pixel_data[..., 2] == int(instance_id)
+        if np.any(mask) and isinstance(instance_feat, list):
+            full_features[mask, :7] = np.asarray(instance_feat, dtype=np.float16)
+
+    return full_features
+
+
+def _draw_orientany_instance_axes(
+    axes_frame: np.ndarray,
+    pixel_data: np.ndarray,
+    instance_features: Dict[Any, Any],
+    R_final_nerf_world_to_nerf_ccs1: np.ndarray,
+    axis_length: int = 70,
+    axis_thickness: int = 4,
+) -> np.ndarray:
+    """Draw per-instance axes from ORIENTANY instance features."""
+    for instance_id, instance_feat in instance_features.items():
+        instance_mask = pixel_data[..., 2] == int(instance_id)
+        if not np.any(instance_mask):
+            continue
+
+        ys, xs = np.where(instance_mask)
+        instance_center = (int(xs.mean()), int(ys.mean()))
+
+        instance_feat_arr = np.asarray(instance_feat, dtype=np.float32)
+        u_x_world = instance_feat_arr[:3]
+        u_z_world = instance_feat_arr[3:6]
+        if np.linalg.norm(u_x_world) < 1e-6 or np.linalg.norm(u_z_world) < 1e-6:
+            continue
+
+        u_y_world = np.cross(u_z_world, u_x_world)
+        if np.linalg.norm(u_y_world) < 1e-6:
+            continue
+        u_y_world = u_y_world / np.linalg.norm(u_y_world)
+        R_objw_to_final_nerf_world = np.column_stack([u_x_world, u_y_world, u_z_world])
+        R_objw_to_nerf_ccs1 = R_final_nerf_world_to_nerf_ccs1 @ R_objw_to_final_nerf_world
+
+        axes_frame = AxesAnnotator.visualize_rotation_matrix(
+            axes_frame,
+            instance_center,
+            R_objw_to_nerf_ccs1,
+            axis_length=axis_length,
+            axis_thickness=axis_thickness,
+        )
+
+    return axes_frame
+
+
 class ORIENTANYWorker:
-    def __init__(self, device: torch.device, data_dir: Path, text_prompts: Optional[List[str]] = None):
-        self.device = device
+    def __init__(self, device: torch.device, data_dir: Path, sam3_feature_type: str):
+        self.device = torch.device(device)
+        if self.device.type == "cuda":
+            torch.cuda.set_device(self.device)
+
         self.data_dir = Path(data_dir)
-        self.text_prompts = text_prompts
+        self.sam3_feature_type = sam3_feature_type
 
-        feat_root = self.data_dir / "features"
-        clip_root = feat_root / "clip"
-        sam2_root = feat_root / "sam2"
-        text_root = feat_root / "text"
+        # Load SAM3 metadata and create loader
+        sam3_root = self.data_dir / "features" / self.sam3_feature_type.lower()
+        if not (sam3_root / "meta.pt").exists():
+            raise FileNotFoundError(f"Missing SAM3 meta: {sam3_root / 'meta.pt'}")
 
-        # Load meta to align indices
-        clip_meta = torch.load(clip_root / "meta.pt")
-        self.feat_image_fnames = [str(p) for p in clip_meta["image_fnames"]]
+        sam3_meta = torch.load(sam3_root / "meta.pt")
+        self.feat_image_fnames = [str(p) for p in sam3_meta["image_fnames"]]
+        self.sam3_loader = BatchFeatureLoader(self.data_dir, self.sam3_feature_type, self.feat_image_fnames, self.device)
 
-        # Create batch feature loaders for the new system
-        self.clip_loader = BatchFeatureLoader(self.data_dir, "CLIP", self.feat_image_fnames, device)
-        self.sam2_loader = BatchFeatureLoader(self.data_dir, "SAM2", self.feat_image_fnames, device)
+        # Initialize orientation estimation model
+        self.orient_any = OrientAny("f3rm/features/orientany/ckpts", "ronormsigma1_dino_weight.pt", device=self.device)
 
-        if self.text_prompts is None:
-            self.text_loader = BatchFeatureLoader(self.data_dir, "TEXT", self.feat_image_fnames, device)
-        else:
-            self.text_loader = None
-
-        self.clip_model = CLIPfeatures(device=self.device)
-        self.orient_any = OrientAny("f3rm/features/orientany/ckpts", "ronormsigma1_dino_weight.pt")
-
-        # Load camera transforms for distribution propagation
+        # Load camera transforms for coordinate system conversion
         transforms_path = self.data_dir / "transforms.json"
         if transforms_path.exists():
             T_orig_to_final_nerf_world, orig_to_final_nerf_world_scale = get_orig_to_final_nerf_world_transform_scale(str(transforms_path))
@@ -100,243 +218,112 @@ class ORIENTANYWorker:
             raise ValueError("transforms.json not found")
 
     async def compute_orientany_for_image_async(self, image_path: str, debug: bool = False) -> Dict[str, Any]:
-        # map image → index
         try:
             idx = self.feat_image_fnames.index(str(image_path))
         except ValueError:
-            raise ValueError(f"Image path not found in CLIP meta order: {image_path}")
+            raise ValueError(f"Image path not found in SAM3 meta order: {image_path}")
 
-        clip_patch_feats = self.clip_loader[idx]
-        raw_auto_masks = self.sam2_loader[idx]
+        # Load and standardize SAM3 masks
+        masks = np.asarray(self.sam3_loader[idx])
+        if masks.ndim == 4:
+            masks = masks[:, 0, ...]  # Remove channel dimension if present
+        elif masks.ndim == 2:
+            masks = masks[None, ...]  # Add batch dimension if missing
+        masks = masks.astype(bool)
 
-        # prompts
-        if self.text_prompts is None:
-            text_prompts = self.text_loader[idx]
-        else:
-            text_prompts = self.text_prompts
+        h, w = masks.shape[-2:]
+        obj_masks = _filter_masks_by_size(masks, ORIENTANYArgs.min_instance_percent)
 
-        if not raw_auto_masks or not text_prompts:
-            # Return all background with zero orientation features
-            h, w = (raw_auto_masks[0]['segmentation'].shape if raw_auto_masks else (Image.open(image_path).size[1], Image.open(image_path).size[0]))
-            fg = np.zeros((h, w), dtype=bool)
-            # Return new format: pixel_data + empty instance_features
-            pixel_data = np.zeros((h, w, 3), dtype=np.float16)  # Use fp16 for VRAM efficiency
-            pixel_data[..., :2] = np.stack([~fg, fg], axis=-1).astype(np.float16)  # foreground one-hot
-            return {
-                'pixel_data': pixel_data,
-                'instance_features': {}  # No instances
-            }
+        if not obj_masks:
+            # No valid objects found
+            pixel_data = _create_pixel_data(h, w, [])
+            return {"pixel_data": pixel_data, "instance_features": {}}
 
-        # Instance mask from SAM2
-        inst_mask, _ = SAM2utils.auto_masks_to_instance_mask(
-            raw_auto_masks,
-            min_iou=float(SAM2Args.pred_iou_thresh) if SAM2Args.pred_iou_thresh is not None else 0.0,
-            min_area=float(SAM2Args.min_mask_region_area) if SAM2Args.min_mask_region_area is not None else 0.0,
-            assign_by="area",
-            start_from="low",
+        # Process each detected object
+        img = Image.open(image_path).convert("RGB")
+        img_array = np.array(img)
+
+        # Get camera coordinate transforms for this image
+        nerf_ccs1_to_final_nerf_world, _ = _get_camera_transforms(
+            image_path, self.transforms_lookup, self.T_orig_to_final_nerf_world, self.orig_to_final_nerf_world_scale
         )
-        if inst_mask is None:
-            if raw_auto_masks:
-                h, w = raw_auto_masks[0]['segmentation'].shape
-            else:
-                img = Image.open(image_path)
-                h, w = img.height, img.width
-            inst_mask = np.zeros((h, w), dtype=np.uint16)
 
-        # Remove tiny instances
-        unique_ids = np.unique(inst_mask)
-        total_pixels = inst_mask.size
-        for inst_id in unique_ids:
-            if inst_id > 0:
-                seg = (inst_mask == inst_id)
-                percent = (np.sum(seg) / total_pixels) * 100.0
-                if percent < ORIENTANYArgs.min_instance_percent:
-                    inst_mask[seg] = 0
-
-        # Build auto_masks list back
-        auto_masks = []
-        for inst_id in np.unique(inst_mask):
-            if inst_id <= 0:
-                continue
-            seg = (inst_mask == inst_id)
-            if not np.any(seg):
-                continue
-            ys, xs = np.where(seg)
-            y_min, y_max = ys.min(), ys.max()
-            x_min, x_max = xs.min(), xs.max()
-            bbox = [int(x_min), int(y_min), int(x_max - x_min + 1), int(y_max - y_min + 1)]
-            auto_masks.append({
-                "segmentation": seg,
-                "bbox": bbox,
-                "predicted_iou": np.float16("inf"),  # Use fp16 for VRAM efficiency
-                "area": np.float16("inf"),           # Use fp16 for VRAM efficiency
-            })
-
-        if not auto_masks:
-            h, w = inst_mask.shape
-            fg = np.zeros((h, w), dtype=bool)
-            pixel_data = np.zeros((h, w, 3), dtype=np.float16)  # Use fp16 for VRAM efficiency
-            pixel_data[..., :2] = np.stack([~fg, fg], axis=-1).astype(np.float16)  # foreground one-hot
-            return {
-                'pixel_data': pixel_data,
-                'instance_features': {}  # No instances
-            }
-
-        h, w = auto_masks[0]["segmentation"].shape
-
-        # Per-prompt sim maps and combine
-        segment_sim_maps: List[np.ndarray] = []
-        for text in text_prompts:
-            text_emb = self.clip_model.encode_text(text).half()
-            neg_text_embs = torch.stack([self.clip_model.encode_text(neg).half() for neg in ORIENTANYArgs.negative_texts], dim=0)
-            sim_map = self.clip_model.compute_similarity(
-                clip_patch_feats,
-                text_emb,
-                neg_text_embs=neg_text_embs,
-                softmax_temp=ORIENTANYArgs.softmax_temp,
-                normalize=True,
-            )
-            sim_map_up = np.array(Image.fromarray(sim_map.cpu().float().numpy()).resize((w, h), Image.BILINEAR)).astype(np.float16)
-
-            seg_map = np.zeros_like(sim_map_up)
-            for m in auto_masks:
-                seg = m["segmentation"]
-                if seg.shape != (h, w):
-                    continue
-                vals = sim_map_up[seg]
-                k = max(1, int(len(vals) * ORIENTANYArgs.top_mean_percent / 100.0))
-                seg_map[seg] = float(np.mean(np.sort(vals)[-k:]))
-            segment_sim_maps.append(seg_map)
-
-        combined_sim = np.maximum.reduce(segment_sim_maps) if len(segment_sim_maps) > 0 else np.zeros((h, w))
-
-        # Foreground map: any pixel belonging to any kept mask (threshold on combined similarity)
-        fg_mask = np.zeros((h, w), dtype=bool)
-        for m in auto_masks:
-            seg = m["segmentation"]
-            if seg.shape != (h, w):
-                continue
-            if np.any(combined_sim[seg] > ORIENTANYArgs.sim_thresh):
-                fg_mask |= seg
-
-        # Initialize per-pixel data: (H, W, 3) - [fg_one_hot, instance_id]
-        pixel_data = np.zeros((h, w, 3), dtype=np.float16)  # Use fp16 for VRAM efficiency
-        pixel_data[..., :2] = np.stack([~fg_mask, fg_mask], axis=-1).astype(np.float16)  # foreground one-hot
-
-        # Initialize instance features mapping
         instance_features = {}
-        next_instance_id = 1
-
-        # For each foreground instance, compute orientation features
-        for m in auto_masks:
-            seg = m["segmentation"]
-            if seg.shape != (h, w):
-                continue
-            if not np.any(combined_sim[seg] > ORIENTANYArgs.sim_thresh):
-                continue
-
-            # Create instance image for OrientAny
-            img = Image.open(image_path).convert('RGB')
-            img_array = np.array(img)
+        for mask in obj_masks:
+            # Create instance image with mask
             instance_img_array = np.zeros((*img_array.shape[:2], 4), dtype=np.uint8)
-            instance_img_array[..., :3] = img_array * seg[..., None]
-            instance_img_array[..., 3] = seg * 255
-            instance_img = Image.fromarray(instance_img_array, 'RGBA')
+            instance_img_array[..., :3] = img_array * mask[..., None]
+            instance_img_array[..., 3] = mask * 255
+            instance_img = Image.fromarray(instance_img_array, "RGBA")
 
-            # Get OrientAny predictions for cam1 (current image camera)
+            # Estimate object orientation
             rm_bkg_img = self.orient_any.preprocess_remove_bkg(instance_img, do_remove_background=False)
             outs = self.orient_any.get_model_outputs(rm_bkg_img, viz_distn=False)
 
-            # Extract logits
-            gaus_ax_logits = torch.from_numpy(outs['gaus_ax_logits']).to(self.device)  # 360D
-            gaus_pl_logits = torch.from_numpy(outs['gaus_pl_logits']).to(self.device)  # 180D
-            gaus_ro_logits = torch.from_numpy(outs['gaus_ro_logits']).to(self.device)  # 360D
-            conf_logits = torch.from_numpy(outs['conf_logits']).to(self.device)
+            # Compute orientation features in final NeRF world coordinates
+            orientation_vectors = _compute_object_orientation_features(
+                outs["phi"], outs["theta_elev"], outs["delta"], nerf_ccs1_to_final_nerf_world
+            )
+            confidence = float(outs["confidence"])
+            instance_feat = np.concatenate([orientation_vectors, [confidence]], axis=0).astype(np.float16)
 
-            # Get rotation matrix using argmax (no distribution propagation)
-            ax_pred = torch.argmax(gaus_ax_logits).item()
-            pl_pred = torch.argmax(gaus_pl_logits).item()
-            ro_pred = torch.argmax(gaus_ro_logits).item()
+            instance_features[len(instance_features) + 1] = instance_feat.tolist()
 
-            # Convert to OrientAny angles
-            phi = float(ax_pred)
-            theta_elev = float(pl_pred) - 90.0
-            delta = float(ro_pred) - self.orient_any.model_config['ro_offset']
+            # Clean up intermediate objects
+            del instance_img, rm_bkg_img, outs
 
-            # Get R_objw_to_cam1 (camera 1 coordinate system)
-            R_objw_to_normal_ccs1 = self.orient_any.get_R_objw2cam(phi, theta_elev, delta)
-            R_objw_to_nerf_ccs1 = get_nerf_ccs_to_normal_ccs_T()[:3, :3].T @ R_objw_to_normal_ccs1
+        # Create final pixel data with object masks and instance assignments
+        pixel_data = _create_pixel_data(h, w, obj_masks)
 
-            # Get cam1 to world transforms (all in NeRF CCS)
-            nerf_ccs1_to_orig_nerf_world = get_nerf_ccs_to_orig_nerf_world(os.path.basename(image_path), self.transforms_lookup)
-            nerf_ccs1_to_final_nerf_world = self.T_orig_to_final_nerf_world @ nerf_ccs1_to_orig_nerf_world
-            nerf_ccs1_to_final_nerf_world[:3, 3] *= self.orig_to_final_nerf_world_scale
-
-            R_objw_to_final_nerf_world = nerf_ccs1_to_final_nerf_world[:3, :3] @ R_objw_to_nerf_ccs1
-            # dont care about translation, so assume at final nerf world origin
-            T_objw_to_final_nerf_world = self.orient_any.get_T_from_R(R_objw_to_final_nerf_world)
-            objw_pts = [
-                np.array([0, 0, 0]),
-                np.array([1, 0, 0]),
-                np.array([0, 1, 0]),
-                np.array([0, 0, 1])
-            ]
-            final_nerf_world_pts = Homography.general_project_A_to_B(objw_pts, T_objw_to_final_nerf_world)
-            # Store u_x and u_z vectors plus confidence (7D vector)
-            u_x = final_nerf_world_pts[1] - final_nerf_world_pts[0]
-            u_z = final_nerf_world_pts[3] - final_nerf_world_pts[0]
-            u_x = u_x / np.linalg.norm(u_x)
-            u_z = u_z / np.linalg.norm(u_z)
-            conf = outs['confidence']  # Single confidence value
-            instance_feat = np.concatenate([u_x, u_z, [conf]], axis=0).astype(np.float16)
-
-            instance_features[next_instance_id] = instance_feat.tolist()  # Convert to list for JSON serialization
-
-            # Assign instance ID to foreground pixels
-            pixel_data[seg, 2] = float(next_instance_id)
-            next_instance_id += 1
-
-            # Clean up instance-specific memory
-            del instance_img, rm_bkg_img, outs, gaus_ax_logits, gaus_pl_logits, gaus_ro_logits, conf_logits
-
-        result = {
-            'pixel_data': pixel_data,  # (H, W, 3) - [fg_one_hot, instance_id]
-            'instance_features': instance_features  # {instance_id: 7D_R_x_R_z_confidence}
-        }
-
-        return result
+        return {"pixel_data": pixel_data, "instance_features": instance_features}
 
 
 class ORIENTANYExtractor:
-    def __init__(self, device: torch.device, data_dir: Optional[Path] = None, text_prompts: Optional[List[str]] = None, verbose: bool = False) -> None:
+    def __init__(
+        self,
+        device: torch.device,
+        data_dir: Optional[Path] = None,
+        text_prompts: Optional[List[str]] = None,
+        sam3_feature_type: Optional[str] = None,
+        verbose: bool = False,
+    ) -> None:
         self.device = device
         self.verbose = verbose
         self.data_dir = Path(data_dir) if data_dir is not None else None
         self.text_prompts = text_prompts
+        self.sam3_feature_type = sam3_feature_type or self._infer_sam3_feature_type(text_prompts)
 
         if self.data_dir is None:
-            raise ValueError("ORIENTANYExtractor requires data_dir to locate precomputed CLIP and SAM2 shards")
+            raise ValueError("ORIENTANYExtractor requires data_dir to locate precomputed SAM3 shards")
 
-        # Validate prerequisites for new per-image system
-        feat_root = self.data_dir / "features"
-        clip_root = feat_root / "clip"
-        sam2_root = feat_root / "sam2"
-        text_root = feat_root / "text"
-
-        if not (clip_root / "meta.pt").exists():
-            raise FileNotFoundError(f"Missing CLIP meta: {clip_root / 'meta.pt'}")
-        if not list(clip_root.glob("image_*.npy")):
-            raise FileNotFoundError(f"Missing CLIP per-image features under {clip_root}")
-        if not list(sam2_root.glob("image_*.npz")):
-            raise FileNotFoundError(f"Missing SAM2 per-image features under {sam2_root}")
-        if text_prompts is None and not list(text_root.glob("image_*.json")):
-            raise FileNotFoundError(f"Missing TEXT per-image features under {text_root} (required when using per-image text prompts)")
+        # Validate prerequisites for precomputed SAM3 masks
+        sam3_root = self.data_dir / "features" / self.sam3_feature_type.lower()
+        if not (sam3_root / "meta.pt").exists():
+            raise FileNotFoundError(
+                f"Missing SAM3 meta: {sam3_root / 'meta.pt'} (expected for ORIENTANY). "
+                f"Run SAM3 extraction for feature type '{self.sam3_feature_type}' first."
+            )
+        if not list(sam3_root.glob("image_*.npz")):
+            raise FileNotFoundError(f"Missing SAM3 per-image features under {sam3_root}")
 
         devices_param, num_workers = resolve_devices_and_workers(device, ORIENTANYArgs.batch_size_per_gpu)
         if verbose:
-            print("Initializing ORIENTANY workers")
-        self.client = AsyncMultiWrapper(ORIENTANYWorker, num_objects=num_workers, devices=devices_param, data_dir=self.data_dir, text_prompts=self.text_prompts)
+            print(f"Initializing ORIENTANY workers (using {self.sam3_feature_type} masks)")
+        self.client = AsyncMultiWrapper(
+            ORIENTANYWorker,
+            num_objects=num_workers,
+            devices=devices_param,
+            data_dir=self.data_dir,
+            sam3_feature_type=self.sam3_feature_type,
+        )
         self.num_workers = num_workers
+
+    @staticmethod
+    def _infer_sam3_feature_type(text_prompts: Optional[List[str]]) -> str:
+        if text_prompts is None or len(text_prompts) == 0:
+            return "SAM3_"
+        joined = "_".join([p.lower() for p in text_prompts])
+        return f"SAM3_{joined}"
 
     async def extract_batch_async(self, image_paths: List[str], debug: bool = False) -> List[Dict[str, Any]]:
         results: List[Dict[str, Any]] = []
@@ -347,11 +334,6 @@ class ORIENTANYExtractor:
             results.extend(batch_results)
             gc.collect()
         return results
-
-
-async def extract_orientany_batch(image_paths: List[str], device: torch.device, data_dir: Path, verbose: bool = False, text_prompts: Optional[List[str]] = None, debug: bool = False):
-    extractor = ORIENTANYExtractor(device=device, data_dir=data_dir, text_prompts=text_prompts, verbose=verbose)
-    return await extractor.extract_batch_async(image_paths, debug=debug)
 
 
 async def process_single_image_orientany_async(image_path: str, orientany_client: AsyncMultiWrapper, debug: bool = False) -> Dict[str, Any]:
@@ -413,31 +395,22 @@ def examine_saved(orientany_feat_dir: str):
         img = Image.open(image_path).convert('RGB')
         img_array = np.array(img)
 
-        # Get foreground mask
-        fg_mask = pixel_data[..., 1] > 0.5
+        # Get object mask (any detected object pixels)
+        obj_mask = pixel_data[..., 1] > 0.5
 
-        if not np.any(fg_mask):
-            # No foreground, create empty frame
+        if not np.any(obj_mask):
+            # No objects detected, create empty frame
             empty_frame = np.zeros((H, W * 3, 3), dtype=np.uint8)
             frame_bgr = cv2.cvtColor(empty_frame, cv2.COLOR_RGB2BGR)
             out.write(frame_bgr)
             continue
 
-        # Reconstruct full features for visualization
-        full_features = np.zeros((H, W, 9), dtype=np.float16)
-        full_features[..., 7:9] = pixel_data[..., :2]  # foreground one-hot
+        # Reconstruct full feature map for visualization
+        full_features = _build_orientany_full_features(pixel_data, instance_features)
 
-        # Assign instance features to pixels
-        for instance_id, instance_feat in instance_features.items():
-            instance_id = int(instance_id)
-            mask = (pixel_data[..., 2] == instance_id)
-            if np.any(mask) and isinstance(instance_feat, list):
-                instance_feat = np.array(instance_feat, dtype=np.float16)
-                full_features[mask, :7] = instance_feat
-
-        # Extract R_x and R_z vectors
-        R_x = full_features[..., :3]
-        R_z = full_features[..., 3:6]
+        # Extract orientation vectors
+        R_x = full_features[..., :3]  # X-axis orientation vectors
+        R_z = full_features[..., 3:6]  # Z-axis orientation vectors
 
         # Create three visualizations
         # 1. Axes visualization (per instance)
@@ -449,51 +422,26 @@ def examine_saved(orientany_feat_dir: str):
         nerf_ccs1_to_final_nerf_world[:3, 3] *= scale
         R_final_nerf_world_to_nerf_ccs1 = nerf_ccs1_to_final_nerf_world[:3, :3].T
 
-        # Draw axes for each instance
-        for instance_id, instance_feat in instance_features.items():
-            instance_id = int(instance_id)
-            if isinstance(instance_feat, list):
-                instance_feat = np.array(instance_feat, dtype=np.float16)
-
-            # Get instance mask
-            instance_mask = (pixel_data[..., 2] == instance_id)
-            if not np.any(instance_mask):
-                continue
-
-            # Calculate instance center
-            ys, xs = np.where(instance_mask)
-            instance_center = (int(xs.mean()), int(ys.mean()))
-
-            # Stored features are in final NeRF world coordinates
-            u_x_world = instance_feat[:3]
-            u_z_world = instance_feat[3:6]
-            u_y_world = np.cross(u_z_world, u_x_world)
-            u_y_world = u_y_world / np.linalg.norm(u_y_world)
-            R_objw_to_final_nerf_world = np.column_stack([u_x_world, u_y_world, u_z_world])
-
-            # Transform to camera coordinate system
-            R_objw_to_nerf_ccs1 = R_final_nerf_world_to_nerf_ccs1 @ R_objw_to_final_nerf_world
-
-            # Draw axes for this instance (axes_frame is already in BGR format)
-            axes_frame = AxesAnnotator.visualize_rotation_matrix(
-                axes_frame,  # Already BGR, no conversion needed
-                instance_center,
-                R_objw_to_nerf_ccs1,
-                axis_length=70,  # Smaller axes to avoid crowding
-                axis_thickness=4
-            )
+        axes_frame = _draw_orientany_instance_axes(
+            axes_frame=axes_frame,
+            pixel_data=pixel_data,
+            instance_features=instance_features,
+            R_final_nerf_world_to_nerf_ccs1=R_final_nerf_world_to_nerf_ccs1,
+            axis_length=70,
+            axis_thickness=4,
+        )
 
         axes_frame = cv2.cvtColor(axes_frame, cv2.COLOR_BGR2RGB)  # Convert back to RGB once at end
 
-        # 2. R_x vector visualization
+        # 2. X-axis orientation vector visualization
         R_x_tensor = torch.from_numpy(R_x).float()
-        fg_tensor = torch.from_numpy(fg_mask).float().unsqueeze(-1)
-        rx_rgb = vector_shader(R_x_tensor, valid_mask=fg_tensor)
+        obj_tensor = torch.from_numpy(obj_mask).float().unsqueeze(-1)
+        rx_rgb = vector_shader(R_x_tensor, valid_mask=obj_tensor)
         rx_rgb = (rx_rgb * 255).clamp(0, 255).byte().numpy()
 
-        # 3. R_z vector visualization
+        # 3. Z-axis orientation vector visualization
         R_z_tensor = torch.from_numpy(R_z).float()
-        rz_rgb = vector_shader(R_z_tensor, valid_mask=fg_tensor)
+        rz_rgb = vector_shader(R_z_tensor, valid_mask=obj_tensor)
         rz_rgb = (rz_rgb * 255).clamp(0, 255).byte().numpy()
 
         # Stack frames side by side
@@ -513,19 +461,17 @@ if __name__ == "__main__":
     data_root = Path("datasets/f3rm/opt/objaverse/car2")
     image_dir = data_root / "images"
     image_paths = sorted(list(image_dir.glob("*.jpg")) + list(image_dir.glob("*.png")))
-    image_paths = [str(p) for p in image_paths[:3]]  # Just 3 for demo
+    image_paths = [str(p) for p in image_paths[10:13]]  # Just 3 for demo
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Extract orientation features using global prompts (with debug info)
+    # Extract orientation features
     extractor = ORIENTANYExtractor(device=device, data_dir=data_root, text_prompts=None, verbose=True)
     features_data = run_async_in_any_context(lambda: extractor.extract_batch_async(image_paths, debug=True))
     print(f"Extracted {len(features_data)} feature maps")
 
     # Visualize results with instance-based axes
-    vis_count = min(2, len(image_paths))
-    fig, axes = plt.subplots(3, vis_count, figsize=(6 * vis_count, 12))
-    if vis_count == 1:
-        axes = axes.reshape(3, 1)
+    vis_count = min(1, len(image_paths))
+    fig, axes = plt.subplots(vis_count, 3, figsize=(18, 4 * vis_count))
 
     # Load transforms for coordinate conversion
     transforms_path = data_root / "transforms.json"
@@ -541,39 +487,28 @@ if __name__ == "__main__":
 
         # RGB image
         rgb = Image.open(image_paths[i]).convert("RGB")
-        axes[0, i].imshow(rgb)
-        axes[0, i].set_title(f"RGB {i+1}")
-        axes[0, i].axis('off')
+        axes[i, 0].imshow(rgb)
+        axes[i, 0].set_title(f"RGB {i+1}")
+        axes[i, 0].axis('off')
 
-        # Foreground mask
-        fg = pixel_data[..., 1]
-        axes[1, i].imshow(fg, cmap='gray', vmin=0, vmax=1)
-        axes[1, i].set_title("Foreground Mask")
-        axes[1, i].axis('off')
+        # Object mask
+        obj_mask = pixel_data[..., 1]
+        axes[i, 1].imshow(obj_mask, cmap='gray', vmin=0, vmax=1)
+        axes[i, 1].set_title("Object Mask")
+        axes[i, 1].axis('off')
 
         # Orientation RGB with instance axes
         if instance_features:
-            # Reconstruct full features for visualization
-            h, w, _ = pixel_data.shape
-            full_features = np.zeros((h, w, 9), dtype=np.float16)
-            full_features[..., 7:9] = pixel_data[..., :2]  # foreground one-hot
+            full_features = _build_orientany_full_features(pixel_data, instance_features)
 
-            for instance_id, instance_feat in instance_features.items():
-                instance_id = int(instance_id)
-                mask = (pixel_data[..., 2] == instance_id)
-                if np.any(mask) and isinstance(instance_feat, list):
-                    instance_feat = np.array(instance_feat, dtype=np.float16)
-                    full_features[mask, :7] = instance_feat
-
-            # Get R_x vector for visualization
+            # Get X-axis orientation vector for visualization
             R_x = full_features[..., :3]
             R_x_tensor = torch.from_numpy(R_x).float()
-            fg_tensor = torch.from_numpy(fg).float().unsqueeze(-1)
-            orient_rgb = vector_shader(R_x_tensor, valid_mask=fg_tensor)
+            obj_tensor = torch.from_numpy(obj_mask).float().unsqueeze(-1)
+            orient_rgb = vector_shader(R_x_tensor, valid_mask=obj_tensor)
             orient_rgb = (orient_rgb * 255).clamp(0, 255).byte().numpy()
 
             # Draw instance axes on orientation visualization
-            # Convert orient_rgb to BGR for axes drawing
             orient_bgr = cv2.cvtColor(orient_rgb, cv2.COLOR_RGB2BGR)
 
             nerf_ccs1_to_orig_nerf_world = get_nerf_ccs_to_orig_nerf_world(Path(image_paths[i]).name, transforms_lookup)
@@ -581,43 +516,24 @@ if __name__ == "__main__":
             nerf_ccs1_to_final_nerf_world[:3, 3] *= scale
             R_final_nerf_world_to_nerf_ccs1 = nerf_ccs1_to_final_nerf_world[:3, :3].T
 
-            for instance_id, instance_feat in instance_features.items():
-                instance_id = int(instance_id)
-                if isinstance(instance_feat, list):
-                    instance_feat = np.array(instance_feat, dtype=np.float16)
-
-                instance_mask = (pixel_data[..., 2] == instance_id)
-                if not np.any(instance_mask):
-                    continue
-
-                ys, xs = np.where(instance_mask)
-                instance_center = (int(xs.mean()), int(ys.mean()))
-
-                u_x_world = instance_feat[:3]
-                u_z_world = instance_feat[3:6]
-                u_y_world = np.cross(u_z_world, u_x_world)
-                u_y_world = u_y_world / np.linalg.norm(u_y_world)
-                R_objw_to_final_nerf_world = np.column_stack([u_x_world, u_y_world, u_z_world])
-                R_objw_to_nerf_ccs1 = R_final_nerf_world_to_nerf_ccs1 @ R_objw_to_final_nerf_world
-
-                # Draw axes in BGR space
-                orient_bgr = AxesAnnotator.visualize_rotation_matrix(
-                    orient_bgr,
-                    instance_center,
-                    R_objw_to_nerf_ccs1,
-                    axis_length=70,  # Even smaller for visualization
-                    axis_thickness=4
-                )
+            orient_bgr = _draw_orientany_instance_axes(
+                axes_frame=orient_bgr,
+                pixel_data=pixel_data,
+                instance_features=instance_features,
+                R_final_nerf_world_to_nerf_ccs1=R_final_nerf_world_to_nerf_ccs1,
+                axis_length=70,
+                axis_thickness=4,
+            )
 
             # Convert back to RGB for display
             orient_rgb = cv2.cvtColor(orient_bgr, cv2.COLOR_BGR2RGB)
 
-            axes[2, i].imshow(orient_rgb)
-            axes[2, i].set_title("Orientation RGB + Instance Axes")
+            axes[i, 2].imshow(orient_rgb)
+            axes[i, 2].set_title("Orientation RGB + Instance Axes")
         else:
-            axes[2, i].text(0.5, 0.5, 'No instances', ha='center', va='center', transform=axes[2, i].transAxes)
-            axes[2, i].set_title("No Instances Found")
-        axes[2, i].axis('off')
+            axes[i, 2].text(0.5, 0.5, 'No instances', ha='center', va='center', transform=axes[i, 2].transAxes)
+            axes[i, 2].set_title("No Instances Found")
+        axes[i, 2].axis('off')
 
     plt.tight_layout()
     plt.show()

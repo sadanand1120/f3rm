@@ -685,8 +685,11 @@ class BatchFeatureLoader:
         elif feature_type.startswith("FOREGROUND_"):
             self.H, self.W, self.C = sample_features.shape
             self.dtype = sample_features.dtype
-        elif feature_type.startswith("ORIENTANY_"):
+        elif feature_type.startswith("ORIENTANY_") or feature_type.startswith("ORIENTANY2_"):
             self.H, self.W = sample_features.shape[:2]
+            self.dtype = sample_features.dtype
+        elif feature_type.startswith("SAM3_"):
+            self.K, _, self.H, self.W = sample_features.shape
             self.dtype = sample_features.dtype
         del sample_features
 
@@ -722,6 +725,28 @@ class BatchFeatureLoader:
                     full_features[mask, :7] = instance_feat  # 7D features: R_x, R_z, confidence
             t = torch.from_numpy(full_features)
             return t.pin_memory() if self._use_pinned else t
+        elif self.feature_type.startswith("ORIENTANY2_"):
+            pixel_data = np.load(self.root / f"image_{img_idx:06d}_pixel.npy", mmap_mode="r")
+            with open(self.root / f"image_{img_idx:06d}_instances.json", 'r') as f:
+                instance_features = json.load(f)
+
+            h, w, _ = pixel_data.shape
+            full_features = np.zeros((h, w, 18), dtype=np.float16)  # 16D features + 2D foreground
+            full_features[..., 16:18] = pixel_data[..., :2]  # foreground one-hot
+            instance_ids = pixel_data[..., 2]
+            unique_ids = np.unique(instance_ids)
+            for instance_id in unique_ids:
+                if instance_id == 0:  # Skip background
+                    continue
+                instance_id_str = str(int(instance_id))
+                if instance_id_str in instance_features:
+                    mask = (instance_ids == instance_id)
+                    instance_feat = instance_features[instance_id_str]
+                    if isinstance(instance_feat, list):
+                        instance_feat = np.array(instance_feat, dtype=np.float16)
+                    full_features[mask, :16] = instance_feat  # 16D features: alpha, u_z, 4*u_x
+            t = torch.from_numpy(full_features)
+            return t.pin_memory() if self._use_pinned else t
 
         elif self.feature_type.startswith("CLIPSAM_") or self.feature_type == "SAM2":
             data = np.load(self.root / f"image_{img_idx:06d}.npz")
@@ -734,6 +759,10 @@ class BatchFeatureLoader:
                 "area_data": data['area_data']
             }
             return unpack_auto_masks(packed_data)
+        elif self.feature_type.startswith("SAM3_"):
+            data = np.load(self.root / f"image_{img_idx:06d}.npz")
+            masks = data["masks"]
+            return masks
         elif self.feature_type == "TEXT":
             with open(self.root / f"image_{img_idx:06d}.json", 'r') as f:
                 return json.load(f)
@@ -777,7 +806,7 @@ class BatchFeatureLoader:
         for cam_idx in unique_indices:
             cam_idx_int = int(cam_idx.item())
             # Only tensor-backed features are cached on GPU. For list/JSON types we fall back to CPU read.
-            if self.feature_type in ("CLIP", "DINO") or self.feature_type.startswith("FOREGROUND_") or self.feature_type.startswith("ORIENTANY_"):
+            if self.feature_type in ("CLIP", "DINO") or self.feature_type.startswith("FOREGROUND_") or self.feature_type.startswith("ORIENTANY_") or self.feature_type.startswith("ORIENTANY2_"):
                 batch_features[cam_idx_int] = self._get_gpu_tensor(cam_idx_int)
             else:
                 # SAM2/TEXT types
@@ -786,7 +815,7 @@ class BatchFeatureLoader:
 
     def __getitem__(self, index: int):
         """Direct access by image index for pipeline compatibility."""
-        if self.feature_type in ("CLIP", "DINO") or self.feature_type.startswith("FOREGROUND_") or self.feature_type.startswith("ORIENTANY_"):
+        if self.feature_type in ("CLIP", "DINO") or self.feature_type.startswith("FOREGROUND_") or self.feature_type.startswith("ORIENTANY_") or self.feature_type.startswith("ORIENTANY2_"):
             return self._get_gpu_tensor(index)
         else:
             return self._load_single_image_cpu(index)
@@ -794,7 +823,7 @@ class BatchFeatureLoader:
 
 def get_cache_paths(data_dir: Path, feature_type: str) -> Tuple[Path, Path]:
     """Get cache directory and metadata paths for a feature type."""
-    if feature_type.startswith("CLIPSAM_") or feature_type.startswith("FOREGROUND_") or feature_type.startswith("ORIENTANY_"):
+    if feature_type.startswith("CLIPSAM_") or feature_type.startswith("FOREGROUND_") or feature_type.startswith("ORIENTANY_") or feature_type.startswith("ORIENTANY2_"):
         root = data_dir / "features" / feature_type.lower()
     else:
         root = data_dir / "features" / feature_type.lower()

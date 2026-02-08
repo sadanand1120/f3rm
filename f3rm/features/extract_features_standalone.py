@@ -2,7 +2,7 @@
 """
 Standalone Feature Extraction Script
 
-Extracts features (CLIP, DINO, SAM2, TEXT, CLIPSAM_*, FOREGROUND_*, ORIENTANY_*) for a dataset
+Extracts features (CLIP, DINO, SAM2, SAM3_*, TEXT, CLIPSAM_*, FOREGROUND_*, ORIENTANY_*, ORIENTANY2_*) for a dataset
 and saves them as individual per-image files for efficient batch loading during training.
 
 Features are processed in batches for memory efficiency during extraction, but each image's
@@ -14,7 +14,7 @@ Usage:
         --feature-type CLIP \
         --batch-size 64
 
-Supported feature types: CLIP, DINO, SAM2, TEXT, CLIPSAM_*, FOREGROUND_*, ORIENTANY_*
+Supported feature types: CLIP, DINO, SAM2, SAM3_*, TEXT, CLIPSAM_*, FOREGROUND_*, ORIENTANY_*, ORIENTANY2_*
 """
 
 import argparse
@@ -31,71 +31,52 @@ from nerfstudio.data.dataparsers.nerfstudio_dataparser import NerfstudioDataPars
 from nerfstudio.utils.rich_utils import CONSOLE
 from tqdm.auto import tqdm
 
-from f3rm.features.clip_extract import CLIPArgs, CLIPExtractor, examine_saved as examine_saved_clip
-from f3rm.features.dino_extract import DINOArgs, DINOExtractor, examine_saved as examine_saved_dino
-from f3rm.features.sam2_extract import SAM2Args, SAM2Extractor, examine_saved as examine_saved_sam2
-from f3rm.features.clipsam_extract import CLIPSAMArgs, CLIPSAMExtractor, parse_clipsam_feature_type, examine_saved as examine_saved_clipsam
-from f3rm.features.foreground_extract import FOREGROUNDArgs, FOREGROUNDExtractor, parse_foreground_feature_type, examine_saved as examine_saved_foreground
-from f3rm.features.orientany_extract import ORIENTANYArgs, ORIENTANYExtractor, parse_orientany_feature_type, examine_saved as examine_saved_orientany
-from f3rm.features.text_extract import TextArgs, TextExtractor
 from f3rm.features.utils import run_async_in_any_context, pack_auto_masks, unpack_auto_masks, BatchFeatureLoader, get_cache_paths
 
 
-FEAT_TYPE_TO_ARGS = {
-    "CLIP": CLIPArgs,
-    "DINO": DINOArgs,
-    "SAM2": SAM2Args,
-    "CLIPSAM": CLIPSAMArgs,
-    "TEXT": TextArgs,
-    "FOREGROUND": FOREGROUNDArgs,
-    "ORIENTANY": ORIENTANYArgs,
-}
-
-FEAT_TYPE_TO_EXTRACTOR_CLASS: Dict[str, Type] = {
-    "CLIP": CLIPExtractor,
-    "DINO": DINOExtractor,
-    "SAM2": SAM2Extractor,
-    "TEXT": TextExtractor,
-}
-
-# Mapping from feature types to their examine_saved functions
-FEAT_TYPE_TO_EXAMINE_FUNC = {
-    "CLIP": examine_saved_clip,
-    "DINO": examine_saved_dino,
-    "SAM2": examine_saved_sam2,
-}
-
-
-def get_examine_func_for_feature_type(feature_type: str):
-    """Get the appropriate examine_saved function for a feature type."""
+def _lazy_import_components(feature_type: str):
+    """Lazy-import only the extractor needed for feature_type.
+    Returns (args_cls, extractor_cls, parse_fn_or_None, examine_fn_or_None).
+    """
     if feature_type.startswith("CLIPSAM_"):
-        return examine_saved_clipsam
-    elif feature_type.startswith("FOREGROUND_"):
-        return examine_saved_foreground
-    elif feature_type.startswith("ORIENTANY_"):
-        return examine_saved_orientany
-    else:
-        return FEAT_TYPE_TO_EXAMINE_FUNC.get(feature_type)
+        from f3rm.features.clipsam_extract import CLIPSAMArgs, CLIPSAMExtractor, parse_clipsam_feature_type, examine_saved
+        return CLIPSAMArgs, CLIPSAMExtractor, parse_clipsam_feature_type, examine_saved
+    if feature_type.startswith("FOREGROUND_"):
+        from f3rm.features.foreground_extract import FOREGROUNDArgs, FOREGROUNDExtractor, parse_foreground_feature_type, examine_saved
+        return FOREGROUNDArgs, FOREGROUNDExtractor, parse_foreground_feature_type, examine_saved
+    if feature_type.startswith("ORIENTANY_"):
+        from f3rm.features.orientany_extract import ORIENTANYArgs, ORIENTANYExtractor, parse_orientany_feature_type, examine_saved
+        return ORIENTANYArgs, ORIENTANYExtractor, parse_orientany_feature_type, examine_saved
+    if feature_type.startswith("ORIENTANY2_"):
+        from f3rm.features.orientany2_extract import ORIENTANY2Args, ORIENTANY2Extractor, parse_orientany2_feature_type, examine_saved
+        return ORIENTANY2Args, ORIENTANY2Extractor, parse_orientany2_feature_type, examine_saved
+    if feature_type.startswith("SAM3_"):
+        from f3rm.features.sam3_extract import SAM3Args, SAM3Extractor, parse_sam3_feature_type, examine_saved
+        return SAM3Args, SAM3Extractor, parse_sam3_feature_type, examine_saved
+    if feature_type == "CLIP":
+        from f3rm.features.clip_extract import CLIPArgs, CLIPExtractor, examine_saved
+        return CLIPArgs, CLIPExtractor, None, examine_saved
+    if feature_type == "DINO":
+        from f3rm.features.dino_extract import DINOArgs, DINOExtractor, examine_saved
+        return DINOArgs, DINOExtractor, None, examine_saved
+    if feature_type == "SAM2":
+        from f3rm.features.sam2_extract import SAM2Args, SAM2Extractor, examine_saved
+        return SAM2Args, SAM2Extractor, None, examine_saved
+    if feature_type == "TEXT":
+        from f3rm.features.text_extract import TextArgs, TextExtractor
+        return TextArgs, TextExtractor, None, None
+    raise ValueError(f"Unknown feature type: {feature_type}")
 
 
 def create_feature_visualization(data_dir: Path, feature_type: str):
     """Automatically create video visualization for extracted features."""
     try:
-        examine_func = get_examine_func_for_feature_type(feature_type)
+        _, _, _, examine_func = _lazy_import_components(feature_type)
         if examine_func is None:
             CONSOLE.print(f"[yellow]No visualization available for feature type: {feature_type}")
             return
 
-        # Determine the feature directory path
-        if feature_type.startswith("CLIPSAM_"):
-            feat_dir = data_dir / "features" / feature_type.lower()
-        elif feature_type.startswith("FOREGROUND_"):
-            feat_dir = data_dir / "features" / feature_type.lower()
-        elif feature_type.startswith("ORIENTANY_"):
-            feat_dir = data_dir / "features" / feature_type.lower()
-        else:
-            feat_dir = data_dir / "features" / feature_type.lower()
-
+        feat_dir = data_dir / "features" / feature_type.lower()
         if not feat_dir.exists():
             CONSOLE.print(f"[yellow]Feature directory not found: {feat_dir}")
             return
@@ -112,8 +93,9 @@ async def _save_per_image_generic(
     image_fnames: List[str],
     data_dir: Path,
     feature_type: str,
-    extractor_class: Type,
     args_cls: Any,
+    extractor_cls: Type,
+    parse_fn: Optional[Callable],
     device: torch.device,
     batch_size: int,
 ):
@@ -122,30 +104,18 @@ async def _save_per_image_generic(
     n_imgs = len(image_fnames)
     n_batches = math.ceil(n_imgs / batch_size)
 
-    if feature_type.startswith("CLIPSAM_"):
-        parsed_prompts = parse_clipsam_feature_type(feature_type)
+    # Create extractor
+    if parse_fn is not None:
+        parsed_prompts = parse_fn(feature_type)
         text_prompts_arg = None if (parsed_prompts is not None and len(parsed_prompts) == 0) else parsed_prompts
-        CONSOLE.print(f"CLIPSAM parsed text prompts: {parsed_prompts} -> using {'TEXT shards' if text_prompts_arg is None else 'global prompts'}")
-        extractor = CLIPSAMExtractor(device=device, data_dir=data_dir, text_prompts=text_prompts_arg, verbose=True)
-    elif feature_type.startswith("FOREGROUND_"):
-        parsed_prompts = parse_foreground_feature_type(feature_type)
-        text_prompts_arg = None if (parsed_prompts is not None and len(parsed_prompts) == 0) else parsed_prompts
-        CONSOLE.print(f"FOREGROUND parsed text prompts: {parsed_prompts} -> using {'TEXT shards' if text_prompts_arg is None else 'global prompts'}")
-        extractor = FOREGROUNDExtractor(device=device, data_dir=data_dir, text_prompts=text_prompts_arg, verbose=True)
-    elif feature_type.startswith("ORIENTANY_"):
-        parsed_prompts = parse_orientany_feature_type(feature_type)
-        text_prompts_arg = None if (parsed_prompts is not None and len(parsed_prompts) == 0) else parsed_prompts
-        CONSOLE.print(f"ORIENTANY parsed text prompts: {parsed_prompts} -> using {'TEXT shards' if text_prompts_arg is None else 'global prompts'}")
-        extractor = ORIENTANYExtractor(device=device, data_dir=data_dir, text_prompts=text_prompts_arg, verbose=True)
+        CONSOLE.print(f"{feature_type} parsed text prompts: {parsed_prompts} -> using {'TEXT shards' if text_prompts_arg is None else 'global prompts'}")
+        extractor = extractor_cls(device=device, data_dir=data_dir, text_prompts=text_prompts_arg, verbose=True)
     elif feature_type == "TEXT":
-        extractor = TextExtractor(device=device, verbose=True, data_dir=data_dir)
+        extractor = extractor_cls(device=device, verbose=True, data_dir=data_dir)
+    elif feature_type == "SAM2":
+        extractor = extractor_cls(device=device, data_dir=data_dir, verbose=True)
     else:
-        if extractor_class is None:
-            raise ValueError(f"No extractor class found for feature type: {feature_type}")
-        if feature_type == "SAM2":
-            extractor = extractor_class(device=device, data_dir=data_dir, verbose=True)
-        else:
-            extractor = extractor_class(device=device, verbose=True)
+        extractor = extractor_cls(device=device, verbose=True)
 
     # Extract features in batches, then save per-image files
     for i in tqdm(range(n_batches), desc=f"{feature_type}: extracting", position=0):
@@ -163,7 +133,7 @@ async def _save_per_image_generic(
             elif feature_type.startswith("FOREGROUND_"):
                 img_data = data[j].astype(np.float16)
                 np.save(root / f"image_{img_idx:06d}.npy", img_data, allow_pickle=False)
-            elif feature_type.startswith("ORIENTANY_"):
+            elif feature_type.startswith("ORIENTANY_") or feature_type.startswith("ORIENTANY2_"):
                 pixel_data = data[j]['pixel_data'].astype(np.float16)
                 instance_features = data[j]['instance_features']
                 np.save(root / f"image_{img_idx:06d}_pixel.npy", pixel_data, allow_pickle=False)
@@ -175,6 +145,9 @@ async def _save_per_image_generic(
                     root / f"image_{img_idx:06d}.npz",
                     **packed_img
                 )
+            elif feature_type.startswith("SAM3_"):
+                masks = data[j].astype(np.bool_)
+                np.savez_compressed(root / f"image_{img_idx:06d}.npz", masks=masks)
             elif feature_type == "TEXT":
                 with open(root / f"image_{img_idx:06d}.json", 'w') as f:
                     json.dump(data[j], f, indent=2)
@@ -218,8 +191,10 @@ def feature_loader(image_fnames: List[str], extract_args, data_dir: Path, featur
         sample_paths = [root / f"image_{i:06d}.npz" for i in range(min(3, len(image_fnames)))]
     elif feature_type == "TEXT":
         sample_paths = [root / f"image_{i:06d}.json" for i in range(min(3, len(image_fnames)))]
-    elif feature_type.startswith("ORIENTANY_"):
+    elif feature_type.startswith("ORIENTANY_") or feature_type.startswith("ORIENTANY2_"):
         sample_paths = [root / f"image_{i:06d}_pixel.npy" for i in range(min(3, len(image_fnames)))]
+    elif feature_type.startswith("SAM3_"):
+        sample_paths = [root / f"image_{i:06d}.npz" for i in range(min(3, len(image_fnames)))]
     else:
         sample_paths = [root / f"image_{i:06d}.npy" for i in range(min(3, len(image_fnames)))]
 
@@ -257,7 +232,7 @@ def get_image_filenames_from_dataparser(data_dir: Path) -> List[str]:
 def extract_features_for_dataset(
     image_fnames: List[str],
     data_dir: Path,
-    feature_type: Literal["CLIP", "DINO", "SAM2", "TEXT", "CLIPSAM_*", "FOREGROUND_*", "ORIENTANY_*"],
+    feature_type: Literal["CLIP", "DINO", "SAM2", "SAM3_*", "TEXT", "CLIPSAM_*", "FOREGROUND_*", "ORIENTANY_*", "ORIENTANY2_*"],
     device: torch.device,
     batch_size: int = 64,
     enable_cache: bool = True,
@@ -274,19 +249,11 @@ def extract_features_for_dataset(
     Returns:
         BatchFeatureLoader for efficient batch loading during training
     """
-    # Get args class - for CLIPSAM, always use CLIPSAMArgs regardless of specific feature type
-    if feature_type.startswith("CLIPSAM_"):
-        args = CLIPSAMArgs
-    elif feature_type.startswith("FOREGROUND_"):
-        args = FOREGROUNDArgs
-    elif feature_type.startswith("ORIENTANY_"):
-        args = ORIENTANYArgs
-    else:
-        args = FEAT_TYPE_TO_ARGS[feature_type]
+    args_cls, extractor_cls, parse_fn, _ = _lazy_import_components(feature_type)
 
     CONSOLE.print(f"[DEBUG] {feature_type}: enable_cache={enable_cache}, checking for cached features...")
     loader_result = (
-        feature_loader(image_fnames, args, data_dir, feature_type)
+        feature_loader(image_fnames, args_cls, data_dir, feature_type)
         if enable_cache and not force
         else None
     )
@@ -302,8 +269,9 @@ def extract_features_for_dataset(
             image_fnames=image_fnames,
             data_dir=data_dir,
             feature_type=feature_type,
-            extractor_class=FEAT_TYPE_TO_EXTRACTOR_CLASS.get(feature_type, None),
-            args_cls=args,
+            args_cls=args_cls,
+            extractor_cls=extractor_cls,
+            parse_fn=parse_fn,
             device=device,
             batch_size=batch_size,
         )
@@ -316,7 +284,7 @@ def extract_features_for_dataset(
 
 def extract_features_standalone(
     data_dir: Path,
-    feature_type: Literal["CLIP", "DINO", "SAM2", "TEXT", "CLIPSAM_*", "FOREGROUND_*", "ORIENTANY_*"],
+    feature_type: Literal["CLIP", "DINO", "SAM2", "SAM3_*", "TEXT", "CLIPSAM_*", "FOREGROUND_*", "ORIENTANY_*", "ORIENTANY2_*"],
     batch_size: int = 64,
     device: str = "auto",
     force: bool = False,
@@ -374,7 +342,9 @@ def main():
             "- CLIPSAM: 'CLIPSAM_book' or 'CLIPSAM_book_pen' (global prompts), 'CLIPSAM_' (use TEXT shards).\n"
             "- FOREGROUND: 'FOREGROUND_book' or 'FOREGROUND_book_pen' (global), 'FOREGROUND_' (use TEXT shards).\n"
             "- ORIENTANY: 'ORIENTANY_book' or 'ORIENTANY_book_pen' (global), 'ORIENTANY_' (use TEXT shards).\n"
-            "Examples: CLIP, DINO, SAM2, TEXT, CLIPSAM_book, CLIPSAM_, FOREGROUND_book, FOREGROUND_, ORIENTANY_book, ORIENTANY_."
+            "- ORIENTANY2: 'ORIENTANY2_book' or 'ORIENTANY2_book_pen' (global), 'ORIENTANY2_' (use TEXT shards).\n"
+            "- SAM3: 'SAM3_book' or 'SAM3_book_pen' (global), 'SAM3_' (use TEXT shards).\n"
+            "Examples: CLIP, DINO, SAM2, SAM3_book, SAM3_, TEXT, CLIPSAM_book, CLIPSAM_, FOREGROUND_book, FOREGROUND_, ORIENTANY_book, ORIENTANY_, ORIENTANY2_book, ORIENTANY2_."
         )
     )
 
