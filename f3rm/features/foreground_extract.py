@@ -153,8 +153,12 @@ class FOREGROUNDWorker:
         # Per-prompt sim maps and combine
         segment_sim_maps: List[np.ndarray] = []
         for text in text_prompts:
-            text_emb = self.clip_model.encode_text(text).half()
-            neg_text_embs = torch.stack([self.clip_model.encode_text(neg).half() for neg in FOREGROUNDArgs.negative_texts], dim=0)
+            text_emb = self.clip_model.encode_text(text).to(
+                device=clip_patch_feats.device, dtype=clip_patch_feats.dtype
+            )
+            neg_text_embs = torch.stack(
+                [self.clip_model.encode_text(neg) for neg in FOREGROUNDArgs.negative_texts], dim=0
+            ).to(device=clip_patch_feats.device, dtype=clip_patch_feats.dtype)
             sim_map = self.clip_model.compute_similarity(
                 clip_patch_feats,
                 text_emb,

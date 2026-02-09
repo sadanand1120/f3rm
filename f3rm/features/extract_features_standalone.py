@@ -18,12 +18,11 @@ Supported feature types: CLIP, DINO, SAM2, SAM3_*, TEXT, CLIPSAM_*, FOREGROUND_*
 """
 
 import argparse
-import asyncio
 import gc
 import json
 import math
 from pathlib import Path
-from typing import Dict, List, Literal, Union, Optional, Tuple, Callable, Any, Type
+from typing import List, Literal, Optional, Callable, Any, Type
 
 import torch
 import numpy as np
@@ -31,7 +30,7 @@ from nerfstudio.data.dataparsers.nerfstudio_dataparser import NerfstudioDataPars
 from nerfstudio.utils.rich_utils import CONSOLE
 from tqdm.auto import tqdm
 
-from f3rm.features.utils import run_async_in_any_context, pack_auto_masks, unpack_auto_masks, BatchFeatureLoader, get_cache_paths
+from f3rm.features.utils import run_async_in_any_context, pack_auto_masks, BatchFeatureLoader, get_cache_paths
 
 
 def _lazy_import_components(feature_type: str):
@@ -101,6 +100,8 @@ async def _save_per_image_generic(
 ):
     root, meta = get_cache_paths(data_dir, feature_type)
     root.mkdir(parents=True, exist_ok=True)
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be > 0, got {batch_size}")
     n_imgs = len(image_fnames)
     n_batches = math.ceil(n_imgs / batch_size)
 
@@ -124,7 +125,7 @@ async def _save_per_image_generic(
         data = await extractor.extract_batch_async(batch_paths)
 
         # Save each image's features individually
-        for j, img_path in enumerate(batch_paths):
+        for j in range(len(batch_paths)):
             img_idx = s + j
 
             if feature_type in ("CLIP", "DINO"):
@@ -153,22 +154,46 @@ async def _save_per_image_generic(
                     json.dump(data[j], f, indent=2)
 
         del data
-        torch.cuda.empty_cache()
-        gc.collect()
+        if torch.cuda.is_available() and ((i + 1) % 10 == 0 or i == n_batches - 1):
+            torch.cuda.empty_cache()
+            gc.collect()
 
     torch.save({"args": args_cls.id_dict(), "image_fnames": image_fnames}, meta)
     CONSOLE.print(f"Saved {feature_type} per-image features → {root}")
 
 
-def feature_loader(image_fnames: List[str], extract_args, data_dir: Path, feature_type: str) -> Optional[BatchFeatureLoader]:
-    """Check if cached features exist and return a BatchFeatureLoader."""
+def _cache_file_count_matches(root: Path, feature_type: str, num_images: int) -> bool:
+    """Fast cache consistency check by expected per-image file counts."""
+    if num_images == 0:
+        return True
+
+    if feature_type in ("CLIP", "DINO") or feature_type.startswith("FOREGROUND_"):
+        return len(list(root.glob("image_*.npy"))) == num_images
+    if feature_type.startswith("ORIENTANY_") or feature_type.startswith("ORIENTANY2_"):
+        return (
+            len(list(root.glob("image_*_pixel.npy"))) == num_images
+            and len(list(root.glob("image_*_instances.json"))) == num_images
+        )
+    if feature_type.startswith("CLIPSAM_") or feature_type == "SAM2" or feature_type.startswith("SAM3_"):
+        return len(list(root.glob("image_*.npz"))) == num_images
+    if feature_type == "TEXT":
+        return len(list(root.glob("image_*.json"))) == num_images
+    return False
+
+
+def feature_loader(image_fnames: List[str], extract_args, data_dir: Path, feature_type: str) -> bool:
+    """Return True if cached features are valid for the current args and image ordering."""
     root, meta = get_cache_paths(data_dir, feature_type)
 
     if not meta.exists():
         CONSOLE.print(f"[DEBUG] {feature_type}: CACHE MISS - Metadata file does not exist")
-        return None
+        return False
 
-    md = torch.load(meta)
+    try:
+        md = torch.load(meta, map_location="cpu")
+    except Exception as exc:
+        CONSOLE.print(f"[DEBUG] {feature_type}: CACHE MISS - Failed reading metadata ({exc})")
+        return False
 
     # Check args match
     current_args = extract_args.id_dict()
@@ -183,27 +208,14 @@ def feature_loader(image_fnames: List[str], extract_args, data_dir: Path, featur
 
     if not args_match or not fnames_match:
         CONSOLE.print(f"[DEBUG] {feature_type}: CACHE MISS - {'Args' if not args_match else 'Filenames'} don't match")
-        return None
+        return False
 
-    # Check per-image files exist
-    sample_paths = []
-    if feature_type.startswith("CLIPSAM_") or feature_type == "SAM2":
-        sample_paths = [root / f"image_{i:06d}.npz" for i in range(min(3, len(image_fnames)))]
-    elif feature_type == "TEXT":
-        sample_paths = [root / f"image_{i:06d}.json" for i in range(min(3, len(image_fnames)))]
-    elif feature_type.startswith("ORIENTANY_") or feature_type.startswith("ORIENTANY2_"):
-        sample_paths = [root / f"image_{i:06d}_pixel.npy" for i in range(min(3, len(image_fnames)))]
-    elif feature_type.startswith("SAM3_"):
-        sample_paths = [root / f"image_{i:06d}.npz" for i in range(min(3, len(image_fnames)))]
-    else:
-        sample_paths = [root / f"image_{i:06d}.npy" for i in range(min(3, len(image_fnames)))]
-
-    if not all(p.exists() for p in sample_paths):
-        CONSOLE.print(f"[DEBUG] {feature_type}: CACHE MISS - Per-image files not found")
-        return None
+    if not _cache_file_count_matches(root, feature_type, len(image_fnames)):
+        CONSOLE.print(f"[DEBUG] {feature_type}: CACHE MISS - Per-image file count mismatch")
+        return False
 
     CONSOLE.print(f"[DEBUG] {feature_type}: CACHE HIT - Using batch feature loader")
-    return "BATCH_LOADER"  # Placeholder - will be replaced with actual loader in extract_features_for_dataset
+    return True
 
 
 def get_image_filenames_from_dataparser(data_dir: Path) -> List[str]:
@@ -249,16 +261,19 @@ def extract_features_for_dataset(
     Returns:
         BatchFeatureLoader for efficient batch loading during training
     """
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be > 0, got {batch_size}")
+
     args_cls, extractor_cls, parse_fn, _ = _lazy_import_components(feature_type)
 
     CONSOLE.print(f"[DEBUG] {feature_type}: enable_cache={enable_cache}, checking for cached features...")
-    loader_result = (
+    cache_hit = (
         feature_loader(image_fnames, args_cls, data_dir, feature_type)
         if enable_cache and not force
-        else None
+        else False
     )
 
-    if loader_result is not None:
+    if cache_hit:
         CONSOLE.print(f"[{feature_type}] Using cached features")
         return BatchFeatureLoader(data_dir, feature_type, image_fnames, device, max_cpu_images=max_cpu_images, max_gpu_images=max_gpu_images)
 
@@ -288,7 +303,7 @@ def extract_features_standalone(
     batch_size: int = 64,
     device: str = "auto",
     force: bool = False,
-) -> None:
+) -> BatchFeatureLoader:
     """Extract features standalone."""
 
     # Setup device
@@ -314,10 +329,11 @@ def extract_features_standalone(
     )
 
     # Cleanup
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     gc.collect()
     CONSOLE.print("Feature extraction completed!")
-    return batch_loader  # Return for potential use in testing
+    return batch_loader
 
 
 def main():
