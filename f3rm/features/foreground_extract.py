@@ -74,7 +74,7 @@ class FOREGROUNDWorker:
 
         self.clip_model = CLIPfeatures(device=self.device)
 
-    async def compute_foreground_for_image_async(self, image_path: str) -> np.ndarray:
+    def _compute_foreground_for_image(self, image_path: str) -> np.ndarray:
         # map image → index
         try:
             idx = self.feat_image_fnames.index(str(image_path))
@@ -191,6 +191,9 @@ class FOREGROUNDWorker:
 
         one_hot = np.stack([~fg_mask, fg_mask], axis=-1).astype(np.float16)  # Use fp16 for VRAM efficiency
         return one_hot
+
+    async def compute_foreground_for_image_async(self, image_path: str) -> np.ndarray:
+        return await asyncio.to_thread(self._compute_foreground_for_image, image_path)
 
 
 class FOREGROUNDExtractor:

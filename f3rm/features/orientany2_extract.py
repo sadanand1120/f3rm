@@ -1,3 +1,4 @@
+import asyncio
 import gc
 import json
 import os
@@ -196,7 +197,7 @@ class ORIENTANY2Worker:
         self.T_orig_to_final_nerf_world = T_orig_to_final_nerf_world
         self.orig_to_final_nerf_world_scale = orig_to_final_nerf_world_scale
 
-    async def compute_orientany2_for_image_async(self, image_path: str, debug: bool = False) -> Dict[str, Any]:
+    def _compute_orientany2_for_image(self, image_path: str, debug: bool = False) -> Dict[str, Any]:
         del debug
         try:
             idx = self.feat_image_fnames.index(str(image_path))
@@ -246,6 +247,9 @@ class ORIENTANY2Worker:
 
         pixel_data = _create_pixel_data(h, w, obj_masks)
         return {"pixel_data": pixel_data, "instance_features": instance_features}
+
+    async def compute_orientany2_for_image_async(self, image_path: str, debug: bool = False) -> Dict[str, Any]:
+        return await asyncio.to_thread(self._compute_orientany2_for_image, image_path, debug)
 
 
 class ORIENTANY2Extractor:

@@ -38,3 +38,4 @@ python3 setup.py develop
 pip install https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3%2Bcu128torch2.8-cp311-cp311-linux_x86_64.whl
 cd ../sam-3d-objects
 pip install -e .
+cd /robodata/smodak/repos/sam2 && pip install -e .

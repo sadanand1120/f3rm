@@ -122,8 +122,7 @@ class CLIPSAMWorker:
             })
         return packed
 
-    async def filter_auto_masks_for_image_async(self, image_path: str) -> List[dict]:
-        """Async version for worker."""
+    def _filter_auto_masks_for_image(self, image_path: str) -> List[dict]:
         # Map image → index (consistent with CLIP shard order)
         try:
             feat_image_index = self.feat_image_fnames.index(str(image_path))
@@ -210,6 +209,9 @@ class CLIPSAMWorker:
 
         return filtered
 
+    async def filter_auto_masks_for_image_async(self, image_path: str) -> List[dict]:
+        return await asyncio.to_thread(self._filter_auto_masks_for_image, image_path)
+
 
 class CLIPSAMExtractor:
     def __init__(self, device: torch.device, data_dir: Optional[Path] = None, text_prompts: Optional[List[str]] = None, verbose: bool = False) -> None:
@@ -256,7 +258,7 @@ class CLIPSAMExtractor:
             for _ in range(self.num_workers):
                 try:
                     # Use synchronous warm-up since we're not in async context
-                    _ = self.client.filter_auto_masks_for_image_async(warmup_path)
+                    _ = self.client._filter_auto_masks_for_image(warmup_path)
                 except Exception:
                     pass  # Warm-up may fail, that's okay
 

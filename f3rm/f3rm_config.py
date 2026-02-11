@@ -27,6 +27,10 @@ f3rm_method = MethodSpecification(
         steps_per_save=5000,
         max_num_iterations=80000,
         mixed_precision=True,
+        use_grad_scaler=True,
+        deterministic_mode=True,
+        deterministic_warn_only=False,
+        amp_disable_on_instability=False,
         pipeline=FeaturePipelineConfig(
             datamanager=FeatureDataManagerConfig(
                 feature_type="CLIP",
@@ -43,6 +47,7 @@ f3rm_method = MethodSpecification(
             ),
             model=FeatureFieldModelConfig(
                 camera_optimizer=CameraOptimizerConfig(mode="SO3xR3"),  # "SO3xR3" or "off"
+                implementation="tcnn",  # for determinism use "torch", other option is "tcnn" for 5x speedup
                 eval_num_rays_per_chunk=1 << 14,
                 predict_normals=True,
                 num_proposal_iterations=2,  # May reduce proposal iterations for speed
@@ -58,11 +63,11 @@ f3rm_method = MethodSpecification(
         optimizers={
             "proposal_networks": {
                 "optimizer": AdamOptimizerConfig(lr=1e-2, eps=1e-15, max_norm=1.0),
-                "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, warmup_steps=1000, max_steps=200000),
+                "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, warmup_steps=1000, max_steps=80000),
             },
             "fields": {
                 "optimizer": AdamOptimizerConfig(lr=1e-2, eps=1e-15, max_norm=1.0),
-                "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, warmup_steps=1000, max_steps=200000),
+                "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, warmup_steps=1000, max_steps=80000),
             },
             "feature_field": {
                 "optimizer": AdamOptimizerConfig(lr=5e-3, eps=1e-15, max_norm=1.0),

@@ -1,3 +1,4 @@
+import asyncio
 import gc
 import json
 import os
@@ -217,7 +218,7 @@ class ORIENTANYWorker:
         else:
             raise ValueError("transforms.json not found")
 
-    async def compute_orientany_for_image_async(self, image_path: str, debug: bool = False) -> Dict[str, Any]:
+    def _compute_orientany_for_image(self, image_path: str, debug: bool = False) -> Dict[str, Any]:
         try:
             idx = self.feat_image_fnames.index(str(image_path))
         except ValueError:
@@ -276,6 +277,9 @@ class ORIENTANYWorker:
         pixel_data = _create_pixel_data(h, w, obj_masks)
 
         return {"pixel_data": pixel_data, "instance_features": instance_features}
+
+    async def compute_orientany_for_image_async(self, image_path: str, debug: bool = False) -> Dict[str, Any]:
+        return await asyncio.to_thread(self._compute_orientany_for_image, image_path, debug)
 
 
 class ORIENTANYExtractor:

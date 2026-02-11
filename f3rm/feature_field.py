@@ -1,11 +1,13 @@
-from typing import Dict, Tuple
+from typing import Dict, Literal, Optional, Tuple
 
-import numpy as np
-import tinycudann as tcnn
+import torch
 from jaxtyping import Float, Shaped
 from nerfstudio.cameras.rays import RaySamples
+from nerfstudio.field_components.encodings import HashEncoding, NeRFEncoding
+from nerfstudio.field_components.mlp import MLP
 from nerfstudio.field_components.spatial_distortions import SpatialDistortion
 from nerfstudio.fields.base_field import Field
+from torch import nn
 from torch import Tensor
 
 
@@ -30,57 +32,52 @@ class FeatureField(Field):
         num_layers: int = 2,
         foreground_hidden_dim: int = 64,
         foreground_num_layers: int = 1,
+        implementation: Literal["tcnn", "torch"] = "tcnn",
     ):
         super().__init__()
         self.feature_dim = feature_dim
         self.spatial_distortion = spatial_distortion
-        growth_factor = np.exp((np.log(max_res) - np.log(start_res)) / (num_levels - 1))
-        encoding_config = {
-            "otype": "Composite",
-            "nested": [
-                {
-                    "otype": "HashGrid",
-                    "n_levels": num_levels,
-                    "n_features_per_level": features_per_level,
-                    "log2_hashmap_size": log2_hashmap_size,
-                    "base_resolution": start_res,
-                    "per_level_scale": growth_factor,
-                }
-            ],
-        }
 
+        self.hash_encoding = HashEncoding(
+            num_levels=num_levels,
+            min_res=start_res,
+            max_res=max_res,
+            log2_hashmap_size=log2_hashmap_size,
+            features_per_level=features_per_level,
+            implementation=implementation,
+        )
+        self.pe_encoding: Optional[NeRFEncoding] = None
         if use_pe:
-            encoding_config["nested"].append(
-                {
-                    "otype": "Frequency",
-                    "n_frequencies": pe_n_freq,
-                    "n_dims_to_encode": 3,
-                }
+            self.pe_encoding = NeRFEncoding(
+                in_dim=3,
+                num_frequencies=pe_n_freq,
+                min_freq_exp=0,
+                max_freq_exp=pe_n_freq - 1,
+                implementation=implementation,
             )
 
-        self.encoding = tcnn.Encoding(n_input_dims=3, encoding_config=encoding_config)
-        self.mlp_feature = tcnn.Network(
-            n_input_dims=self.encoding.n_output_dims,
-            n_output_dims=self.feature_dim,
-            network_config={
-                "otype": "FullyFusedMLP",
-                "activation": "ReLU",
-                "output_activation": "None",
-                "n_neurons": hidden_dim,
-                "n_hidden_layers": num_layers,
-            },
+        enc_out_dim = self.hash_encoding.get_out_dim()
+        if self.pe_encoding is not None:
+            enc_out_dim += self.pe_encoding.get_out_dim()
+
+        self.mlp_feature = MLP(
+            in_dim=enc_out_dim,
+            num_layers=num_layers,
+            layer_width=hidden_dim,
+            out_dim=self.feature_dim,
+            activation=nn.ReLU(),
+            out_activation=None,
+            implementation=implementation,
         )
 
-        self.mlp_foreground = tcnn.Network(
-            n_input_dims=self.encoding.n_output_dims,
-            n_output_dims=2,
-            network_config={
-                "otype": "FullyFusedMLP",
-                "activation": "ReLU",
-                "output_activation": "None",
-                "n_neurons": foreground_hidden_dim,
-                "n_hidden_layers": foreground_num_layers,
-            },
+        self.mlp_foreground = MLP(
+            in_dim=enc_out_dim,
+            num_layers=foreground_num_layers,
+            layer_width=foreground_hidden_dim,
+            out_dim=2,
+            activation=nn.ReLU(),
+            out_activation=None,
+            implementation=implementation,
         )
 
     def get_density(self, ray_samples: RaySamples) -> Tuple[Shaped[Tensor, "*batch 1"], Float[Tensor, "*batch num_features"]]:
@@ -90,7 +87,11 @@ class FeatureField(Field):
         """Apply scene contraction and encode positions once."""
         positions = ray_samples.frustums.get_positions().detach()
         positions = self._preprocess_positions(positions)
-        return self.encoding(positions.view(-1, 3))
+        positions_flat = positions.view(-1, 3)
+        encoded = [self.hash_encoding(positions_flat)]
+        if self.pe_encoding is not None:
+            encoded.append(self.pe_encoding(positions_flat))
+        return torch.cat(encoded, dim=-1) if len(encoded) > 1 else encoded[0]
 
     def _preprocess_positions(self, positions: Tensor) -> Tensor:
         """Apply scene contraction and range normalization to positions."""
@@ -108,8 +109,9 @@ class FeatureField(Field):
         logits = self.mlp_foreground(encoded_base).view(*ray_samples.frustums.directions.shape[:-1], -1)
         return logits
 
-    def get_outputs(self, ray_samples: RaySamples) -> Dict[str, Tensor]:
+    def get_outputs(self, ray_samples: RaySamples, density_embedding: Optional[Tensor] = None) -> Dict[str, Tensor]:
         """Compute all field outputs."""
+        del density_embedding  # Unused for this field; kept for Field API compatibility.
         features = self.get_feature(ray_samples)
         foreground = self.get_foreground(ray_samples)
 

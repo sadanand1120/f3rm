@@ -149,6 +149,7 @@ class FeatureFieldModel(NerfactoModel):
             num_layers=self.config.feat_num_layers,
             foreground_hidden_dim=self.config.foreground_hidden_dim,
             foreground_num_layers=self.config.foreground_num_layers,
+            implementation=self.config.implementation,
         )
 
         self.renderer_feature = FeatureRenderer()
@@ -188,6 +189,10 @@ class FeatureFieldModel(NerfactoModel):
 
     def _get_outputs_internal(self, ray_bundle: RayBundle, render_features: bool):
         """Core rendering that can optionally skip feature-field computation."""
+        # Match Nerfacto behavior: apply learned camera pose deltas during training.
+        if self.training:
+            self.camera_optimizer.apply_to_raybundle(ray_bundle)
+
         ray_samples: RaySamples
         ray_samples, weights_list, ray_samples_list = self.proposal_sampler(ray_bundle, density_fns=self.density_fns)
         field_outputs = self.field.forward(ray_samples, compute_normals=self.config.predict_normals)
@@ -201,8 +206,8 @@ class FeatureFieldModel(NerfactoModel):
         rgb = self.renderer_rgb(rgb=field_outputs[FieldHeadNames.RGB], weights=weights)
         with torch.no_grad():
             depth = self.renderer_depth(weights=weights, ray_samples=ray_samples)
-            expected_depth = self.renderer_expected_depth(weights=weights, ray_samples=ray_samples)
-            accumulation = self.renderer_accumulation(weights=weights)
+        expected_depth = self.renderer_expected_depth(weights=weights, ray_samples=ray_samples)
+        accumulation = self.renderer_accumulation(weights=weights)
 
         # Always use detached weights to avoid gradients flowing to NeRF/cameras
         custom_weights = weights.detach()
@@ -261,10 +266,11 @@ class FeatureFieldModel(NerfactoModel):
     def get_metrics_dict(self, outputs, batch):
         metrics_dict = super().get_metrics_dict(outputs, batch)
         # Feature metrics
-        target_feats = batch["feature"].to(self.device)
-        metrics_dict["feature_error"] = F.mse_loss(outputs["feature"], target_feats)
+        target_feats = batch["feature"].to(device=self.device, dtype=torch.float32)
+        pred_feats = outputs["feature"].to(dtype=torch.float32)
+        metrics_dict["feature_error"] = F.mse_loss(pred_feats, target_feats)
         # Foreground metrics
-        probs = torch.softmax(outputs["foreground_logits"], dim=-1)
+        probs = torch.softmax(outputs["foreground_logits"].to(dtype=torch.float32), dim=-1)
         fg_target = batch["foreground"].to(self.device)
         pred = probs.argmax(dim=-1)
         targ = fg_target.argmax(dim=-1)
@@ -274,10 +280,11 @@ class FeatureFieldModel(NerfactoModel):
     def get_loss_dict(self, outputs, batch, metrics_dict=None):
         loss_dict = super().get_loss_dict(outputs, batch, metrics_dict)
         # Feature loss
-        target_feats = batch["feature"].to(self.device)
-        loss_dict["feature_loss"] = self.config.feat_loss_weight * F.mse_loss(outputs["feature"], target_feats)
+        target_feats = batch["feature"].to(device=self.device, dtype=torch.float32)
+        pred_feats = outputs["feature"].to(dtype=torch.float32)
+        loss_dict["feature_loss"] = self.config.feat_loss_weight * F.mse_loss(pred_feats, target_feats)
         # Foreground loss
-        fg_logits = outputs["foreground_logits"].view(-1, 2)
+        fg_logits = outputs["foreground_logits"].to(dtype=torch.float32).view(-1, 2)
         fg_target = batch["foreground"].to(self.device)
         fg_target_idx = fg_target.argmax(dim=-1).view(-1)
         ce = F.cross_entropy(fg_logits, fg_target_idx)
@@ -287,6 +294,7 @@ class FeatureFieldModel(NerfactoModel):
     @torch.no_grad()
     def get_outputs_for_camera_ray_bundle(self, camera_ray_bundle: RayBundle, render_features: bool = True) -> Dict[str, torch.Tensor]:
         """Full-image render with optional feature computation. Features are kept on CPU."""
+        input_device = camera_ray_bundle.directions.device
         num_rays_per_chunk = self.config.eval_num_rays_per_chunk
         image_height, image_width = camera_ray_bundle.origins.shape[:2]
         num_rays = len(camera_ray_bundle)
@@ -305,9 +313,9 @@ class FeatureFieldModel(NerfactoModel):
                 if output_name.startswith("feature"):
                     outputs_lists[output_name].append(output.cpu())
                 else:
-                    outputs_lists[output_name].append(output)
+                    outputs_lists[output_name].append(output.to(input_device))
                 del output
-            if (i // num_rays_per_chunk) % 50 == 0:
+            if torch.cuda.is_available() and (i // num_rays_per_chunk) % 50 == 0:
                 torch.cuda.empty_cache()
         outputs: Dict[str, torch.Tensor] = {}
         for output_name, outputs_list in outputs_lists.items():

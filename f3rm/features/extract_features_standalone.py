@@ -398,18 +398,22 @@ def main():
 
     CONSOLE.print(f"Extracting {args.feature_type} features from {args.data}")
 
-    # Extract features
-    extract_features_standalone(
-        data_dir=args.data,
-        feature_type=args.feature_type,
-        batch_size=args.batch_size,
-        device=args.device,
-        force=args.force,
-    )
+    try:
+        # Extract features
+        extract_features_standalone(
+            data_dir=args.data,
+            feature_type=args.feature_type,
+            batch_size=args.batch_size,
+            device=args.device,
+            force=args.force,
+        )
 
-    # Create visualization video
-    CONSOLE.print("Creating visualization video...")
-    create_feature_visualization(args.data, args.feature_type)
+        # Create visualization video
+        CONSOLE.print("Creating visualization video...")
+        create_feature_visualization(args.data, args.feature_type)
+    except KeyboardInterrupt:
+        CONSOLE.print("[yellow]Interrupted by user (Ctrl+C). Exiting cleanly.")
+        raise SystemExit(130)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 import gc
+import asyncio
 import glob
 import os
 import shutil
@@ -77,7 +78,7 @@ class SAM3Worker:
         )
 
     @torch.inference_mode()
-    async def compute_masks_for_image_async(self, image_path: str) -> np.ndarray:
+    def _compute_masks_for_image(self, image_path: str) -> np.ndarray:
         if self.text_loader is not None:
             try:
                 idx = self.feat_image_fnames.index(str(image_path))
@@ -119,6 +120,9 @@ class SAM3Worker:
 
         stacked = torch.cat(mask_tensors, dim=0)
         return stacked.numpy()
+
+    async def compute_masks_for_image_async(self, image_path: str) -> np.ndarray:
+        return await asyncio.to_thread(self._compute_masks_for_image, image_path)
 
 
 class SAM3Extractor:

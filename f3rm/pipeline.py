@@ -75,6 +75,14 @@ class FeaturePipeline(VanillaPipeline):
             return int(image_idx.item())
         return int(image_idx)
 
+    def _get_deterministic_eval_camera_and_batch(self, step: int):
+        """Pick eval image deterministically to keep eval logs reproducible."""
+        if hasattr(self.datamanager, "fixed_indices_eval_dataloader") and self.datamanager.eval_dataset is not None:
+            num_eval = len(self.datamanager.eval_dataset)
+            image_idx = step % max(num_eval, 1)
+            return self.datamanager.fixed_indices_eval_dataloader.get_camera(image_idx)
+        return self.datamanager.next_eval_image(step)
+
     def _log_train_images_for_step(self, batch: Dict, step: int) -> None:
         # Select a representative train camera from the current sampled batch.
         if "indices" not in batch:
@@ -88,9 +96,8 @@ class FeaturePipeline(VanillaPipeline):
         ci = int(unique_cams[0])
         # Build and render full-image outputs for that train camera.
         cams = self.datamanager.train_ray_generator.cameras
-        c_tensor = torch.tensor([ci], device=cams.device)
-        camera_opt_to_camera = self.model.camera_optimizer(c_tensor)
-        camera_ray_bundle = cams.generate_rays(camera_indices=ci, camera_opt_to_camera=camera_opt_to_camera)
+        # Camera optimizer is applied inside model.get_outputs while training.
+        camera_ray_bundle = cams.generate_rays(camera_indices=ci, keep_shape=True)
         outputs = self._render_outputs_with_progress(
             camera_ray_bundle, description="Rendering train image", render_features=True
         )
@@ -112,8 +119,8 @@ class FeaturePipeline(VanillaPipeline):
     @profiler.time_function
     def get_eval_image_metrics_and_images(self, step: int):
         self.eval()
-        # Retrieve one eval camera + batch using the current Nerfstudio datamanager API.
-        camera, batch = self.datamanager.next_eval_image(step)
+        # Retrieve one eval camera/batch deterministically for reproducible eval curves.
+        camera, batch = self._get_deterministic_eval_camera_and_batch(step)
         camera_ray_bundle = camera.generate_rays(camera_indices=0, keep_shape=True)
         # Render full-image outputs and compute base image metrics/artifacts.
         outputs = self._render_outputs_with_progress(
