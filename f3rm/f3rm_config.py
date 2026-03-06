@@ -11,7 +11,7 @@ from f3rm.trainer import F3RMTrainerConfig
 from f3rm.pipeline import FeaturePipelineConfig
 
 # TODO: Look at https://docs.nerf.studio/nerfology/methods/nerfacto.html, try bigger model for better scenes!
-# TODO: (maybe) replace the f3rm utils's pca with ur sam2 pca (did speed testing, both were almost same)
+# TODO: (maybe) revisit PCA implementation for feature visualization (previous speed tests were similar)
 # TODO: optimize code by calling super().bla at places (e.g. super().get_train_loss_dict() in pipeline.py)
 # TODO: reduce training time, look at original feature loading (.pt based) in f3rm, maybe thats the issue?
 # TODO: do model compression so training time is reduced as well, instead of having separate entire MLPs, just have a larger common trunk where possible, and have separate output heads

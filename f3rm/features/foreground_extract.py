@@ -11,185 +11,87 @@ from PIL import Image
 from tqdm.auto import tqdm
 import matplotlib.pyplot as plt
 
-from sam2.features.utils import SAM2utils
-from sam2.features.clip_main import CLIPfeatures
 from sam2.features.utils import AsyncMultiWrapper
 
-from f3rm.features.utils import run_async_in_any_context, resolve_devices_and_workers
-from f3rm.features.utils import BatchFeatureLoader
-from f3rm.features.sam2_extract import SAM2Args
+from f3rm.features.utils import (
+    BatchFeatureLoader,
+    ensure_sam3_feature_cache,
+    infer_sam3_feature_type,
+    load_sam3_image_fnames,
+    normalize_sam3_masks,
+    parse_prefixed_feature_type,
+    resolve_devices_and_workers,
+    run_async_in_any_context,
+)
 
 
 class FOREGROUNDArgs:
-    negative_texts: List[str] = ["object", "floor", "wall"]
-    softmax_temp: float = 0.01
-    top_mean_percent: float = 15.0
-    sim_thresh: float = 0.7
     min_instance_percent: float = 1.0
     batch_size_per_gpu: int = 8
 
     @classmethod
     def id_dict(cls):
         return {
-            "negative_texts": list(cls.negative_texts),
-            "softmax_temp": float(cls.softmax_temp),
-            "top_mean_percent": float(cls.top_mean_percent),
-            "sim_thresh": float(cls.sim_thresh),
             "min_instance_percent": float(cls.min_instance_percent),
         }
 
 
 def parse_foreground_feature_type(feature_type: str) -> List[str]:
-    if not feature_type.startswith("FOREGROUND_"):
-        raise ValueError(f"Invalid FOREGROUND feature type: {feature_type}. Must start with 'FOREGROUND_'")
-    prompts_part = feature_type[len("FOREGROUND_"):]
-    if prompts_part == "":
-        return []
-    return [w.lower() for w in prompts_part.split("_") if w.strip()]
+    return parse_prefixed_feature_type(feature_type, "FOREGROUND_")
 
 
 class FOREGROUNDWorker:
-    def __init__(self, device: torch.device, data_dir: Path, text_prompts: Optional[List[str]] = None):
+    def __init__(
+        self,
+        device: torch.device,
+        data_dir: Path,
+        sam3_feature_type: str = "SAM3_",
+    ):
         self.device = device
         self.data_dir = Path(data_dir)
-        self.text_prompts = text_prompts
+        self.sam3_feature_type = sam3_feature_type
 
-        feat_root = self.data_dir / "features"
-        clip_root = feat_root / "clip"
-        sam2_root = feat_root / "sam2"
-        text_root = feat_root / "text"
+        self.feat_image_fnames = load_sam3_image_fnames(self.data_dir, self.sam3_feature_type)
+        sam3_image_fnames = self.feat_image_fnames
+        self._image_to_index = {fname: i for i, fname in enumerate(self.feat_image_fnames)}
+        self.sam3_loader = BatchFeatureLoader(self.data_dir, self.sam3_feature_type, sam3_image_fnames, device)
 
-        # Load meta to align indices
-        clip_meta = torch.load(clip_root / "meta.pt")
-        self.feat_image_fnames = [str(p) for p in clip_meta["image_fnames"]]
-
-        # Create batch feature loaders for the new per-image system
-        self.clip_loader = BatchFeatureLoader(self.data_dir, "CLIP", self.feat_image_fnames, device)
-        self.sam2_loader = BatchFeatureLoader(self.data_dir, "SAM2", self.feat_image_fnames, device)
-
-        if self.text_prompts is None:
-            self.text_loader = BatchFeatureLoader(self.data_dir, "TEXT", self.feat_image_fnames, device)
-        else:
-            self.text_loader = None
-
-        self.clip_model = CLIPfeatures(device=self.device)
+    @staticmethod
+    def _filter_masks_by_area(masks: np.ndarray, min_instance_percent: float) -> np.ndarray:
+        if masks.size == 0:
+            return masks
+        h, w = masks.shape[-2:]
+        total_pixels = max(1, h * w)
+        keep = []
+        for mask in masks:
+            if mask.shape != (h, w):
+                continue
+            percent = (float(mask.sum()) / float(total_pixels)) * 100.0
+            if percent >= min_instance_percent:
+                keep.append(mask)
+        if not keep:
+            return np.zeros((0, h, w), dtype=bool)
+        return np.stack(keep, axis=0).astype(bool)
 
     def _compute_foreground_for_image(self, image_path: str) -> np.ndarray:
-        # map image → index
         try:
-            idx = self.feat_image_fnames.index(str(image_path))
-        except ValueError:
-            raise ValueError(f"Image path not found in CLIP meta order: {image_path}")
+            idx = self._image_to_index[str(image_path)]
+        except KeyError as exc:
+            raise ValueError(f"Image path not found in SAM3 meta order: {image_path}") from exc
 
-        clip_patch_feats = self.clip_loader[idx]
-        raw_auto_masks = self.sam2_loader[idx]
+        raw_masks = self.sam3_loader[idx]
+        masks = normalize_sam3_masks(raw_masks, image_path=image_path)
+        masks = self._filter_masks_by_area(masks, FOREGROUNDArgs.min_instance_percent)
 
-        # prompts
-        if self.text_prompts is None:
-            text_prompts = self.text_loader[idx]
-        else:
-            text_prompts = self.text_prompts
-
-        if not raw_auto_masks or not text_prompts:
-            # Return all background
-            h, w = (raw_auto_masks[0]['segmentation'].shape if raw_auto_masks else (Image.open(image_path).size[1], Image.open(image_path).size[0]))
-            fg = np.zeros((h, w), dtype=bool)
-            one_hot = np.stack([~fg, fg], axis=-1).astype(np.float16)  # Use fp16 for VRAM efficiency
-            return one_hot
-
-        # Instance mask from SAM2
-        inst_mask, _ = SAM2utils.auto_masks_to_instance_mask(
-            raw_auto_masks,
-            min_iou=float(SAM2Args.pred_iou_thresh) if SAM2Args.pred_iou_thresh is not None else 0.0,
-            min_area=float(SAM2Args.min_mask_region_area) if SAM2Args.min_mask_region_area is not None else 0.0,
-            assign_by="area",
-            start_from="low",
-        )
-        if inst_mask is None:
-            if raw_auto_masks:
-                h, w = raw_auto_masks[0]['segmentation'].shape
-            else:
-                img = Image.open(image_path)
+        if masks.size == 0:
+            with Image.open(image_path) as img:
                 h, w = img.height, img.width
-            inst_mask = np.zeros((h, w), dtype=np.uint16)
-
-        # Remove tiny instances
-        unique_ids = np.unique(inst_mask)
-        total_pixels = inst_mask.size
-        for inst_id in unique_ids:
-            if inst_id > 0:
-                seg = (inst_mask == inst_id)
-                percent = (np.sum(seg) / total_pixels) * 100.0
-                if percent < FOREGROUNDArgs.min_instance_percent:
-                    inst_mask[seg] = 0
-
-        # Build auto_masks list back
-        auto_masks = []
-        for inst_id in np.unique(inst_mask):
-            if inst_id <= 0:
-                continue
-            seg = (inst_mask == inst_id)
-            if not np.any(seg):
-                continue
-            ys, xs = np.where(seg)
-            y_min, y_max = ys.min(), ys.max()
-            x_min, x_max = xs.min(), xs.max()
-            bbox = [int(x_min), int(y_min), int(x_max - x_min + 1), int(y_max - y_min + 1)]
-            auto_masks.append({
-                "segmentation": seg,
-                "bbox": bbox,
-                "predicted_iou": np.float16("inf"),  # Use fp16 for VRAM efficiency
-                "area": np.float16("inf"),           # Use fp16 for VRAM efficiency
-            })
-
-        if not auto_masks:
-            h, w = inst_mask.shape
             fg = np.zeros((h, w), dtype=bool)
-            one_hot = np.stack([~fg, fg], axis=-1).astype(np.float16)  # Use fp16 for VRAM efficiency
+            one_hot = np.stack([~fg, fg], axis=-1).astype(np.float16)
             return one_hot
 
-        h, w = auto_masks[0]["segmentation"].shape
-
-        # Per-prompt sim maps and combine
-        segment_sim_maps: List[np.ndarray] = []
-        for text in text_prompts:
-            text_emb = self.clip_model.encode_text(text).to(
-                device=clip_patch_feats.device, dtype=clip_patch_feats.dtype
-            )
-            neg_text_embs = torch.stack(
-                [self.clip_model.encode_text(neg) for neg in FOREGROUNDArgs.negative_texts], dim=0
-            ).to(device=clip_patch_feats.device, dtype=clip_patch_feats.dtype)
-            sim_map = self.clip_model.compute_similarity(
-                clip_patch_feats,
-                text_emb,
-                neg_text_embs=neg_text_embs,
-                softmax_temp=FOREGROUNDArgs.softmax_temp,
-                normalize=True,
-            )
-            sim_map_up = np.array(Image.fromarray(sim_map.cpu().float().numpy()).resize((w, h), Image.BILINEAR)).astype(np.float16)
-
-            seg_map = np.zeros_like(sim_map_up)
-            for m in auto_masks:
-                seg = m["segmentation"]
-                if seg.shape != (h, w):
-                    continue
-                vals = sim_map_up[seg]
-                k = max(1, int(len(vals) * FOREGROUNDArgs.top_mean_percent / 100.0))
-                seg_map[seg] = float(np.mean(np.sort(vals)[-k:]))
-            segment_sim_maps.append(seg_map)
-
-        combined_sim = np.maximum.reduce(segment_sim_maps) if len(segment_sim_maps) > 0 else np.zeros((h, w))
-
-        # Foreground map: any pixel belonging to any kept mask (threshold on combined similarity)
-        fg_mask = np.zeros((h, w), dtype=bool)
-        for m in auto_masks:
-            seg = m["segmentation"]
-            if seg.shape != (h, w):
-                continue
-            if np.any(combined_sim[seg] > FOREGROUNDArgs.sim_thresh):
-                fg_mask |= seg
-
-        one_hot = np.stack([~fg_mask, fg_mask], axis=-1).astype(np.float16)  # Use fp16 for VRAM efficiency
+        fg_mask = np.logical_or.reduce(masks, axis=0)
+        one_hot = np.stack([~fg_mask, fg_mask], axis=-1).astype(np.float16)
         return one_hot
 
     async def compute_foreground_for_image_async(self, image_path: str) -> np.ndarray:
@@ -197,34 +99,34 @@ class FOREGROUNDWorker:
 
 
 class FOREGROUNDExtractor:
-    def __init__(self, device: torch.device, data_dir: Optional[Path] = None, text_prompts: Optional[List[str]] = None, verbose: bool = False) -> None:
+    def __init__(
+        self,
+        device: torch.device,
+        data_dir: Optional[Path] = None,
+        text_prompts: Optional[List[str]] = None,
+        sam3_feature_type: Optional[str] = None,
+        verbose: bool = False,
+    ) -> None:
         self.device = device
         self.verbose = verbose
         self.data_dir = Path(data_dir) if data_dir is not None else None
-        self.text_prompts = text_prompts
+        self.sam3_feature_type = sam3_feature_type or infer_sam3_feature_type(text_prompts)
 
         if self.data_dir is None:
-            raise ValueError("FOREGROUNDExtractor requires data_dir to locate precomputed CLIP and SAM2 shards")
+            raise ValueError("FOREGROUNDExtractor requires data_dir to locate precomputed SAM3 shards")
 
-        # Validate prerequisites
-        feat_root = self.data_dir / "features"
-        clip_root = feat_root / "clip"
-        sam2_root = feat_root / "sam2"
-        text_root = feat_root / "text"
-
-        if not (clip_root / "meta.pt").exists():
-            raise FileNotFoundError(f"Missing CLIP meta: {clip_root / 'meta.pt'}")
-        if not list(clip_root.glob("image_*.npy")):
-            raise FileNotFoundError(f"Missing CLIP per-image features under {clip_root}")
-        if not list(sam2_root.glob("image_*.npz")):
-            raise FileNotFoundError(f"Missing SAM2 per-image features under {sam2_root}")
-        if text_prompts is None and not list(text_root.glob("image_*.json")):
-            raise FileNotFoundError(f"Missing TEXT per-image features under {text_root} (required when using per-image text prompts)")
+        ensure_sam3_feature_cache(self.data_dir, self.sam3_feature_type, consumer="FOREGROUND", require_npz=True)
 
         devices_param, num_workers = resolve_devices_and_workers(device, FOREGROUNDArgs.batch_size_per_gpu)
         if verbose:
-            print("Initializing FOREGROUND workers")
-        self.client = AsyncMultiWrapper(FOREGROUNDWorker, num_objects=num_workers, devices=devices_param, data_dir=self.data_dir, text_prompts=self.text_prompts)
+            print(f"Initializing FOREGROUND workers (using {self.sam3_feature_type} masks)")
+        self.client = AsyncMultiWrapper(
+            FOREGROUNDWorker,
+            num_objects=num_workers,
+            devices=devices_param,
+            data_dir=self.data_dir,
+            sam3_feature_type=self.sam3_feature_type,
+        )
         self.num_workers = num_workers
 
     async def extract_batch_async(self, image_paths: List[str]) -> List[np.ndarray]:
@@ -288,15 +190,15 @@ if __name__ == "__main__":
     image_paths = [str(p) for p in image_paths[:8]]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Mode 1: use TEXT shards (FOREGROUND_)
+    # Mode 1: use SAM3_ masks (derived from FOREGROUND_)
     extractor = FOREGROUNDExtractor(device=device, data_dir=data_root, text_prompts=None, verbose=True)
     maps = run_async_in_any_context(lambda: extractor.extract_batch_async(image_paths))
-    print(f"Mode 1 (TEXT shards): Extracted {len(maps)} maps, sample shape: {maps[0].shape if maps else None}")
+    print(f"Mode 1 (SAM3_ masks): Extracted {len(maps)} maps, sample shape: {maps[0].shape if maps else None}")
 
-    # Mode 2: use global prompts (e.g., FOREGROUND_book)
+    # Mode 2: use SAM3_<prompts> masks (e.g., SAM3_laptop inferred from FOREGROUND prompts)
     extractor2 = FOREGROUNDExtractor(device=device, data_dir=data_root, text_prompts=["laptop"], verbose=True)
     maps2 = run_async_in_any_context(lambda: extractor2.extract_batch_async(image_paths))
-    print(f"Mode 2 (global prompts): Extracted {len(maps2)} maps, sample shape: {maps2[0].shape if maps2 else None}")
+    print(f"Mode 2 (SAM3 prompt masks): Extracted {len(maps2)} maps, sample shape: {maps2[0].shape if maps2 else None}")
 
     # Visualize a few results (RGB, Mode1 FG, Mode2 FG)
     vis_count = min(3, len(image_paths))
@@ -313,11 +215,11 @@ if __name__ == "__main__":
         fg2 = maps2[i][..., 1] if i < len(maps2) else None
         if fg1 is not None:
             axes[1, i].imshow(fg1, cmap='gray', vmin=0, vmax=1)
-            axes[1, i].set_title("Mode1 FG (TEXT)")
+            axes[1, i].set_title("Mode1 FG (SAM3_)")
         axes[1, i].axis('off')
         if fg2 is not None:
             axes[2, i].imshow(fg2, cmap='gray', vmin=0, vmax=1)
-            axes[2, i].set_title("Mode2 FG (global)")
+            axes[2, i].set_title("Mode2 FG (SAM3 prompt)")
         axes[2, i].axis('off')
     plt.tight_layout()
     plt.show()

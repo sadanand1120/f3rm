@@ -17,6 +17,7 @@ from sam2.features.utils import AsyncMultiWrapper
 from sam3.sam3_main import SAM3Main
 
 from f3rm.features.utils import BatchFeatureLoader, resolve_devices_and_workers, run_async_in_any_context
+from f3rm.features.utils import parse_prefixed_feature_type
 
 
 class SAM3Args:
@@ -39,12 +40,7 @@ class SAM3Args:
 
 
 def parse_sam3_feature_type(feature_type: str) -> List[str]:
-    if not feature_type.startswith("SAM3_"):
-        raise ValueError(f"Invalid SAM3 feature type: {feature_type}. Must start with 'SAM3_'")
-    prompts_part = feature_type[len("SAM3_"):]
-    if prompts_part == "":
-        return []
-    return [w.lower() for w in prompts_part.split("_") if w.strip()]
+    return parse_prefixed_feature_type(feature_type, "SAM3_")
 
 
 class SAM3Worker:

@@ -35,7 +35,7 @@ ns-export pointcloud --load-config outputs/sittingroom/f3rm/2025-04-07_123618/co
 
 
 
-unset CUDA_VISIBLE_DEVICES && ns-viewer --load-config outputs/home/f3rm/2025-04-06_131604/config.yml
+unset CUDA_VISIBLE_DEVICES && ns-viewer --load-config outputs/home/f3rm/2025-04-06_131604/config.yml --viewer.make-share-url True
 
 
 

@@ -2,7 +2,7 @@
 """
 Standalone Feature Extraction Script
 
-Extracts features (CLIP, DINO, SAM2, SAM3_*, TEXT, CLIPSAM_*, FOREGROUND_*, ORIENTANY_*, ORIENTANY2_*) for a dataset
+Extracts features (CLIP, DINO, SAM3_*, TEXT, FOREGROUND_*, ORIENTANY_*, ORIENTANY2_*) for a dataset
 and saves them as individual per-image files for efficient batch loading during training.
 
 Features are processed in batches for memory efficiency during extraction, but each image's
@@ -14,7 +14,7 @@ Usage:
         --feature-type CLIP \
         --batch-size 64
 
-Supported feature types: CLIP, DINO, SAM2, SAM3_*, TEXT, CLIPSAM_*, FOREGROUND_*, ORIENTANY_*, ORIENTANY2_*
+Supported feature types: CLIP, DINO, SAM3_*, TEXT, FOREGROUND_*, ORIENTANY_*, ORIENTANY2_*
 """
 
 import argparse
@@ -30,16 +30,13 @@ from nerfstudio.data.dataparsers.nerfstudio_dataparser import NerfstudioDataPars
 from nerfstudio.utils.rich_utils import CONSOLE
 from tqdm.auto import tqdm
 
-from f3rm.features.utils import run_async_in_any_context, pack_auto_masks, BatchFeatureLoader, get_cache_paths
+from f3rm.features.utils import run_async_in_any_context, BatchFeatureLoader, get_cache_paths
 
 
 def _lazy_import_components(feature_type: str):
     """Lazy-import only the extractor needed for feature_type.
     Returns (args_cls, extractor_cls, parse_fn_or_None, examine_fn_or_None).
     """
-    if feature_type.startswith("CLIPSAM_"):
-        from f3rm.features.clipsam_extract import CLIPSAMArgs, CLIPSAMExtractor, parse_clipsam_feature_type, examine_saved
-        return CLIPSAMArgs, CLIPSAMExtractor, parse_clipsam_feature_type, examine_saved
     if feature_type.startswith("FOREGROUND_"):
         from f3rm.features.foreground_extract import FOREGROUNDArgs, FOREGROUNDExtractor, parse_foreground_feature_type, examine_saved
         return FOREGROUNDArgs, FOREGROUNDExtractor, parse_foreground_feature_type, examine_saved
@@ -58,9 +55,6 @@ def _lazy_import_components(feature_type: str):
     if feature_type == "DINO":
         from f3rm.features.dino_extract import DINOArgs, DINOExtractor, examine_saved
         return DINOArgs, DINOExtractor, None, examine_saved
-    if feature_type == "SAM2":
-        from f3rm.features.sam2_extract import SAM2Args, SAM2Extractor, examine_saved
-        return SAM2Args, SAM2Extractor, None, examine_saved
     if feature_type == "TEXT":
         from f3rm.features.text_extract import TextArgs, TextExtractor
         return TextArgs, TextExtractor, None, None
@@ -109,12 +103,14 @@ async def _save_per_image_generic(
     if parse_fn is not None:
         parsed_prompts = parse_fn(feature_type)
         text_prompts_arg = None if (parsed_prompts is not None and len(parsed_prompts) == 0) else parsed_prompts
-        CONSOLE.print(f"{feature_type} parsed text prompts: {parsed_prompts} -> using {'TEXT shards' if text_prompts_arg is None else 'global prompts'}")
+        if feature_type.startswith("SAM3_"):
+            mode_desc = "TEXT shards" if text_prompts_arg is None else "global prompts"
+        else:
+            mode_desc = "SAM3_ masks" if text_prompts_arg is None else "SAM3 prompt-derived masks"
+        CONSOLE.print(f"{feature_type} parsed prompts: {parsed_prompts} -> using {mode_desc}")
         extractor = extractor_cls(device=device, data_dir=data_dir, text_prompts=text_prompts_arg, verbose=True)
     elif feature_type == "TEXT":
         extractor = extractor_cls(device=device, verbose=True, data_dir=data_dir)
-    elif feature_type == "SAM2":
-        extractor = extractor_cls(device=device, data_dir=data_dir, verbose=True)
     else:
         extractor = extractor_cls(device=device, verbose=True)
 
@@ -140,12 +136,6 @@ async def _save_per_image_generic(
                 np.save(root / f"image_{img_idx:06d}_pixel.npy", pixel_data, allow_pickle=False)
                 with open(root / f"image_{img_idx:06d}_instances.json", 'w') as f:
                     json.dump(instance_features, f, indent=2)
-            elif feature_type.startswith("CLIPSAM_") or feature_type == "SAM2":
-                packed_img = pack_auto_masks(data[j])
-                np.savez_compressed(
-                    root / f"image_{img_idx:06d}.npz",
-                    **packed_img
-                )
             elif feature_type.startswith("SAM3_"):
                 masks = data[j].astype(np.bool_)
                 np.savez_compressed(root / f"image_{img_idx:06d}.npz", masks=masks)
@@ -174,7 +164,7 @@ def _cache_file_count_matches(root: Path, feature_type: str, num_images: int) ->
             len(list(root.glob("image_*_pixel.npy"))) == num_images
             and len(list(root.glob("image_*_instances.json"))) == num_images
         )
-    if feature_type.startswith("CLIPSAM_") or feature_type == "SAM2" or feature_type.startswith("SAM3_"):
+    if feature_type.startswith("SAM3_"):
         return len(list(root.glob("image_*.npz"))) == num_images
     if feature_type == "TEXT":
         return len(list(root.glob("image_*.json"))) == num_images
@@ -244,7 +234,7 @@ def get_image_filenames_from_dataparser(data_dir: Path) -> List[str]:
 def extract_features_for_dataset(
     image_fnames: List[str],
     data_dir: Path,
-    feature_type: Literal["CLIP", "DINO", "SAM2", "SAM3_*", "TEXT", "CLIPSAM_*", "FOREGROUND_*", "ORIENTANY_*", "ORIENTANY2_*"],
+    feature_type: Literal["CLIP", "DINO", "SAM3_*", "TEXT", "FOREGROUND_*", "ORIENTANY_*", "ORIENTANY2_*"],
     device: torch.device,
     batch_size: int = 64,
     enable_cache: bool = True,
@@ -299,7 +289,7 @@ def extract_features_for_dataset(
 
 def extract_features_standalone(
     data_dir: Path,
-    feature_type: Literal["CLIP", "DINO", "SAM2", "SAM3_*", "TEXT", "CLIPSAM_*", "FOREGROUND_*", "ORIENTANY_*", "ORIENTANY2_*"],
+    feature_type: Literal["CLIP", "DINO", "SAM3_*", "TEXT", "FOREGROUND_*", "ORIENTANY_*", "ORIENTANY2_*"],
     batch_size: int = 64,
     device: str = "auto",
     force: bool = False,
@@ -355,12 +345,11 @@ def main():
         default="CLIP",
         help=(
             "Feature type to extract.\n"
-            "- CLIPSAM: 'CLIPSAM_book' or 'CLIPSAM_book_pen' (global prompts), 'CLIPSAM_' (use TEXT shards).\n"
-            "- FOREGROUND: 'FOREGROUND_book' or 'FOREGROUND_book_pen' (global), 'FOREGROUND_' (use TEXT shards).\n"
-            "- ORIENTANY: 'ORIENTANY_book' or 'ORIENTANY_book_pen' (global), 'ORIENTANY_' (use TEXT shards).\n"
-            "- ORIENTANY2: 'ORIENTANY2_book' or 'ORIENTANY2_book_pen' (global), 'ORIENTANY2_' (use TEXT shards).\n"
+            "- FOREGROUND: 'FOREGROUND_book' or 'FOREGROUND_book_pen' -> uses SAM3_book(_pen) masks, 'FOREGROUND_' -> uses SAM3_ masks.\n"
+            "- ORIENTANY: 'ORIENTANY_book' or 'ORIENTANY_book_pen' -> uses SAM3_book(_pen) masks, 'ORIENTANY_' -> uses SAM3_ masks.\n"
+            "- ORIENTANY2: 'ORIENTANY2_book' or 'ORIENTANY2_book_pen' -> uses SAM3_book(_pen) masks, 'ORIENTANY2_' -> uses SAM3_ masks.\n"
             "- SAM3: 'SAM3_book' or 'SAM3_book_pen' (global), 'SAM3_' (use TEXT shards).\n"
-            "Examples: CLIP, DINO, SAM2, SAM3_book, SAM3_, TEXT, CLIPSAM_book, CLIPSAM_, FOREGROUND_book, FOREGROUND_, ORIENTANY_book, ORIENTANY_, ORIENTANY2_book, ORIENTANY2_."
+            "Examples: CLIP, DINO, SAM3_book, SAM3_, TEXT, FOREGROUND_book, FOREGROUND_, ORIENTANY_book, ORIENTANY_, ORIENTANY2_book, ORIENTANY2_."
         )
     )
 

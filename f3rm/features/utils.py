@@ -11,12 +11,54 @@ import yaml
 import torch
 import torch.nn.functional as F
 from pathlib import Path
-import matplotlib.pyplot as plt
 from PIL import Image
-from sam2.features.utils import SAM2utils
 
 from nerfstudio.cameras import camera_utils
 from nerfstudio.utils.math import safe_normalize
+
+
+def parse_comma_separated_labels(raw_text: str) -> List[str]:
+    """Parse comma-separated labels and drop empty tokens."""
+    return [x.strip() for x in raw_text.split(",") if x.strip()]
+
+
+def l2_normalize_embeddings(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """L2-normalize embedding tensors on the last dimension."""
+    return x / x.norm(dim=-1, keepdim=True).clamp_min(eps)
+
+
+def compute_similarity_scores(
+    clip_features: torch.Tensor,
+    pos_embed: torch.Tensor,
+    neg_embed: Optional[torch.Tensor] = None,
+    softmax_temp: float = 0.1,
+) -> torch.Tensor:
+    """Compute similarity exactly following F3RM model semantics.
+
+    Returns:
+        If `neg_embed` is None: cosine similarities to positives in [-1, 1].
+        Else: paired-softmax min probability in [0, 1].
+    """
+    if pos_embed.ndim == 1:
+        pos_embed = pos_embed.unsqueeze(0)
+
+    clip_features = l2_normalize_embeddings(clip_features.float())
+    pos_embed = l2_normalize_embeddings(pos_embed.float())
+    clip_features = clip_features.to(dtype=pos_embed.dtype)
+
+    if neg_embed is None:
+        return clip_features @ pos_embed.T
+
+    neg_embed = l2_normalize_embeddings(neg_embed.float())
+    text_embs = torch.cat([pos_embed, neg_embed], dim=0)
+    raw_sims = clip_features @ text_embs.T
+    pos_sims, neg_sims = raw_sims[..., :1], raw_sims[..., 1:]
+    pos_sims = pos_sims.broadcast_to(neg_sims.shape)
+    paired_sims = torch.cat([pos_sims, neg_sims], dim=-1)
+    probs = (paired_sims / max(float(softmax_temp), 1e-6)).softmax(dim=-1)[..., :1]
+    torch.nan_to_num_(probs, nan=0.0)
+    sims, _ = probs.min(dim=-1, keepdim=True)
+    return sims
 
 
 def get_conf_temp_scaled_logits(logits, confidence, drop_exp_factor=6, eps=1e-8):
@@ -447,6 +489,71 @@ def run_async_in_any_context(coro_fn: Callable[[], Any]) -> Any:
         return asyncio.run(coro_fn())
 
 
+def parse_prefixed_feature_type(feature_type: str, prefix: str) -> List[str]:
+    if not feature_type.startswith(prefix):
+        raise ValueError(f"Invalid feature type: {feature_type}. Must start with '{prefix}'")
+    prompts_part = feature_type[len(prefix):]
+    if prompts_part == "":
+        return []
+    return [w.lower() for w in prompts_part.split("_") if w.strip()]
+
+
+def compose_prefixed_feature_type(prefix: str, text_prompts: Optional[List[str]]) -> str:
+    if text_prompts is None or len(text_prompts) == 0:
+        return prefix
+    joined = "_".join([p.lower() for p in text_prompts])
+    return f"{prefix}{joined}"
+
+
+def infer_sam3_feature_type(text_prompts: Optional[List[str]]) -> str:
+    return compose_prefixed_feature_type("SAM3_", text_prompts)
+
+
+def get_sam3_feature_root(data_dir: Path, sam3_feature_type: str) -> Path:
+    return Path(data_dir) / "features" / sam3_feature_type.lower()
+
+
+def ensure_sam3_feature_cache(
+    data_dir: Path,
+    sam3_feature_type: str,
+    *,
+    consumer: Optional[str] = None,
+    require_npz: bool = True,
+) -> Path:
+    sam3_root = get_sam3_feature_root(data_dir, sam3_feature_type)
+    meta_path = sam3_root / "meta.pt"
+    if not meta_path.exists():
+        if consumer is None:
+            raise FileNotFoundError(f"Missing SAM3 meta: {meta_path}")
+        raise FileNotFoundError(
+            f"Missing SAM3 meta: {meta_path} (expected for {consumer}). "
+            f"Run SAM3 extraction for feature type '{sam3_feature_type}' first."
+        )
+    if require_npz and not list(sam3_root.glob("image_*.npz")):
+        raise FileNotFoundError(f"Missing SAM3 per-image features under {sam3_root}")
+    return sam3_root
+
+
+def load_sam3_image_fnames(data_dir: Path, sam3_feature_type: str) -> List[str]:
+    sam3_root = ensure_sam3_feature_cache(data_dir, sam3_feature_type, require_npz=False)
+    sam3_meta = torch.load(sam3_root / "meta.pt")
+    return [str(p) for p in sam3_meta["image_fnames"]]
+
+
+def normalize_sam3_masks(raw_masks: Any, image_path: Optional[str] = None) -> np.ndarray:
+    masks = np.asarray(raw_masks)
+    if masks.ndim == 4:
+        masks = masks[:, 0, ...]
+    elif masks.ndim == 2:
+        masks = masks[None, ...]
+    elif masks.ndim != 3:
+        if image_path is None:
+            raise ValueError(f"Invalid SAM3 mask shape: {masks.shape}")
+        with Image.open(image_path) as img:
+            return np.zeros((0, img.height, img.width), dtype=bool)
+    return masks.astype(bool)
+
+
 def vector_mode(points: torch.Tensor, radius_deg: float = 12.0, max_anchors: int = 512, unsigned: bool = False) -> torch.Tensor:
     """Return unit vector mode of a set of 3D vectors using max-support within an angular neighborhood.
 
@@ -484,179 +591,6 @@ def vector_mode(points: torch.Tensor, radius_deg: float = 12.0, max_anchors: int
     inliers = sim_center >= cos_thr
     mode_vec = x[inliers].mean(dim=0)
     return safe_normalize(mode_vec)
-
-
-def pack_auto_masks(auto_masks: List[dict]) -> dict:
-    """Pack auto masks into a memory-mappable format.
-
-    Returns a dict with:
-    - num_masks: number of masks per image
-    - mask_data: packed binary data for all masks
-    - mask_shapes: shapes of each mask
-    - bbox_data: bbox coordinates as float16 array
-    - pred_iou_data: predicted IoU scores as float16 array
-    - area_data: mask areas as float16 array
-    """
-    if not auto_masks:
-        return {
-            "num_masks": 0,
-            "mask_data": np.array([], dtype=np.uint8),
-            "mask_shapes": np.empty((0, 2), dtype=np.int32),
-            "bbox_data": np.empty((0, 4), dtype=np.float16),      # Use fp16 for VRAM efficiency
-            "pred_iou_data": np.array([], dtype=np.float16),      # Use fp16 for VRAM efficiency
-            "area_data": np.array([], dtype=np.float16)           # Use fp16 for VRAM efficiency
-        }
-
-    # Collect all mask data
-    all_packed_data = []
-    all_shapes = []
-    all_bboxes = []
-    all_scores = []
-    all_areas = []
-
-    for m in auto_masks:
-        seg = m.get("segmentation", None)
-        if isinstance(seg, np.ndarray):
-            h, w = seg.shape
-            packed = np.packbits(seg.astype(np.uint8).reshape(-1))
-            all_packed_data.append(packed)
-            all_shapes.append([h, w])
-
-            # Extract bbox, score, and area as regular arrays
-            bbox = m.get("bbox", [0, 0, 0, 0])
-            score = m.get("predicted_iou", m.get("score", 0.0))
-            area = m.get("area", h * w)  # Default to full mask area if not provided
-            all_bboxes.append(bbox)
-            all_scores.append(score)
-            all_areas.append(area)
-
-    if not all_packed_data:
-        return {
-            "num_masks": 0,
-            "mask_data": np.array([], dtype=np.uint8),
-            "mask_shapes": np.empty((0, 2), dtype=np.int32),
-            "bbox_data": np.empty((0, 4), dtype=np.float16),      # Use fp16 for VRAM efficiency
-            "pred_iou_data": np.array([], dtype=np.float16),      # Use fp16 for VRAM efficiency
-            "area_data": np.array([], dtype=np.float16)           # Use fp16 for VRAM efficiency
-        }
-
-    # Concatenate all packed data
-    total_packed_size = sum(len(data) for data in all_packed_data)
-    combined_data = np.empty(total_packed_size, dtype=np.uint8)
-
-    start_idx = 0
-    for data in all_packed_data:
-        end_idx = start_idx + len(data)
-        combined_data[start_idx:end_idx] = data
-        start_idx = end_idx
-
-    return {
-        "num_masks": len(all_packed_data),  # Actual number of packed masks
-        "mask_data": combined_data,
-        "mask_shapes": np.array(all_shapes, dtype=np.int32),
-        "bbox_data": np.array(all_bboxes, dtype=np.float16),      # Use fp16 for VRAM efficiency
-        "pred_iou_data": np.array(all_scores, dtype=np.float16),  # Use fp16 for VRAM efficiency
-        "area_data": np.array(all_areas, dtype=np.float16)        # Use fp16 for VRAM efficiency
-    }
-
-
-def unpack_auto_masks(packed_data: dict) -> List[dict]:
-    """Unpack auto masks from memory-mappable format back to original format.
-
-    This is the standalone version of the unpacking logic used in BatchFeatureLoader.
-    """
-    if packed_data["num_masks"] == 0:
-        return []
-
-    decoded = []
-    mask_data = packed_data["mask_data"]
-    mask_shapes = packed_data["mask_shapes"]
-    bbox_data = packed_data["bbox_data"]
-    pred_iou_data = packed_data["pred_iou_data"]
-    area_data = packed_data["area_data"]
-
-    if len(mask_data) == 0 or len(mask_shapes) == 0:
-        return []
-
-    start_idx = 0
-    for i in range(packed_data["num_masks"]):
-        h, w = mask_shapes[i]
-        bbox = bbox_data[i]
-        pred_iou = pred_iou_data[i]
-        area = area_data[i]
-
-        # Calculate packed size for this mask
-        packed_size = (h * w + 7) // 8  # Round up for packbits
-        end_idx = start_idx + packed_size
-
-        if end_idx > len(mask_data):
-            break
-
-        # Extract and unpack this mask's data
-        packed = mask_data[start_idx:end_idx]
-        flat = np.unpackbits(packed)[:h * w]
-        seg_arr = flat.reshape(h, w).astype(bool)
-
-        # Reconstruct original mask dict with fp16 optimization
-        mask_dict = {
-            "segmentation": seg_arr,
-            "bbox": bbox.tolist(),
-            "predicted_iou": np.float16(pred_iou),  # Use fp16 for VRAM efficiency
-            "area": np.float16(area)                # Use fp16 for VRAM efficiency
-        }
-        decoded.append(mask_dict)
-        start_idx = end_idx
-
-    return decoded
-
-
-def visualize_auto_masks_demo(auto_masks_list: List[List[dict]], image_paths: List[str], title_prefix: str = "Mask", max_vis: int = 4, pred_iou_thresh: float = 0.8, min_mask_region_area: int = 0):
-    """Common visualization function for auto masks demos.
-
-    Args:
-        auto_masks_list: List of auto mask lists, one per image
-        image_paths: List of image file paths
-        title_prefix: Prefix for the mask titles (e.g., "SAM2", "CLIPSAM")
-        max_vis: Maximum number of images to visualize
-        pred_iou_thresh: IoU threshold for mask filtering
-        min_mask_region_area: Minimum mask area threshold
-    """
-    vis_count = min(max_vis, len(auto_masks_list))
-    fig, axes = plt.subplots(2, vis_count, figsize=(4 * vis_count, 8))
-    if vis_count == 1:
-        axes = axes.reshape(2, 1)
-
-    for i, (auto_masks, image_path) in enumerate(zip(auto_masks_list[:vis_count], image_paths[:vis_count])):
-        # Load and display RGB image
-        rgb_img = Image.open(image_path).convert("RGB")
-        axes[0, i].imshow(rgb_img)
-        axes[0, i].set_title(f"RGB {i+1}")
-        axes[0, i].axis('off')
-
-        # Generate and display mask
-        inst_mask, _ = SAM2utils.auto_masks_to_instance_mask(
-            auto_masks,
-            min_iou=float(pred_iou_thresh) if pred_iou_thresh is not None else 0.0,
-            min_area=float(min_mask_region_area) if min_mask_region_area is not None else 0.0,
-            assign_by="area",
-            start_from="low",
-        )
-        if inst_mask is None:
-            # No valid masks found, create empty instance mask
-            if auto_masks:
-                h, w = auto_masks[0]['segmentation'].shape
-            else:
-                # Use actual image dimensions as fallback
-                img = Image.open(image_path)
-                h, w = img.height, img.width
-            inst_mask = np.zeros((h, w), dtype=np.uint16)
-        viz_mask, cmap, norm = SAM2utils.make_viz_mask_and_cmap(inst_mask)
-        axes[1, i].imshow(viz_mask, cmap=cmap, norm=norm, interpolation='nearest')
-        axes[1, i].set_title(f"{title_prefix} {i+1} ({len(np.unique(inst_mask)) - 1} inst)")
-        axes[1, i].axis('off')
-
-    plt.tight_layout()
-    plt.show()
 
 
 class BatchFeatureLoader:
@@ -748,17 +682,6 @@ class BatchFeatureLoader:
             t = torch.from_numpy(full_features)
             return t.pin_memory() if self._use_pinned else t
 
-        elif self.feature_type.startswith("CLIPSAM_") or self.feature_type == "SAM2":
-            data = np.load(self.root / f"image_{img_idx:06d}.npz")
-            packed_data = {
-                "num_masks": int(data['num_masks']),
-                "mask_data": data['mask_data'],
-                "mask_shapes": data['mask_shapes'],
-                "bbox_data": data['bbox_data'],
-                "pred_iou_data": data['pred_iou_data'],
-                "area_data": data['area_data']
-            }
-            return unpack_auto_masks(packed_data)
         elif self.feature_type.startswith("SAM3_"):
             data = np.load(self.root / f"image_{img_idx:06d}.npz")
             masks = data["masks"]
@@ -809,7 +732,7 @@ class BatchFeatureLoader:
             if self.feature_type in ("CLIP", "DINO") or self.feature_type.startswith("FOREGROUND_") or self.feature_type.startswith("ORIENTANY_") or self.feature_type.startswith("ORIENTANY2_"):
                 batch_features[cam_idx_int] = self._get_gpu_tensor(cam_idx_int)
             else:
-                # SAM2/TEXT types
+                # CPU-backed feature types (e.g. SAM3/TEXT)
                 batch_features[cam_idx_int] = self._load_single_image_cpu(cam_idx_int)
         return batch_features
 
@@ -823,8 +746,5 @@ class BatchFeatureLoader:
 
 def get_cache_paths(data_dir: Path, feature_type: str) -> Tuple[Path, Path]:
     """Get cache directory and metadata paths for a feature type."""
-    if feature_type.startswith("CLIPSAM_") or feature_type.startswith("FOREGROUND_") or feature_type.startswith("ORIENTANY_") or feature_type.startswith("ORIENTANY2_"):
-        root = data_dir / "features" / feature_type.lower()
-    else:
-        root = data_dir / "features" / feature_type.lower()
+    root = data_dir / "features" / feature_type.lower()
     return root, root / "meta.pt"

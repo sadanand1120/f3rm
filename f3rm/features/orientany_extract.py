@@ -19,9 +19,14 @@ from f3rm.features.orientany.orientany_main import OrientAny
 from f3rm.features.utils import (
     BatchFeatureLoader,
     build_transform_lookup,
+    ensure_sam3_feature_cache,
     get_nerf_ccs_to_normal_ccs_T,
     get_nerf_ccs_to_orig_nerf_world,
     get_orig_to_final_nerf_world_transform_scale,
+    infer_sam3_feature_type,
+    load_sam3_image_fnames,
+    normalize_sam3_masks,
+    parse_prefixed_feature_type,
     resolve_devices_and_workers,
     run_async_in_any_context,
 )
@@ -123,12 +128,7 @@ def _create_pixel_data(h: int, w: int, obj_masks: List[np.ndarray]) -> np.ndarra
 
 
 def parse_orientany_feature_type(feature_type: str) -> List[str]:
-    if not feature_type.startswith("ORIENTANY_"):
-        raise ValueError(f"Invalid ORIENTANY feature type: {feature_type}. Must start with 'ORIENTANY_'")
-    prompts_part = feature_type[len("ORIENTANY_"):]
-    if prompts_part == "":
-        return []
-    return [w.lower() for w in prompts_part.split("_") if w.strip()]
+    return parse_prefixed_feature_type(feature_type, "ORIENTANY_")
 
 
 def _build_orientany_full_features(pixel_data: np.ndarray, instance_features: Dict[Any, Any]) -> np.ndarray:
@@ -195,13 +195,7 @@ class ORIENTANYWorker:
         self.data_dir = Path(data_dir)
         self.sam3_feature_type = sam3_feature_type
 
-        # Load SAM3 metadata and create loader
-        sam3_root = self.data_dir / "features" / self.sam3_feature_type.lower()
-        if not (sam3_root / "meta.pt").exists():
-            raise FileNotFoundError(f"Missing SAM3 meta: {sam3_root / 'meta.pt'}")
-
-        sam3_meta = torch.load(sam3_root / "meta.pt")
-        self.feat_image_fnames = [str(p) for p in sam3_meta["image_fnames"]]
+        self.feat_image_fnames = load_sam3_image_fnames(self.data_dir, self.sam3_feature_type)
         self.sam3_loader = BatchFeatureLoader(self.data_dir, self.sam3_feature_type, self.feat_image_fnames, self.device)
 
         # Initialize orientation estimation model
@@ -224,13 +218,7 @@ class ORIENTANYWorker:
         except ValueError:
             raise ValueError(f"Image path not found in SAM3 meta order: {image_path}")
 
-        # Load and standardize SAM3 masks
-        masks = np.asarray(self.sam3_loader[idx])
-        if masks.ndim == 4:
-            masks = masks[:, 0, ...]  # Remove channel dimension if present
-        elif masks.ndim == 2:
-            masks = masks[None, ...]  # Add batch dimension if missing
-        masks = masks.astype(bool)
+        masks = normalize_sam3_masks(self.sam3_loader[idx], image_path=image_path)
 
         h, w = masks.shape[-2:]
         obj_masks = _filter_masks_by_size(masks, ORIENTANYArgs.min_instance_percent)
@@ -295,20 +283,12 @@ class ORIENTANYExtractor:
         self.verbose = verbose
         self.data_dir = Path(data_dir) if data_dir is not None else None
         self.text_prompts = text_prompts
-        self.sam3_feature_type = sam3_feature_type or self._infer_sam3_feature_type(text_prompts)
+        self.sam3_feature_type = sam3_feature_type or infer_sam3_feature_type(text_prompts)
 
         if self.data_dir is None:
             raise ValueError("ORIENTANYExtractor requires data_dir to locate precomputed SAM3 shards")
 
-        # Validate prerequisites for precomputed SAM3 masks
-        sam3_root = self.data_dir / "features" / self.sam3_feature_type.lower()
-        if not (sam3_root / "meta.pt").exists():
-            raise FileNotFoundError(
-                f"Missing SAM3 meta: {sam3_root / 'meta.pt'} (expected for ORIENTANY). "
-                f"Run SAM3 extraction for feature type '{self.sam3_feature_type}' first."
-            )
-        if not list(sam3_root.glob("image_*.npz")):
-            raise FileNotFoundError(f"Missing SAM3 per-image features under {sam3_root}")
+        ensure_sam3_feature_cache(self.data_dir, self.sam3_feature_type, consumer="ORIENTANY", require_npz=True)
 
         devices_param, num_workers = resolve_devices_and_workers(device, ORIENTANYArgs.batch_size_per_gpu)
         if verbose:
@@ -321,13 +301,6 @@ class ORIENTANYExtractor:
             sam3_feature_type=self.sam3_feature_type,
         )
         self.num_workers = num_workers
-
-    @staticmethod
-    def _infer_sam3_feature_type(text_prompts: Optional[List[str]]) -> str:
-        if text_prompts is None or len(text_prompts) == 0:
-            return "SAM3_"
-        joined = "_".join([p.lower() for p in text_prompts])
-        return f"SAM3_{joined}"
 
     async def extract_batch_async(self, image_paths: List[str], debug: bool = False) -> List[Dict[str, Any]]:
         results: List[Dict[str, Any]] = []

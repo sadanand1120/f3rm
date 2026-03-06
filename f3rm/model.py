@@ -26,6 +26,7 @@ from f3rm.feature_field import FeatureField
 from f3rm.pca_colormap import apply_pca_colormap_return_proj
 from f3rm.renderer import FeatureRenderer, ScalarRenderer
 from f3rm.features.clip_extract import CLIPArgs
+from f3rm.features.utils import compute_similarity_scores, parse_comma_separated_labels
 from f3rm.shaders import ProbFromProbsShader
 
 
@@ -75,7 +76,7 @@ class ViewerUtils:
     @torch.no_grad()
     def handle_language_queries(self, raw_text: str, is_positive: bool):
         """Compute CLIP embeddings based on queries and update state"""
-        texts = [x.strip() for x in raw_text.split(",") if x.strip()]
+        texts = parse_comma_separated_labels(raw_text)
         # Clear the GUI state if there are no texts
         if not texts:
             self.clear_positives() if is_positive else self.clear_negatives()
@@ -330,31 +331,13 @@ class FeatureFieldModel(NerfactoModel):
             return outputs
 
         # Normalize CLIP features rendered by feature field
-        clip_features = outputs["feature"]   # is on cpu()
-        clip_features = clip_features.to(viewer_utils.device)
-        clip_features = clip_features / clip_features.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-        clip_features = clip_features.to(dtype=viewer_utils.pos_embed.dtype)
-
-        # If there are no negatives, just show the cosine similarity with the positives
-        if not viewer_utils.has_negatives:
-            sims = clip_features @ viewer_utils.pos_embed.T
-            outputs["similarity"] = sims
-            return outputs
-
-        # Use paired softmax method as described in the paper with positive and negative texts
-        text_embs = torch.cat([viewer_utils.pos_embed, viewer_utils.neg_embed], dim=0)
-        raw_sims = clip_features @ text_embs.T
-
-        # Broadcast positive label similarities to all negative labels
-        pos_sims, neg_sims = raw_sims[..., :1], raw_sims[..., 1:]
-        pos_sims = pos_sims.broadcast_to(neg_sims.shape)
-        paired_sims = torch.cat([pos_sims, neg_sims], dim=-1)
-
-        # Compute paired softmax
-        probs = (paired_sims / viewer_utils.softmax_temp).softmax(dim=-1)[..., :1]
-        torch.nan_to_num_(probs, nan=0.0)
-        sims, _ = probs.min(dim=-1, keepdim=True)
-        outputs["similarity"] = sims
+        clip_features = outputs["feature"].to(viewer_utils.device)
+        outputs["similarity"] = compute_similarity_scores(
+            clip_features=clip_features,
+            pos_embed=viewer_utils.pos_embed,
+            neg_embed=viewer_utils.neg_embed if viewer_utils.has_negatives else None,
+            softmax_temp=viewer_utils.softmax_temp,
+        )
         return outputs
 
     def get_image_metrics_and_images(self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]):

@@ -14,6 +14,7 @@ ns-train --help
 pip install -e ".[robot]" && pip install --no-build-isolation "git+https://github.com/facebookresearch/pytorch3d.git@stable"
 pip3 install torchtyping==0.1.5 && pip3 install typeguard==4.4.2 && pip3 install pycolmap==3.11.1
 f3rm-optimize --help
+pip3 install -U "gradio==5.50.0" "gradio_client==1.14.0"
 cp /robodata/smodak/repos/f3rm/nerfstudio_changes/record3d_utils.py /opt/miniconda3/envs/f3rm/lib/python3.11/site-packages/nerfstudio/process_data/
 cp /robodata/smodak/repos/f3rm/nerfstudio_changes/hloc_utils.py /opt/miniconda3/envs/f3rm/lib/python3.11/site-packages/nerfstudio/process_data/
 cp /robodata/smodak/repos/f3rm/nerfstudio_changes/colmap_utils.py /opt/miniconda3/envs/f3rm/lib/python3.11/site-packages/nerfstudio/process_data/

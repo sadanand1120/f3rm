@@ -24,8 +24,13 @@ from f3rm.features.orientany_extract import (
 from f3rm.features.utils import (
     BatchFeatureLoader,
     build_transform_lookup,
+    ensure_sam3_feature_cache,
     get_nerf_ccs_to_orig_nerf_world,
     get_orig_to_final_nerf_world_transform_scale,
+    infer_sam3_feature_type,
+    load_sam3_image_fnames,
+    normalize_sam3_masks,
+    parse_prefixed_feature_type,
     resolve_devices_and_workers,
     run_async_in_any_context,
 )
@@ -45,12 +50,7 @@ class ORIENTANY2Args:
 
 
 def parse_orientany2_feature_type(feature_type: str) -> List[str]:
-    if not feature_type.startswith("ORIENTANY2_"):
-        raise ValueError(f"Invalid ORIENTANY2 feature type: {feature_type}. Must start with 'ORIENTANY2_'")
-    prompts_part = feature_type[len("ORIENTANY2_"):]
-    if prompts_part == "":
-        return []
-    return [w.lower() for w in prompts_part.split("_") if w.strip()]
+    return parse_prefixed_feature_type(feature_type, "ORIENTANY2_")
 
 
 def _normalize_alpha(alpha_raw: Any) -> int:
@@ -177,12 +177,7 @@ class ORIENTANY2Worker:
         self.data_dir = Path(data_dir)
         self.sam3_feature_type = sam3_feature_type
 
-        sam3_root = self.data_dir / "features" / self.sam3_feature_type.lower()
-        if not (sam3_root / "meta.pt").exists():
-            raise FileNotFoundError(f"Missing SAM3 meta: {sam3_root / 'meta.pt'}")
-
-        sam3_meta = torch.load(sam3_root / "meta.pt")
-        self.feat_image_fnames = [str(p) for p in sam3_meta["image_fnames"]]
+        self.feat_image_fnames = load_sam3_image_fnames(self.data_dir, self.sam3_feature_type)
         self.sam3_loader = BatchFeatureLoader(self.data_dir, self.sam3_feature_type, self.feat_image_fnames, self.device)
 
         ckpt_path = Path(__file__).parent / "orientany2" / "rotmod_realrotaug_best.pt"
@@ -204,12 +199,7 @@ class ORIENTANY2Worker:
         except ValueError as exc:
             raise ValueError(f"Image path not found in SAM3 meta order: {image_path}") from exc
 
-        masks = np.asarray(self.sam3_loader[idx])
-        if masks.ndim == 4:
-            masks = masks[:, 0, ...]
-        elif masks.ndim == 2:
-            masks = masks[None, ...]
-        masks = masks.astype(bool)
+        masks = normalize_sam3_masks(self.sam3_loader[idx], image_path=image_path)
 
         h, w = masks.shape[-2:]
         obj_masks = _filter_masks_by_size(masks, ORIENTANY2Args.min_instance_percent)
@@ -265,19 +255,12 @@ class ORIENTANY2Extractor:
         self.verbose = verbose
         self.data_dir = Path(data_dir) if data_dir is not None else None
         self.text_prompts = text_prompts
-        self.sam3_feature_type = sam3_feature_type or self._infer_sam3_feature_type(text_prompts)
+        self.sam3_feature_type = sam3_feature_type or infer_sam3_feature_type(text_prompts)
 
         if self.data_dir is None:
             raise ValueError("ORIENTANY2Extractor requires data_dir to locate precomputed SAM3 shards")
 
-        sam3_root = self.data_dir / "features" / self.sam3_feature_type.lower()
-        if not (sam3_root / "meta.pt").exists():
-            raise FileNotFoundError(
-                f"Missing SAM3 meta: {sam3_root / 'meta.pt'} (expected for ORIENTANY2). "
-                f"Run SAM3 extraction for feature type '{self.sam3_feature_type}' first."
-            )
-        if not list(sam3_root.glob("image_*.npz")):
-            raise FileNotFoundError(f"Missing SAM3 per-image features under {sam3_root}")
+        ensure_sam3_feature_cache(self.data_dir, self.sam3_feature_type, consumer="ORIENTANY2", require_npz=True)
 
         devices_param, num_workers = resolve_devices_and_workers(device, ORIENTANY2Args.batch_size_per_gpu)
         if verbose:
@@ -290,13 +273,6 @@ class ORIENTANY2Extractor:
             sam3_feature_type=self.sam3_feature_type,
         )
         self.num_workers = num_workers
-
-    @staticmethod
-    def _infer_sam3_feature_type(text_prompts: Optional[List[str]]) -> str:
-        if text_prompts is None or len(text_prompts) == 0:
-            return "SAM3_"
-        joined = "_".join([p.lower() for p in text_prompts])
-        return f"SAM3_{joined}"
 
     async def extract_batch_async(self, image_paths: List[str], debug: bool = False) -> List[Dict[str, Any]]:
         results: List[Dict[str, Any]] = []
