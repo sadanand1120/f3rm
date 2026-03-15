@@ -2,9 +2,8 @@
 name = "f3rm"
 version = "0.0.6"
 description = "F3RM: Feature Fields for Robotic Manipulation"
-readme = "README.md"
 requires-python = ">=3.8"
-license = { file = "LICENSE" }
+license = { text = "MIT" }
 keywords = ["nerf", "feature-fields", "robotics"]
 authors = [
     { name = "William Shen", email = "willshen@csail.mit.edu" },
@@ -35,13 +34,6 @@ dev = [
     "black",
     "isort",
 ]
-robot = [
-    "open3d",
-    "params-proto<3.0.0",  # v3.x has breaking API changes
-    "PyMCubes",
-    "python-slugify",
-    "viser",
-]
 
 [tool.black]
 line-length = 120
@@ -53,18 +45,11 @@ line-length = 120
 [project.entry-points."nerfstudio.method_configs"]
 f3rm = "f3rm.f3rm_config:f3rm_method"
 
-[project.scripts]
-f3rm-download-data = "f3rm.utils.download_datasets:main"
-f3rm-optimize = "f3rm_robot.optimize:entrypoint"
-
 [tool.setuptools.packages]
-find = { include = ["f3rm", "f3rm.*", "f3rm_robot", "f3rm_robot.*"] }
+find = { include = ["f3rm", "f3rm.*"] }
 
 [tool.setuptools.package-data]
 "f3rm.features.images" = ["*.png"]  # images for demo CLIP and DINO features
-"f3rm.features.clip" = ["bpe_simple_vocab_16e6.txt.gz", "README.md"]  # CLIP assets
-"f3rm_robot" = ["README.md"]
-"f3rm_robot.assets" = ["panda_gripper_visual.obj", "tasks/*.pt"]
 
 [build-system]
 requires = ["setuptools>=61.0"]

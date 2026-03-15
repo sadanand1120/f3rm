@@ -112,14 +112,6 @@ class FeaturePipeline(VanillaPipeline):
 
         images_dict["foreground_prob_gt"] = fg_gt_rgb
         images_dict["foreground_prob_vs_gt"] = torch.cat([images_dict["foreground_prob_rgb"], fg_gt_rgb], dim=1)
-        centroid_gt, centroid_valid = self.datamanager.get_centroid_image(ci_global)
-        centroid_gt = centroid_gt.to(images_dict["centroid_rgb"].device)
-        centroid_valid = centroid_valid.to(images_dict["centroid_rgb"].device)
-        centroid_pred_rgb = self.model.centroid_shader(outputs["centroid"], self.model.scene_box.aabb, centroid_valid)
-        centroid_gt_rgb = self.model.centroid_shader(centroid_gt, self.model.scene_box.aabb, centroid_valid)
-        images_dict["centroid_rgb"] = centroid_pred_rgb
-        images_dict["centroid_gt"] = centroid_gt_rgb
-        images_dict["centroid_vs_gt"] = torch.cat([centroid_pred_rgb, centroid_gt_rgb], dim=1)
 
         for key, img in images_dict.items():
             writer.put_image(name=f"Train Images/{key}", image=img, step=step)
@@ -144,14 +136,6 @@ class FeaturePipeline(VanillaPipeline):
 
         images_dict["foreground_prob_gt"] = fg_gt_rgb
         images_dict["foreground_prob_vs_gt"] = torch.cat([images_dict["foreground_prob_rgb"], fg_gt_rgb], dim=1)
-        centroid_gt, centroid_valid = self.datamanager.get_centroid_image(ci_global)
-        centroid_gt = centroid_gt.to(images_dict["centroid_rgb"].device)
-        centroid_valid = centroid_valid.to(images_dict["centroid_rgb"].device)
-        centroid_pred_rgb = self.model.centroid_shader(outputs["centroid"], self.model.scene_box.aabb, centroid_valid)
-        centroid_gt_rgb = self.model.centroid_shader(centroid_gt, self.model.scene_box.aabb, centroid_valid)
-        images_dict["centroid_rgb"] = centroid_pred_rgb
-        images_dict["centroid_gt"] = centroid_gt_rgb
-        images_dict["centroid_vs_gt"] = torch.cat([centroid_pred_rgb, centroid_gt_rgb], dim=1)
 
         # Add metadata expected by trainer-side eval logging.
         assert "image_idx" not in metrics_dict

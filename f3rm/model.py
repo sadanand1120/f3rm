@@ -1,14 +1,12 @@
 from dataclasses import dataclass, field
 from collections import defaultdict
 from functools import cached_property
-from pathlib import Path
-from typing import Dict, FrozenSet, List, Optional, Set, Type
+from typing import Dict, List, Optional, Type
 
 import open_clip
 import torch
 import torch.nn.functional as F
 from nerfstudio.cameras.rays import RayBundle, RaySamples
-from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes, TrainingCallbackLocation
 from nerfstudio.field_components.field_heads import FieldHeadNames
 from nerfstudio.model_components.losses import (
     orientation_loss,
@@ -29,7 +27,7 @@ from f3rm.pca_colormap import apply_pca_colormap_return_proj
 from f3rm.renderer import FeatureRenderer, ScalarRenderer
 from f3rm.features.clip_extract import CLIPArgs
 from f3rm.features.utils import compute_similarity_scores, parse_comma_separated_labels
-from f3rm.shaders import ProbFromProbsShader, SceneBoxCoordinateShader
+from f3rm.shaders import ProbFromProbsShader
 
 
 @dataclass
@@ -49,12 +47,6 @@ class FeatureFieldModelConfig(NerfactoModelConfig):
     foreground_loss_weight: float = 1e-3
     foreground_hidden_dim: int = 64
     foreground_num_layers: int = 1
-    centroid_loss_weight: float = 1e-3
-    centroid_hidden_dim: int = 64
-    centroid_num_layers: int = 2
-    train_stage1_heads: List[str] = field(default_factory=lambda: ["RGB", "FEATURE", "FOREGROUND"])
-    train_stage2_heads: List[str] = field(default_factory=lambda: ["RGB", "FEATURE", "FOREGROUND"])
-    train_stage1_steps: int = 0
 
 
 @dataclass
@@ -136,7 +128,6 @@ class FeatureFieldModel(NerfactoModel):
     config: FeatureFieldModelConfig
 
     feature_field: FeatureField
-    _SUPPORTED_TRAIN_HEADS = frozenset({"RGB", "FEATURE", "FOREGROUND", "CENTROID"})
 
     def populate_modules(self):
         super().populate_modules()
@@ -159,17 +150,12 @@ class FeatureFieldModel(NerfactoModel):
             num_layers=self.config.feat_num_layers,
             foreground_hidden_dim=self.config.foreground_hidden_dim,
             foreground_num_layers=self.config.foreground_num_layers,
-            centroid_hidden_dim=self.config.centroid_hidden_dim,
-            centroid_num_layers=self.config.centroid_num_layers,
             implementation=self.config.implementation,
         )
 
         self.renderer_feature = FeatureRenderer()
-        self.renderer_centroid = FeatureRenderer()
         self.renderer_spread = ScalarRenderer()
         self.prob_from_probs_shader = ProbFromProbsShader()
-        self.centroid_shader = SceneBoxCoordinateShader()
-        self._initialize_two_stage_training_config()
         self.setup_gui()
 
     def setup_gui(self):
@@ -201,129 +187,6 @@ class FeatureFieldModel(NerfactoModel):
         param_groups = super().get_param_groups()
         param_groups["feature_field"] = list(self.feature_field.parameters())
         return param_groups
-
-    @classmethod
-    def _normalize_train_heads(cls, raw_heads: List[str], field_name: str) -> FrozenSet[str]:
-        normalized_heads: Set[str] = set()
-        invalid_heads: List[str] = []
-        for head in raw_heads:
-            if not isinstance(head, str):
-                invalid_heads.append(str(head))
-                continue
-            head_upper = head.strip().upper()
-            if head_upper in cls._SUPPORTED_TRAIN_HEADS:
-                normalized_heads.add(head_upper)
-            else:
-                invalid_heads.append(head)
-        if invalid_heads:
-            valid_heads = ", ".join(sorted(cls._SUPPORTED_TRAIN_HEADS))
-            invalid_list = ", ".join(invalid_heads)
-            raise ValueError(f"{field_name} has invalid head(s): {invalid_list}. Valid heads are: {valid_heads}.")
-        return frozenset(normalized_heads)
-
-    def _initialize_two_stage_training_config(self) -> None:
-        if self.config.train_stage1_steps < 0:
-            raise ValueError(f"train_stage1_steps must be >= 0. Got: {self.config.train_stage1_steps}.")
-        self._train_stage1_heads = self._normalize_train_heads(self.config.train_stage1_heads, "train_stage1_heads")
-        self._train_stage2_heads = self._normalize_train_heads(self.config.train_stage2_heads, "train_stage2_heads")
-        self._active_train_heads: Optional[FrozenSet[str]] = None
-        self._centroid_scales_ready = False
-
-    def _active_heads_for_step(self, step: int) -> FrozenSet[str]:
-        return self._train_stage1_heads if step < self.config.train_stage1_steps else self._train_stage2_heads
-
-    @staticmethod
-    def _set_requires_grad(parameters, enabled: bool) -> None:
-        for param in parameters:
-            param.requires_grad = enabled
-
-    def _apply_two_stage_head_freezing(self, step: int) -> None:
-        active_heads = self._active_heads_for_step(step)
-        if active_heads == self._active_train_heads:
-            return
-        self._active_train_heads = active_heads
-
-        rgb_active = "RGB" in active_heads
-        feature_active = "FEATURE" in active_heads
-        foreground_active = "FOREGROUND" in active_heads
-        centroid_active = "CENTROID" in active_heads
-
-        # RGB controls all non-feature-field trainables (Nerfacto fields/proposals/camera path).
-        for param_name, param in self.named_parameters():
-            if param_name.startswith("feature_field."):
-                continue
-            param.requires_grad = rgb_active
-
-        self._set_requires_grad(self.feature_field.feature_hash_encoding.parameters(), feature_active)
-        if self.feature_field.feature_pe_encoding is not None:
-            self._set_requires_grad(self.feature_field.feature_pe_encoding.parameters(), feature_active)
-        self._set_requires_grad(self.feature_field.mlp_feature.parameters(), feature_active)
-
-        self._set_requires_grad(self.feature_field.foreground_hash_encoding.parameters(), foreground_active)
-        if self.feature_field.foreground_pe_encoding is not None:
-            self._set_requires_grad(self.feature_field.foreground_pe_encoding.parameters(), foreground_active)
-        self._set_requires_grad(self.feature_field.mlp_foreground.parameters(), foreground_active)
-
-        self._set_requires_grad(self.feature_field.centroid_hash_encoding.parameters(), centroid_active)
-        if self.feature_field.centroid_pe_encoding is not None:
-            self._set_requires_grad(self.feature_field.centroid_pe_encoding.parameters(), centroid_active)
-        self._set_requires_grad(self.feature_field.mlp_centroid.parameters(), centroid_active)
-
-    def _is_entering_stage2(self, step: int) -> bool:
-        if step < self.config.train_stage1_steps:
-            return False
-        return self._active_heads_for_step(step) != self._active_train_heads
-
-    def _run_centroid_scale_calibration(
-        self,
-        step: int,
-        training_callback_attributes: TrainingCallbackAttributes,
-    ) -> None:
-        if self._centroid_scales_ready or not self._is_entering_stage2(step):
-            return
-        active_heads = self._active_heads_for_step(step)
-        if "CENTROID" not in active_heads:
-            return
-
-        trainer = training_callback_attributes.trainer
-        pipeline = training_callback_attributes.pipeline
-        checkpoint_step = max(step - 1, 0)
-        CONSOLE.print(f"[bold cyan]Stage 2 transition at step {step}[/bold cyan]")
-        CONSOLE.print(f"Saving checkpoint for centroid calibration at step {checkpoint_step}")
-        trainer.save_checkpoint(checkpoint_step)
-
-        config_path = Path(trainer.base_dir) / "config.yml"
-        datamanager = pipeline.datamanager
-        CONSOLE.print("Running one-time centroid scale calibration")
-        from f3rm.centroid import run_parallel_scale_calibration
-
-        scale_results = run_parallel_scale_calibration(
-            data_dir=Path(datamanager.config.dataparser.data),
-            config_path=config_path,
-            sam3d_feature_name=datamanager.centroid_sam3d_feature_name,
-            num_workers_per_gpu=2,
-        )
-        datamanager.set_centroid_scale_results(scale_results)
-        self._centroid_scales_ready = True
-        CONSOLE.print("Centroid scale calibration complete; continuing with stage 2")
-
-    def get_training_callbacks(
-        self, training_callback_attributes: TrainingCallbackAttributes
-    ) -> List[TrainingCallback]:
-        callbacks = super().get_training_callbacks(training_callback_attributes)
-
-        def apply_stage_controls(step: int) -> None:
-            self._run_centroid_scale_calibration(step, training_callback_attributes)
-            self._apply_two_stage_head_freezing(step)
-
-        callbacks.append(
-            TrainingCallback(
-                where_to_run=[TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
-                update_every_num_iters=1,
-                func=apply_stage_controls,
-            )
-        )
-        return callbacks
 
     def _get_outputs_internal(self, ray_bundle: RayBundle, render_features: bool):
         """Core rendering that can optionally skip feature-field computation."""
@@ -360,9 +223,6 @@ class FeatureFieldModel(NerfactoModel):
             feat_vals = self.feature_field.get_feature(ray_samples)
             features = self.renderer_feature(features=feat_vals, weights=custom_weights)
             del feat_vals
-            centroid_vals = self.feature_field.get_centroid(ray_samples)
-            centroids = self.renderer_centroid(features=centroid_vals, weights=custom_weights)
-            del centroid_vals
 
         outputs = {
             "rgb": rgb,
@@ -373,7 +233,6 @@ class FeatureFieldModel(NerfactoModel):
         }
         if render_features:
             outputs["feature"] = features
-            outputs["centroid"] = centroids
 
         if self.config.predict_normals:
             normals = self.renderer_normals(normals=field_outputs[FieldHeadNames.NORMALS], weights=weights)
@@ -417,13 +276,6 @@ class FeatureFieldModel(NerfactoModel):
         pred = probs.argmax(dim=-1)
         targ = fg_target.argmax(dim=-1)
         metrics_dict["foreground_acc"] = (pred == targ).float().mean()
-        centroid_valid = batch["centroid_valid"].to(self.device)
-        if centroid_valid.any():
-            target_centroid = batch["centroid"].to(device=self.device, dtype=torch.float32)
-            pred_centroid = outputs["centroid"].to(dtype=torch.float32)
-            metrics_dict["centroid_error"] = F.mse_loss(pred_centroid[centroid_valid], target_centroid[centroid_valid])
-        else:
-            metrics_dict["centroid_error"] = torch.zeros((), device=self.device, dtype=torch.float32)
         return metrics_dict
 
     def get_loss_dict(self, outputs, batch, metrics_dict=None):
@@ -438,14 +290,6 @@ class FeatureFieldModel(NerfactoModel):
         fg_target_idx = fg_target.argmax(dim=-1).view(-1)
         ce = F.cross_entropy(fg_logits, fg_target_idx)
         loss_dict["foreground_loss"] = self.config.foreground_loss_weight * ce
-        centroid_valid = batch["centroid_valid"].to(self.device)
-        if centroid_valid.any():
-            target_centroid = batch["centroid"].to(device=self.device, dtype=torch.float32)
-            pred_centroid = outputs["centroid"].to(dtype=torch.float32)
-            centroid_loss = F.mse_loss(pred_centroid[centroid_valid], target_centroid[centroid_valid])
-        else:
-            centroid_loss = torch.zeros((), device=self.device, dtype=torch.float32)
-        loss_dict["centroid_loss"] = self.config.centroid_loss_weight * centroid_loss
         return loss_dict
 
     @torch.no_grad()
@@ -524,7 +368,5 @@ class FeatureFieldModel(NerfactoModel):
             images_dict["feature_pca"], viewer_utils.pca_proj, *_ = apply_pca_colormap_return_proj(
                 outputs["feature"], viewer_utils.pca_proj
             )
-        if "centroid" in outputs:
-            images_dict["centroid_rgb"] = self.centroid_shader(outputs["centroid"], self.scene_box.aabb)
 
         return metrics_dict, images_dict

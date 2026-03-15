@@ -14,7 +14,6 @@ from torch import Tensor
 class FeatureFieldHeadNames:
     FEATURE = "feature"
     FOREGROUND = "foreground"
-    CENTROID = "centroid"
 
 
 class FeatureField(Field):
@@ -33,8 +32,6 @@ class FeatureField(Field):
         num_layers: int = 2,
         foreground_hidden_dim: int = 64,
         foreground_num_layers: int = 1,
-        centroid_hidden_dim: int = 64,
-        centroid_num_layers: int = 2,
         implementation: Literal["tcnn", "torch"] = "tcnn",
     ):
         super().__init__()
@@ -77,24 +74,6 @@ class FeatureField(Field):
                 implementation=implementation,
             )
 
-        self.centroid_hash_encoding = HashEncoding(
-            num_levels=num_levels,
-            min_res=start_res,
-            max_res=max_res,
-            log2_hashmap_size=log2_hashmap_size,
-            features_per_level=features_per_level,
-            implementation=implementation,
-        )
-        self.centroid_pe_encoding: Optional[NeRFEncoding] = None
-        if use_pe:
-            self.centroid_pe_encoding = NeRFEncoding(
-                in_dim=3,
-                num_frequencies=pe_n_freq,
-                min_freq_exp=0,
-                max_freq_exp=pe_n_freq - 1,
-                implementation=implementation,
-            )
-
         feature_enc_out_dim = self.feature_hash_encoding.get_out_dim()
         if self.feature_pe_encoding is not None:
             feature_enc_out_dim += self.feature_pe_encoding.get_out_dim()
@@ -102,10 +81,6 @@ class FeatureField(Field):
         foreground_enc_out_dim = self.foreground_hash_encoding.get_out_dim()
         if self.foreground_pe_encoding is not None:
             foreground_enc_out_dim += self.foreground_pe_encoding.get_out_dim()
-
-        centroid_enc_out_dim = self.centroid_hash_encoding.get_out_dim()
-        if self.centroid_pe_encoding is not None:
-            centroid_enc_out_dim += self.centroid_pe_encoding.get_out_dim()
 
         self.mlp_feature = MLP(
             in_dim=feature_enc_out_dim,
@@ -122,16 +97,6 @@ class FeatureField(Field):
             num_layers=foreground_num_layers,
             layer_width=foreground_hidden_dim,
             out_dim=2,
-            activation=nn.ReLU(),
-            out_activation=None,
-            implementation=implementation,
-        )
-
-        self.mlp_centroid = MLP(
-            in_dim=centroid_enc_out_dim,
-            num_layers=centroid_num_layers,
-            layer_width=centroid_hidden_dim,
-            out_dim=3,
             activation=nn.ReLU(),
             out_activation=None,
             implementation=implementation,
@@ -176,26 +141,15 @@ class FeatureField(Field):
         logits = self.mlp_foreground(encoded_base).view(*ray_samples.frustums.directions.shape[:-1], -1)
         return logits
 
-    def get_centroid(self, ray_samples: RaySamples) -> Tensor:
-        encoded_base = self._encode_positions(
-            ray_samples=ray_samples,
-            hash_encoding=self.centroid_hash_encoding,
-            pe_encoding=self.centroid_pe_encoding,
-        )
-        centroids = self.mlp_centroid(encoded_base).view(*ray_samples.frustums.directions.shape[:-1], -1)
-        return centroids
-
     def get_outputs(self, ray_samples: RaySamples, density_embedding: Optional[Tensor] = None) -> Dict[str, Tensor]:
         """Compute all field outputs."""
         del density_embedding  # Unused for this field; kept for Field API compatibility.
         features = self.get_feature(ray_samples)
         foreground = self.get_foreground(ray_samples)
-        centroid = self.get_centroid(ray_samples)
 
         return {
             FeatureFieldHeadNames.FEATURE: features,
             FeatureFieldHeadNames.FOREGROUND: foreground,
-            FeatureFieldHeadNames.CENTROID: centroid,
         }
 
     def forward(self, ray_samples: RaySamples, compute_normals: bool = False) -> Dict[str, Tensor]:

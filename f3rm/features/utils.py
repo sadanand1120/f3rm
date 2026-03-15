@@ -616,7 +616,7 @@ class BatchFeatureLoader:
         if feature_type in ("CLIP", "DINO"):
             self.H, self.W, self.C = sample_features.shape
             self.dtype = sample_features.dtype
-        elif feature_type.startswith("FOREGROUND_") or feature_type.startswith("CENTROID_"):
+        elif feature_type.startswith("FOREGROUND_"):
             self.H, self.W, self.C = sample_features.shape
             self.dtype = sample_features.dtype
         elif feature_type.startswith("ORIENTANY_") or feature_type.startswith("ORIENTANY2_"):
@@ -633,7 +633,7 @@ class BatchFeatureLoader:
             data = np.load(self.root / f"image_{img_idx:06d}.npy", mmap_mode="r")
             t = torch.from_numpy(data)
             return t.pin_memory() if self._use_pinned else t
-        elif self.feature_type.startswith("FOREGROUND_") or self.feature_type.startswith("CENTROID_"):
+        elif self.feature_type.startswith("FOREGROUND_"):
             data = np.load(self.root / f"image_{img_idx:06d}.npy", mmap_mode="r")
             t = torch.from_numpy(data)
             return t.pin_memory() if self._use_pinned else t
@@ -729,7 +729,7 @@ class BatchFeatureLoader:
         for cam_idx in unique_indices:
             cam_idx_int = int(cam_idx.item())
             # Only tensor-backed features are cached on GPU. For list/JSON types we fall back to CPU read.
-            if self.feature_type in ("CLIP", "DINO") or self.feature_type.startswith("FOREGROUND_") or self.feature_type.startswith("CENTROID_") or self.feature_type.startswith("ORIENTANY_") or self.feature_type.startswith("ORIENTANY2_"):
+            if self.feature_type in ("CLIP", "DINO") or self.feature_type.startswith("FOREGROUND_") or self.feature_type.startswith("ORIENTANY_") or self.feature_type.startswith("ORIENTANY2_"):
                 batch_features[cam_idx_int] = self._get_gpu_tensor(cam_idx_int)
             else:
                 # CPU-backed feature types (e.g. SAM3/TEXT)
@@ -738,7 +738,7 @@ class BatchFeatureLoader:
 
     def __getitem__(self, index: int):
         """Direct access by image index for pipeline compatibility."""
-        if self.feature_type in ("CLIP", "DINO") or self.feature_type.startswith("FOREGROUND_") or self.feature_type.startswith("CENTROID_") or self.feature_type.startswith("ORIENTANY_") or self.feature_type.startswith("ORIENTANY2_"):
+        if self.feature_type in ("CLIP", "DINO") or self.feature_type.startswith("FOREGROUND_") or self.feature_type.startswith("ORIENTANY_") or self.feature_type.startswith("ORIENTANY2_"):
             return self._get_gpu_tensor(index)
         else:
             return self._load_single_image_cpu(index)
