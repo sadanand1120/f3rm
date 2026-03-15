@@ -35,6 +35,7 @@ f3rm_method = MethodSpecification(
             datamanager=FeatureDataManagerConfig(
                 feature_type="CLIP",
                 foreground_feature_type="FOREGROUND_",
+                centroid_feature_type="CENTROID_",
                 cpu_feature_cache_images=256,
                 gpu_feature_cache_images=128,
                 dataparser=NerfstudioDataParserConfig(train_split_fraction=0.95),
@@ -57,6 +58,12 @@ f3rm_method = MethodSpecification(
                 foreground_loss_weight=1e-3,
                 foreground_hidden_dim=64,
                 foreground_num_layers=2,
+                centroid_loss_weight=1.0,
+                centroid_hidden_dim=64,
+                centroid_num_layers=2,
+                train_stage1_heads=["RGB", "FEATURE", "FOREGROUND"],
+                train_stage2_heads=["CENTROID"],
+                train_stage1_steps=31000,
             ),
             steps_per_train_image_viz=8000,
         ),
@@ -70,8 +77,8 @@ f3rm_method = MethodSpecification(
                 "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, warmup_steps=1000, max_steps=80000),
             },
             "feature_field": {
-                "optimizer": AdamOptimizerConfig(lr=5e-3, eps=1e-15, max_norm=1.0),
-                "scheduler": ExponentialDecaySchedulerConfig(lr_final=6e-5, warmup_steps=1000, max_steps=28000),
+                "optimizer": AdamOptimizerConfig(lr=5e-2, eps=1e-15, max_norm=1.0),
+                "scheduler": ExponentialDecaySchedulerConfig(lr_final=5e-3, warmup_steps=1000, max_steps=80000),
             },
             "camera_opt": {
                 "optimizer": AdamOptimizerConfig(lr=1e-4, eps=1e-8, weight_decay=0.0, max_norm=0.5),

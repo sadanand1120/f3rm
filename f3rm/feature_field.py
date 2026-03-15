@@ -14,6 +14,7 @@ from torch import Tensor
 class FeatureFieldHeadNames:
     FEATURE = "feature"
     FOREGROUND = "foreground"
+    CENTROID = "centroid"
 
 
 class FeatureField(Field):
@@ -32,13 +33,15 @@ class FeatureField(Field):
         num_layers: int = 2,
         foreground_hidden_dim: int = 64,
         foreground_num_layers: int = 1,
+        centroid_hidden_dim: int = 64,
+        centroid_num_layers: int = 2,
         implementation: Literal["tcnn", "torch"] = "tcnn",
     ):
         super().__init__()
         self.feature_dim = feature_dim
         self.spatial_distortion = spatial_distortion
 
-        self.hash_encoding = HashEncoding(
+        self.feature_hash_encoding = HashEncoding(
             num_levels=num_levels,
             min_res=start_res,
             max_res=max_res,
@@ -46,9 +49,9 @@ class FeatureField(Field):
             features_per_level=features_per_level,
             implementation=implementation,
         )
-        self.pe_encoding: Optional[NeRFEncoding] = None
+        self.feature_pe_encoding: Optional[NeRFEncoding] = None
         if use_pe:
-            self.pe_encoding = NeRFEncoding(
+            self.feature_pe_encoding = NeRFEncoding(
                 in_dim=3,
                 num_frequencies=pe_n_freq,
                 min_freq_exp=0,
@@ -56,12 +59,56 @@ class FeatureField(Field):
                 implementation=implementation,
             )
 
-        enc_out_dim = self.hash_encoding.get_out_dim()
-        if self.pe_encoding is not None:
-            enc_out_dim += self.pe_encoding.get_out_dim()
+        self.foreground_hash_encoding = HashEncoding(
+            num_levels=num_levels,
+            min_res=start_res,
+            max_res=max_res,
+            log2_hashmap_size=log2_hashmap_size,
+            features_per_level=features_per_level,
+            implementation=implementation,
+        )
+        self.foreground_pe_encoding: Optional[NeRFEncoding] = None
+        if use_pe:
+            self.foreground_pe_encoding = NeRFEncoding(
+                in_dim=3,
+                num_frequencies=pe_n_freq,
+                min_freq_exp=0,
+                max_freq_exp=pe_n_freq - 1,
+                implementation=implementation,
+            )
+
+        self.centroid_hash_encoding = HashEncoding(
+            num_levels=num_levels,
+            min_res=start_res,
+            max_res=max_res,
+            log2_hashmap_size=log2_hashmap_size,
+            features_per_level=features_per_level,
+            implementation=implementation,
+        )
+        self.centroid_pe_encoding: Optional[NeRFEncoding] = None
+        if use_pe:
+            self.centroid_pe_encoding = NeRFEncoding(
+                in_dim=3,
+                num_frequencies=pe_n_freq,
+                min_freq_exp=0,
+                max_freq_exp=pe_n_freq - 1,
+                implementation=implementation,
+            )
+
+        feature_enc_out_dim = self.feature_hash_encoding.get_out_dim()
+        if self.feature_pe_encoding is not None:
+            feature_enc_out_dim += self.feature_pe_encoding.get_out_dim()
+
+        foreground_enc_out_dim = self.foreground_hash_encoding.get_out_dim()
+        if self.foreground_pe_encoding is not None:
+            foreground_enc_out_dim += self.foreground_pe_encoding.get_out_dim()
+
+        centroid_enc_out_dim = self.centroid_hash_encoding.get_out_dim()
+        if self.centroid_pe_encoding is not None:
+            centroid_enc_out_dim += self.centroid_pe_encoding.get_out_dim()
 
         self.mlp_feature = MLP(
-            in_dim=enc_out_dim,
+            in_dim=feature_enc_out_dim,
             num_layers=num_layers,
             layer_width=hidden_dim,
             out_dim=self.feature_dim,
@@ -71,7 +118,7 @@ class FeatureField(Field):
         )
 
         self.mlp_foreground = MLP(
-            in_dim=enc_out_dim,
+            in_dim=foreground_enc_out_dim,
             num_layers=foreground_num_layers,
             layer_width=foreground_hidden_dim,
             out_dim=2,
@@ -80,17 +127,29 @@ class FeatureField(Field):
             implementation=implementation,
         )
 
+        self.mlp_centroid = MLP(
+            in_dim=centroid_enc_out_dim,
+            num_layers=centroid_num_layers,
+            layer_width=centroid_hidden_dim,
+            out_dim=3,
+            activation=nn.ReLU(),
+            out_activation=None,
+            implementation=implementation,
+        )
+
     def get_density(self, ray_samples: RaySamples) -> Tuple[Shaped[Tensor, "*batch 1"], Float[Tensor, "*batch num_features"]]:
         raise NotImplementedError("get_density not supported for FeatureField")
 
-    def _encode_positions(self, ray_samples: RaySamples) -> Tensor:
-        """Apply scene contraction and encode positions once."""
+    def _encode_positions(
+        self, ray_samples: RaySamples, hash_encoding: HashEncoding, pe_encoding: Optional[NeRFEncoding]
+    ) -> Tensor:
+        """Apply scene contraction and encode positions for a specific branch."""
         positions = ray_samples.frustums.get_positions().detach()
         positions = self._preprocess_positions(positions)
         positions_flat = positions.view(-1, 3)
-        encoded = [self.hash_encoding(positions_flat)]
-        if self.pe_encoding is not None:
-            encoded.append(self.pe_encoding(positions_flat))
+        encoded = [hash_encoding(positions_flat)]
+        if pe_encoding is not None:
+            encoded.append(pe_encoding(positions_flat))
         return torch.cat(encoded, dim=-1) if len(encoded) > 1 else encoded[0]
 
     def _preprocess_positions(self, positions: Tensor) -> Tensor:
@@ -100,24 +159,43 @@ class FeatureField(Field):
         return positions
 
     def get_feature(self, ray_samples: RaySamples) -> Tensor:
-        encoded_base = self._encode_positions(ray_samples)
+        encoded_base = self._encode_positions(
+            ray_samples=ray_samples,
+            hash_encoding=self.feature_hash_encoding,
+            pe_encoding=self.feature_pe_encoding,
+        )
         features = self.mlp_feature(encoded_base).view(*ray_samples.frustums.directions.shape[:-1], -1)
         return features
 
     def get_foreground(self, ray_samples: RaySamples) -> Tensor:
-        encoded_base = self._encode_positions(ray_samples)
+        encoded_base = self._encode_positions(
+            ray_samples=ray_samples,
+            hash_encoding=self.foreground_hash_encoding,
+            pe_encoding=self.foreground_pe_encoding,
+        )
         logits = self.mlp_foreground(encoded_base).view(*ray_samples.frustums.directions.shape[:-1], -1)
         return logits
+
+    def get_centroid(self, ray_samples: RaySamples) -> Tensor:
+        encoded_base = self._encode_positions(
+            ray_samples=ray_samples,
+            hash_encoding=self.centroid_hash_encoding,
+            pe_encoding=self.centroid_pe_encoding,
+        )
+        centroids = self.mlp_centroid(encoded_base).view(*ray_samples.frustums.directions.shape[:-1], -1)
+        return centroids
 
     def get_outputs(self, ray_samples: RaySamples, density_embedding: Optional[Tensor] = None) -> Dict[str, Tensor]:
         """Compute all field outputs."""
         del density_embedding  # Unused for this field; kept for Field API compatibility.
         features = self.get_feature(ray_samples)
         foreground = self.get_foreground(ray_samples)
+        centroid = self.get_centroid(ray_samples)
 
         return {
             FeatureFieldHeadNames.FEATURE: features,
             FeatureFieldHeadNames.FOREGROUND: foreground,
+            FeatureFieldHeadNames.CENTROID: centroid,
         }
 
     def forward(self, ray_samples: RaySamples, compute_normals: bool = False) -> Dict[str, Tensor]:

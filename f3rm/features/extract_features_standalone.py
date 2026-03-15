@@ -2,7 +2,7 @@
 """
 Standalone Feature Extraction Script
 
-Extracts features (CLIP, DINO, SAM3_*, TEXT, FOREGROUND_*, ORIENTANY_*, ORIENTANY2_*) for a dataset
+Extracts features (CLIP, DINO, SAM3_*, TEXT, FOREGROUND_*, CENTROID_*, ORIENTANY_*, ORIENTANY2_*) for a dataset
 and saves them as individual per-image files for efficient batch loading during training.
 
 Features are processed in batches for memory efficiency during extraction, but each image's
@@ -14,7 +14,7 @@ Usage:
         --feature-type CLIP \
         --batch-size 64
 
-Supported feature types: CLIP, DINO, SAM3_*, TEXT, FOREGROUND_*, ORIENTANY_*, ORIENTANY2_*
+Supported feature types: CLIP, DINO, SAM3_*, TEXT, FOREGROUND_*, CENTROID_*, ORIENTANY_*, ORIENTANY2_*
 """
 
 import argparse
@@ -40,6 +40,9 @@ def _lazy_import_components(feature_type: str):
     if feature_type.startswith("FOREGROUND_"):
         from f3rm.features.foreground_extract import FOREGROUNDArgs, FOREGROUNDExtractor, parse_foreground_feature_type, examine_saved
         return FOREGROUNDArgs, FOREGROUNDExtractor, parse_foreground_feature_type, examine_saved
+    if feature_type.startswith("CENTROID_"):
+        from f3rm.features.centroid_extract import CENTROIDArgs, CENTROIDExtractor, parse_centroid_feature_type
+        return CENTROIDArgs, CENTROIDExtractor, parse_centroid_feature_type, None
     if feature_type.startswith("ORIENTANY_"):
         from f3rm.features.orientany_extract import ORIENTANYArgs, ORIENTANYExtractor, parse_orientany_feature_type, examine_saved
         return ORIENTANYArgs, ORIENTANYExtractor, parse_orientany_feature_type, examine_saved
@@ -127,7 +130,7 @@ async def _save_per_image_generic(
             if feature_type in ("CLIP", "DINO"):
                 img_data = data[j].cpu().half()
                 np.save(root / f"image_{img_idx:06d}.npy", img_data.numpy(), allow_pickle=False)
-            elif feature_type.startswith("FOREGROUND_"):
+            elif feature_type.startswith("FOREGROUND_") or feature_type.startswith("CENTROID_"):
                 img_data = data[j].astype(np.float16)
                 np.save(root / f"image_{img_idx:06d}.npy", img_data, allow_pickle=False)
             elif feature_type.startswith("ORIENTANY_") or feature_type.startswith("ORIENTANY2_"):
@@ -157,7 +160,7 @@ def _cache_file_count_matches(root: Path, feature_type: str, num_images: int) ->
     if num_images == 0:
         return True
 
-    if feature_type in ("CLIP", "DINO") or feature_type.startswith("FOREGROUND_"):
+    if feature_type in ("CLIP", "DINO") or feature_type.startswith("FOREGROUND_") or feature_type.startswith("CENTROID_"):
         return len(list(root.glob("image_*.npy"))) == num_images
     if feature_type.startswith("ORIENTANY_") or feature_type.startswith("ORIENTANY2_"):
         return (
@@ -169,6 +172,20 @@ def _cache_file_count_matches(root: Path, feature_type: str, num_images: int) ->
     if feature_type == "TEXT":
         return len(list(root.glob("image_*.json"))) == num_images
     return False
+
+
+def _normalize_image_path_for_cache(path_like: str, data_dir: Path) -> str:
+    """Normalize image path strings so absolute/relative variants compare equal."""
+    p = Path(str(path_like))
+    if p.is_absolute():
+        return str(p.resolve())
+
+    bases = [Path.cwd(), data_dir, *data_dir.parents]
+    for base in bases:
+        candidate = (base / p)
+        if candidate.exists():
+            return str(candidate.resolve())
+    return str((Path.cwd() / p).resolve())
 
 
 def feature_loader(image_fnames: List[str], extract_args, data_dir: Path, feature_type: str) -> bool:
@@ -192,8 +209,12 @@ def feature_loader(image_fnames: List[str], extract_args, data_dir: Path, featur
 
     # Check image filenames match
     cached_fnames = md.get("image_fnames")
-    current_fnames_str = [str(fname) for fname in image_fnames]
-    cached_fnames_str = [str(fname) for fname in cached_fnames] if cached_fnames else None
+    current_fnames_str = [_normalize_image_path_for_cache(str(fname), data_dir) for fname in image_fnames]
+    cached_fnames_str = (
+        [_normalize_image_path_for_cache(str(fname), data_dir) for fname in cached_fnames]
+        if cached_fnames
+        else None
+    )
     fnames_match = cached_fnames_str == current_fnames_str
 
     if not args_match or not fnames_match:
@@ -234,7 +255,7 @@ def get_image_filenames_from_dataparser(data_dir: Path) -> List[str]:
 def extract_features_for_dataset(
     image_fnames: List[str],
     data_dir: Path,
-    feature_type: Literal["CLIP", "DINO", "SAM3_*", "TEXT", "FOREGROUND_*", "ORIENTANY_*", "ORIENTANY2_*"],
+    feature_type: Literal["CLIP", "DINO", "SAM3_*", "TEXT", "FOREGROUND_*", "CENTROID_*", "ORIENTANY_*", "ORIENTANY2_*"],
     device: torch.device,
     batch_size: int = 64,
     enable_cache: bool = True,
@@ -289,7 +310,7 @@ def extract_features_for_dataset(
 
 def extract_features_standalone(
     data_dir: Path,
-    feature_type: Literal["CLIP", "DINO", "SAM3_*", "TEXT", "FOREGROUND_*", "ORIENTANY_*", "ORIENTANY2_*"],
+    feature_type: Literal["CLIP", "DINO", "SAM3_*", "TEXT", "FOREGROUND_*", "CENTROID_*", "ORIENTANY_*", "ORIENTANY2_*"],
     batch_size: int = 64,
     device: str = "auto",
     force: bool = False,
@@ -346,10 +367,11 @@ def main():
         help=(
             "Feature type to extract.\n"
             "- FOREGROUND: 'FOREGROUND_book' or 'FOREGROUND_book_pen' -> uses SAM3_book(_pen) masks, 'FOREGROUND_' -> uses SAM3_ masks.\n"
+            "- CENTROID: 'CENTROID_book' or 'CENTROID_book_pen' -> uses SAM3_book(_pen) masks + SAM3D_book(_pen) centroids, 'CENTROID_' -> uses SAM3_ masks + SAM3D_ centroids.\n"
             "- ORIENTANY: 'ORIENTANY_book' or 'ORIENTANY_book_pen' -> uses SAM3_book(_pen) masks, 'ORIENTANY_' -> uses SAM3_ masks.\n"
             "- ORIENTANY2: 'ORIENTANY2_book' or 'ORIENTANY2_book_pen' -> uses SAM3_book(_pen) masks, 'ORIENTANY2_' -> uses SAM3_ masks.\n"
             "- SAM3: 'SAM3_book' or 'SAM3_book_pen' (global), 'SAM3_' (use TEXT shards).\n"
-            "Examples: CLIP, DINO, SAM3_book, SAM3_, TEXT, FOREGROUND_book, FOREGROUND_, ORIENTANY_book, ORIENTANY_, ORIENTANY2_book, ORIENTANY2_."
+            "Examples: CLIP, DINO, SAM3_book, SAM3_, TEXT, FOREGROUND_book, FOREGROUND_, CENTROID_book, CENTROID_, ORIENTANY_book, ORIENTANY_, ORIENTANY2_book, ORIENTANY2_."
         )
     )
 
