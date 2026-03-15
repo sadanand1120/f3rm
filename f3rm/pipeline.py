@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Optional, Type
 from pathlib import Path
-from time import time
+from time import perf_counter, time
+from typing import Dict, List, Literal, Optional, Type
 
 import torch
 
@@ -21,6 +21,10 @@ class FeaturePipelineConfig(VanillaPipelineConfig):
 
 
 class FeaturePipeline(VanillaPipeline):
+    @staticmethod
+    def _put_timing(name: str, duration: float, step: int, avg_over_steps: bool = True) -> None:
+        writer.put_time(name=name, duration=duration, step=step, avg_over_steps=avg_over_steps)
+
     def __init__(
         self,
         config: FeaturePipelineConfig,
@@ -43,9 +47,15 @@ class FeaturePipeline(VanillaPipeline):
     @profiler.time_function
     def get_train_loss_dict(self, step: int):
         ray_bundle, batch = self.datamanager.next_train(step)
+        model_start = perf_counter()
         model_outputs = self._model(ray_bundle)
+        self._put_timing("Timing/Train/model_forward", perf_counter() - model_start, step)
+
+        metrics_start = perf_counter()
         metrics_dict = self.model.get_metrics_dict(model_outputs, batch)
         loss_dict = self.model.get_loss_dict(model_outputs, batch, metrics_dict)
+        self._put_timing("Timing/Train/metrics_loss", perf_counter() - metrics_start, step)
+
         if self.config.steps_per_train_image_viz and step_check(step, self.config.steps_per_train_image_viz):
             self._log_train_images_for_step(batch, step)
         return model_outputs, loss_dict, metrics_dict
@@ -118,6 +128,7 @@ class FeaturePipeline(VanillaPipeline):
 
     @profiler.time_function
     def get_eval_image_metrics_and_images(self, step: int):
+        eval_start = perf_counter()
         self.eval()
         # Retrieve one eval camera/batch deterministically for reproducible eval curves.
         camera, batch = self._get_deterministic_eval_camera_and_batch(step)
@@ -143,6 +154,7 @@ class FeaturePipeline(VanillaPipeline):
         assert "num_rays" not in metrics_dict
         metrics_dict["num_rays"] = (camera.height * camera.width * camera.size).item()
         self.train()
+        self._put_timing("Timing/Eval/image_total", perf_counter() - eval_start, step, avg_over_steps=False)
         return metrics_dict, images_dict
 
     @profiler.time_function
@@ -150,6 +162,7 @@ class FeaturePipeline(VanillaPipeline):
         self, step: Optional[int] = None, output_path: Optional[Path] = None, get_std: bool = False
     ):
         """Memory-efficient override: iterate eval images, render per image with no_grad, free tensors between images."""
+        eval_start = perf_counter()
         self.eval()
         metrics_dict_list = []
         assert isinstance(self.datamanager, VanillaDataManager)
@@ -198,4 +211,10 @@ class FeaturePipeline(VanillaPipeline):
                     torch.mean(torch.tensor([m[key] for m in metrics_dict_list]))
                 )
         self.train()
+        self._put_timing(
+            "Timing/Eval/all_images_total",
+            perf_counter() - eval_start,
+            step=0 if step is None else step,
+            avg_over_steps=False,
+        )
         return metrics_dict

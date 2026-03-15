@@ -19,6 +19,7 @@ datasets/
 
 # Nerfstudio outputs
 *outputs*/
+benchmark_runs/
 
 renders/
 exports/

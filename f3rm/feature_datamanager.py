@@ -1,5 +1,6 @@
 import gc
 from dataclasses import dataclass, field
+from time import perf_counter
 from typing import Dict, Literal, Tuple, Type
 
 import torch
@@ -8,6 +9,7 @@ from nerfstudio.data.datamanagers.base_datamanager import (
     VanillaDataManager,
     VanillaDataManagerConfig,
 )
+from nerfstudio.utils import writer
 from nerfstudio.utils.rich_utils import CONSOLE
 
 from f3rm.features.extract_features_standalone import extract_features_for_dataset
@@ -26,6 +28,10 @@ class FeatureDataManagerConfig(VanillaDataManagerConfig):
 
 class FeatureDataManager(VanillaDataManager):
     config: FeatureDataManagerConfig
+
+    @staticmethod
+    def _put_timing(name: str, duration: float, step: int) -> None:
+        writer.put_time(name=name, duration=duration, step=step, avg_over_steps=True)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -121,7 +127,9 @@ class FeatureDataManager(VanillaDataManager):
         x_idx = (ray_indices[:, 2] * scale_w).long()
         return camera_idx, y_idx, x_idx
 
-    def _populate_batch_features(self, batch: Dict, is_eval: bool) -> None:
+    def _populate_batch_features(self, batch: Dict, step: int, is_eval: bool) -> None:
+        prefix = "Eval" if is_eval else "Train"
+        populate_start = perf_counter()
         self._clear_batch_features()
         camera_idx, y_feat, x_feat = self._index_triplet(batch, self.feat_scale_h, self.feat_scale_w)
         cam_fg, y_fg, x_fg = self._index_triplet(batch, self.fg_scale_h, self.fg_scale_w)
@@ -130,18 +138,28 @@ class FeatureDataManager(VanillaDataManager):
             camera_idx = camera_idx + self.eval_offset
             cam_fg = cam_fg + self.eval_offset
 
+        load_start = perf_counter()
         self._load_batch_features(camera_idx)
+        self._put_timing(f"Timing/{prefix}/feature_cache_load", perf_counter() - load_start, step)
+
+        gather_start = perf_counter()
         batch["feature"] = self._gather_feats_from_batch(self.current_batch_features, camera_idx, y_feat, x_feat)
         batch["foreground"] = self._gather_feats_from_batch(self.current_batch_fg, cam_fg, y_fg, x_fg)
+        self._put_timing(f"Timing/{prefix}/feature_gather", perf_counter() - gather_start, step)
+        self._put_timing(f"Timing/{prefix}/feature_populate", perf_counter() - populate_start, step)
 
     def next_train(self, step: int) -> Tuple[RayBundle, Dict]:
+        batch_start = perf_counter()
         ray_bundle, batch = super().next_train(step)
         batch["image"] = batch["image"].to(self.device, non_blocking=True)
-        self._populate_batch_features(batch, is_eval=False)
+        self._populate_batch_features(batch, step=step, is_eval=False)
+        self._put_timing("Timing/Train/batch_load", perf_counter() - batch_start, step)
         return ray_bundle, batch
 
     def next_eval(self, step: int) -> Tuple[RayBundle, Dict]:
+        batch_start = perf_counter()
         ray_bundle, batch = super().next_eval(step)
         batch["image"] = batch["image"].to(self.device, non_blocking=True)
-        self._populate_batch_features(batch, is_eval=True)
+        self._populate_batch_features(batch, step=step, is_eval=True)
+        self._put_timing("Timing/Eval/batch_load", perf_counter() - batch_start, step)
         return ray_bundle, batch
