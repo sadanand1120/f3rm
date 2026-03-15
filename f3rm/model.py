@@ -3,7 +3,6 @@ from collections import defaultdict
 from functools import cached_property
 from typing import Dict, List, Optional, Type
 
-import open_clip
 import torch
 import torch.nn.functional as F
 from nerfstudio.cameras.rays import RayBundle, RaySamples
@@ -25,7 +24,6 @@ from torch.nn import Parameter
 from f3rm.feature_field import FeatureField
 from f3rm.pca_colormap import apply_pca_colormap_return_proj
 from f3rm.renderer import FeatureRenderer, ScalarRenderer
-from f3rm.features.clip_extract import CLIPArgs
 from f3rm.features.utils import compute_similarity_scores, parse_comma_separated_labels
 from f3rm.shaders import ProbFromProbsShader
 
@@ -68,6 +66,9 @@ class ViewerUtils:
 
     @cached_property
     def clip(self):
+        import open_clip
+        from f3rm.features.clip_extract import CLIPArgs
+
         CONSOLE.print(f"Loading CLIP {CLIPArgs.model_name} for viewer")
         model, _, _ = open_clip.create_model_and_transforms(CLIPArgs.model_name, pretrained=CLIPArgs.model_pretrained, device=self.device)
         model.eval()
@@ -76,6 +77,9 @@ class ViewerUtils:
     @torch.no_grad()
     def handle_language_queries(self, raw_text: str, is_positive: bool):
         """Compute CLIP embeddings based on queries and update state"""
+        import open_clip
+        from f3rm.features.clip_extract import CLIPArgs
+
         texts = parse_comma_separated_labels(raw_text)
         # Clear the GUI state if there are no texts
         if not texts:
