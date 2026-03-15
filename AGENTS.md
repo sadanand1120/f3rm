@@ -10,7 +10,6 @@
 
 ## Edit Boundaries
 - Primary code focus: `f3rm/` and `f3rm/features/`.
-- Ignore legacy code outside those areas unless explicitly requested.
 - Do not directly edit Nerfstudio site-packages.
 - If a Nerfstudio edit is unavoidable and cannot be overridden cleanly, place patched files in `nerfstudio_changes/` for manual copy (user will copy them to the correct location).
 
@@ -28,7 +27,7 @@
 
 ## W&B Debugging Notes
 - Prefer local artifact analysis from run directories and `config.yml` paths.
-- Track canonical metric groups (`Train*`, `Eval*`) and non-finite / grad-related metrics.
+- Track canonical metric groups (`Train*`, `Eval*`, `Final Metrics/*`).
 - Flag NaNs/Infs, jumps, flatlines, and step gaps explicitly.
 
 ## F3RM Abstract

@@ -237,14 +237,25 @@ class F3RMTrainer(Trainer):
             self._latest_eval_all_metrics = self._extract_scalar_metrics(metrics_dict)
             writer.put_dict(name="Eval Images Metrics Dict (all images)", scalar_dict=metrics_dict, step=step)
 
-    def _log_final_metrics(self) -> None:
+    def _get_final_metric_groups(self) -> list[tuple[str, Dict[str, float]]]:
         metric_groups = [
             ("Train Batch", self._latest_train_metrics),
             ("Eval Batch", self._latest_eval_batch_metrics),
             ("Eval Image", self._latest_eval_image_metrics),
             ("Eval All Images", self._latest_eval_all_metrics),
         ]
-        metric_groups = [(group_name, metrics) for group_name, metrics in metric_groups if metrics]
+        return [(group_name, metrics) for group_name, metrics in metric_groups if metrics]
+
+    def _queue_final_metrics(self, metric_groups: list[tuple[str, Dict[str, float]]]) -> None:
+        for group_name, metrics in metric_groups:
+            for metric_name, metric_value in sorted(metrics.items()):
+                writer.put_scalar(
+                    name=f"Final Metrics/{group_name}/{metric_name}",
+                    scalar=metric_value,
+                    step=self.step,
+                )
+
+    def _print_final_metrics(self, metric_groups: list[tuple[str, Dict[str, float]]]) -> None:
         if not metric_groups:
             return
 
@@ -255,15 +266,12 @@ class F3RMTrainer(Trainer):
 
         for group_name, metrics in metric_groups:
             for metric_name, metric_value in sorted(metrics.items()):
-                writer.put_scalar(
-                    name=f"Final Metrics/{group_name}/{metric_name}",
-                    scalar=metric_value,
-                    step=self.step,
-                )
                 table.add_row(group_name, metric_name, f"{metric_value:.6f}")
 
         CONSOLE.print(Panel(table, title="[bold]Final Unweighted Metrics[/bold]", expand=False))
 
     def _after_train(self) -> None:
-        self._log_final_metrics()
+        metric_groups = self._get_final_metric_groups()
+        self._queue_final_metrics(metric_groups)
         super()._after_train()
+        self._print_final_metrics(metric_groups)
