@@ -40,13 +40,3 @@ def apply_pca_colormap_return_proj(
 
     colored_image = low_rank.reshape(image.shape[:-1] + (3,))
     return colored_image.to(torch.float16), proj_V, low_rank_min, low_rank_max  # Ensure fp16 consistency for RGB visualization
-
-
-def apply_pca_colormap(
-    image: TensorType["bs":..., "d"],
-    proj_V: Optional[TensorType] = None,
-    low_rank_min: Optional[TensorType] = None,
-    low_rank_max: Optional[TensorType] = None,
-    niter: int = 5,
-) -> TensorType["bs":..., "rgb":3]:
-    return apply_pca_colormap_return_proj(image, proj_V, low_rank_min, low_rank_max, niter)[0]

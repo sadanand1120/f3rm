@@ -28,9 +28,6 @@ f3rm_method = MethodSpecification(
         max_num_iterations=80000,
         mixed_precision=True,
         use_grad_scaler=True,
-        deterministic_mode=True,
-        deterministic_warn_only=False,
-        amp_disable_on_instability=False,
         pipeline=FeaturePipelineConfig(
             datamanager=FeatureDataManagerConfig(
                 feature_type="CLIP",
@@ -47,7 +44,7 @@ f3rm_method = MethodSpecification(
             ),
             model=FeatureFieldModelConfig(
                 camera_optimizer=CameraOptimizerConfig(mode="SO3xR3"),  # "SO3xR3" or "off"
-                implementation="tcnn",  # for determinism use "torch", other option is "tcnn" for 5x speedup
+                implementation="tcnn",  # other option is "torch"
                 eval_num_rays_per_chunk=1 << 14,
                 predict_normals=True,
                 num_proposal_iterations=2,  # May reduce proposal iterations for speed
@@ -81,5 +78,5 @@ f3rm_method = MethodSpecification(
         viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
         vis="viewer",
     ),
-    description="F3RM with parallel NeRF training, feature field distillation, and comprehensive seeding for reproducibility.",
+    description="F3RM with parallel NeRF training and feature field distillation.",
 )

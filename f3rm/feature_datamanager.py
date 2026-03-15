@@ -16,7 +16,7 @@ from f3rm.features.extract_features_standalone import extract_features_for_datas
 @dataclass
 class FeatureDataManagerConfig(VanillaDataManagerConfig):
     _target: Type = field(default_factory=lambda: FeatureDataManager)
-    feature_type: Literal["CLIP", "DINO"] = "CLIP"
+    feature_type: Literal["CLIP"] = "CLIP"
     foreground_feature_type: str = "FOREGROUND_"
     enable_cache: bool = True
     """Whether to cache extracted features."""
@@ -107,7 +107,7 @@ class FeatureDataManager(VanillaDataManager):
         batch_size = len(camera_idx)
         if not batch_features:
             return torch.zeros(batch_size, 0, device=self.device, dtype=torch.float16)
-        # Regular tensor features (CLIP, DINO, FOREGROUND)
+        # Regular tensor features (CLIP, FOREGROUND)
         # Build a stacked tensor for the unique cameras in the batch and index in one shot.
         unique_cams, inverse = torch.unique(camera_idx, sorted=True, return_inverse=True)
         stacked = [batch_features[int(cam.item())] for cam in unique_cams]

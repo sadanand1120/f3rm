@@ -138,13 +138,6 @@ class FOREGROUNDExtractor:
             results.extend(batch_results)
             gc.collect()
         return results
-
-
-async def extract_foreground_batch(image_paths: List[str], device: torch.device, data_dir: Path, verbose: bool = False, text_prompts: Optional[List[str]] = None):
-    extractor = FOREGROUNDExtractor(device=device, data_dir=data_dir, text_prompts=text_prompts, verbose=verbose)
-    return await extractor.extract_batch_async(image_paths)
-
-
 async def process_single_image_foreground_async(image_path: str, fg_client: AsyncMultiWrapper) -> np.ndarray:
     return await fg_client.compute_foreground_for_image_async(image_path)
 

@@ -2,7 +2,7 @@
 """
 Standalone Feature Extraction Script
 
-Extracts features (CLIP, DINO, SAM3_*, TEXT, FOREGROUND_*, ORIENTANY_*, ORIENTANY2_*) for a dataset
+Extracts features (CLIP, SAM3_*, TEXT, FOREGROUND_*) for a dataset
 and saves them as individual per-image files for efficient batch loading during training.
 
 Features are processed in batches for memory efficiency during extraction, but each image's
@@ -14,7 +14,7 @@ Usage:
         --feature-type CLIP \
         --batch-size 64
 
-Supported feature types: CLIP, DINO, SAM3_*, TEXT, FOREGROUND_*, ORIENTANY_*, ORIENTANY2_*
+Supported feature types: CLIP, SAM3_*, TEXT, FOREGROUND_*
 """
 
 import argparse
@@ -40,21 +40,12 @@ def _lazy_import_components(feature_type: str):
     if feature_type.startswith("FOREGROUND_"):
         from f3rm.features.foreground_extract import FOREGROUNDArgs, FOREGROUNDExtractor, parse_foreground_feature_type, examine_saved
         return FOREGROUNDArgs, FOREGROUNDExtractor, parse_foreground_feature_type, examine_saved
-    if feature_type.startswith("ORIENTANY_"):
-        from f3rm.features.orientany_extract import ORIENTANYArgs, ORIENTANYExtractor, parse_orientany_feature_type, examine_saved
-        return ORIENTANYArgs, ORIENTANYExtractor, parse_orientany_feature_type, examine_saved
-    if feature_type.startswith("ORIENTANY2_"):
-        from f3rm.features.orientany2_extract import ORIENTANY2Args, ORIENTANY2Extractor, parse_orientany2_feature_type, examine_saved
-        return ORIENTANY2Args, ORIENTANY2Extractor, parse_orientany2_feature_type, examine_saved
     if feature_type.startswith("SAM3_"):
         from f3rm.features.sam3_extract import SAM3Args, SAM3Extractor, parse_sam3_feature_type, examine_saved
         return SAM3Args, SAM3Extractor, parse_sam3_feature_type, examine_saved
     if feature_type == "CLIP":
         from f3rm.features.clip_extract import CLIPArgs, CLIPExtractor, examine_saved
         return CLIPArgs, CLIPExtractor, None, examine_saved
-    if feature_type == "DINO":
-        from f3rm.features.dino_extract import DINOArgs, DINOExtractor, examine_saved
-        return DINOArgs, DINOExtractor, None, examine_saved
     if feature_type == "TEXT":
         from f3rm.features.text_extract import TextArgs, TextExtractor
         return TextArgs, TextExtractor, None, None
@@ -124,18 +115,12 @@ async def _save_per_image_generic(
         for j in range(len(batch_paths)):
             img_idx = s + j
 
-            if feature_type in ("CLIP", "DINO"):
+            if feature_type == "CLIP":
                 img_data = data[j].cpu().half()
                 np.save(root / f"image_{img_idx:06d}.npy", img_data.numpy(), allow_pickle=False)
             elif feature_type.startswith("FOREGROUND_"):
                 img_data = data[j].astype(np.float16)
                 np.save(root / f"image_{img_idx:06d}.npy", img_data, allow_pickle=False)
-            elif feature_type.startswith("ORIENTANY_") or feature_type.startswith("ORIENTANY2_"):
-                pixel_data = data[j]['pixel_data'].astype(np.float16)
-                instance_features = data[j]['instance_features']
-                np.save(root / f"image_{img_idx:06d}_pixel.npy", pixel_data, allow_pickle=False)
-                with open(root / f"image_{img_idx:06d}_instances.json", 'w') as f:
-                    json.dump(instance_features, f, indent=2)
             elif feature_type.startswith("SAM3_"):
                 masks = data[j].astype(np.bool_)
                 np.savez_compressed(root / f"image_{img_idx:06d}.npz", masks=masks)
@@ -157,13 +142,8 @@ def _cache_file_count_matches(root: Path, feature_type: str, num_images: int) ->
     if num_images == 0:
         return True
 
-    if feature_type in ("CLIP", "DINO") or feature_type.startswith("FOREGROUND_"):
+    if feature_type == "CLIP" or feature_type.startswith("FOREGROUND_"):
         return len(list(root.glob("image_*.npy"))) == num_images
-    if feature_type.startswith("ORIENTANY_") or feature_type.startswith("ORIENTANY2_"):
-        return (
-            len(list(root.glob("image_*_pixel.npy"))) == num_images
-            and len(list(root.glob("image_*_instances.json"))) == num_images
-        )
     if feature_type.startswith("SAM3_"):
         return len(list(root.glob("image_*.npz"))) == num_images
     if feature_type == "TEXT":
@@ -252,7 +232,7 @@ def get_image_filenames_from_dataparser(data_dir: Path) -> List[str]:
 def extract_features_for_dataset(
     image_fnames: List[str],
     data_dir: Path,
-    feature_type: Literal["CLIP", "DINO", "SAM3_*", "TEXT", "FOREGROUND_*", "ORIENTANY_*", "ORIENTANY2_*"],
+    feature_type: Literal["CLIP", "SAM3_*", "TEXT", "FOREGROUND_*"],
     device: torch.device,
     batch_size: int = 64,
     enable_cache: bool = True,
@@ -307,7 +287,7 @@ def extract_features_for_dataset(
 
 def extract_features_standalone(
     data_dir: Path,
-    feature_type: Literal["CLIP", "DINO", "SAM3_*", "TEXT", "FOREGROUND_*", "ORIENTANY_*", "ORIENTANY2_*"],
+    feature_type: Literal["CLIP", "SAM3_*", "TEXT", "FOREGROUND_*"],
     batch_size: int = 64,
     device: str = "auto",
     force: bool = False,
@@ -364,10 +344,8 @@ def main():
         help=(
             "Feature type to extract.\n"
             "- FOREGROUND: 'FOREGROUND_book' or 'FOREGROUND_book_pen' -> uses SAM3_book(_pen) masks, 'FOREGROUND_' -> uses SAM3_ masks.\n"
-            "- ORIENTANY: 'ORIENTANY_book' or 'ORIENTANY_book_pen' -> uses SAM3_book(_pen) masks, 'ORIENTANY_' -> uses SAM3_ masks.\n"
-            "- ORIENTANY2: 'ORIENTANY2_book' or 'ORIENTANY2_book_pen' -> uses SAM3_book(_pen) masks, 'ORIENTANY2_' -> uses SAM3_ masks.\n"
             "- SAM3: 'SAM3_book' or 'SAM3_book_pen' (global), 'SAM3_' (use TEXT shards).\n"
-            "Examples: CLIP, DINO, SAM3_book, SAM3_, TEXT, FOREGROUND_book, FOREGROUND_, ORIENTANY_book, ORIENTANY_, ORIENTANY2_book, ORIENTANY2_."
+            "Examples: CLIP, SAM3_book, SAM3_, TEXT, FOREGROUND_book, FOREGROUND_."
         )
     )
 

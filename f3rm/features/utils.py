@@ -1,21 +1,13 @@
 from typing import Optional, Tuple, Callable, Any, List, Dict
-import math
 from collections import OrderedDict
 import json
 
 import asyncio
 import concurrent.futures
 import numpy as np
-import os
-import yaml
 import torch
-import torch.nn.functional as F
 from pathlib import Path
 from PIL import Image
-
-from nerfstudio.cameras import camera_utils
-from nerfstudio.utils.math import safe_normalize
-
 
 def parse_comma_separated_labels(raw_text: str) -> List[str]:
     """Parse comma-separated labels and drop empty tokens."""
@@ -59,398 +51,6 @@ def compute_similarity_scores(
     torch.nan_to_num_(probs, nan=0.0)
     sims, _ = probs.min(dim=-1, keepdim=True)
     return sims
-
-
-def get_conf_temp_scaled_logits(logits, confidence, drop_exp_factor=6, eps=1e-8):
-    """Scale logits by confidence. T = 1/max(confidence^drop_exp_factor, eps). Lower confidence -> higher T -> flatter probs."""
-    x = torch.as_tensor(logits, dtype=torch.float32)
-    T = 1.0 / max(float(confidence)**drop_exp_factor, eps)
-    return x / T
-
-
-def probs_to_normal(
-    probs: torch.Tensor,
-    *,
-    n_bins: int,
-    angle_min_deg: float,
-    period_deg: float,
-    bin_width_deg: Optional[float] = None,
-    min_std_deg: float = 1e-3,
-    window_deg: float = 60.0,  # Increased from 45.0 to capture even more of the distribution
-    peak_frac: float = 0.05,   # Reduced from 0.1 to include even more tail
-    gamma: float = 1.2,        # Reduced from 1.5 to be even less aggressive
-    ridge: float = 0.0,
-    shrink_to_moment: float = 0.2,  # Reduced from 0.3 to be even less conservative
-    sigma_floor_deg: Optional[float] = 0.3,  # Reduced from 0.5 to allow even narrower fits
-    sigma_ceil_deg: Optional[float] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Fit a single Gaussian N(mean_deg, std_deg) on a bounded linear range [angle_min, angle_min+period)."""
-    p = probs.float()
-    assert p.ndim == 1 and p.numel() == n_bins, "probs must be 1D with length n_bins"
-    if bin_width_deg is None:
-        bin_width_deg = period_deg / n_bins
-    else:
-        if not float(abs(n_bins * bin_width_deg - period_deg)) < 1e-6:
-            raise ValueError("n_bins*bin_width_deg must equal period_deg")
-
-    eps = 1e-12
-    p = p + eps
-    n = n_bins
-
-    # ---- mode & sub-bin refinement (no wrapping at edges)
-    k = int(torch.argmax(p).item())
-    km = k - 1 if k - 1 >= 0 else k
-    kp = k + 1 if k + 1 < n else k
-    Lm, L0, Lp = torch.log(p[km]), torch.log(p[k]), torch.log(p[kp])
-    denom = (Lm - 2.0 * L0 + Lp)
-    concave = bool((denom < -1e-9).item() and km != k and kp != k)
-
-    if concave:
-        delta = 0.5 * (Lm - Lp) / denom
-        delta = torch.clamp(delta, -0.5, 0.5)
-        mean_bins = torch.tensor(float(k), dtype=p.dtype, device=p.device) + delta
-    else:
-        mean_bins = torch.tensor(float(k), dtype=p.dtype, device=p.device)
-
-    mean_deg = angle_min_deg + mean_bins * bin_width_deg
-
-    # ---- select local window (linear, clipped to range)
-    idx = torch.arange(n, device=p.device, dtype=p.dtype)
-    centers = angle_min_deg + idx * bin_width_deg
-    diff = centers - mean_deg
-    mask = (diff.abs() <= window_deg) & (p >= (peak_frac * p[k]))
-    if int(mask.sum().item()) < 3:
-        # fallback: curvature or minimal std
-        if concave:
-            # from denom ≈ -1/σ_bins^2  -> σ ≈ 1/sqrt(-denom) bins
-            sigma_bins = 1.0 / torch.sqrt(-denom)
-            std_deg = sigma_bins * bin_width_deg
-        else:
-            std_deg = torch.tensor(sigma_floor_deg or min_std_deg, device=p.device, dtype=p.dtype)
-        std_deg = torch.clamp(std_deg, min=min_std_deg)
-        if sigma_floor_deg is not None:
-            std_deg = torch.clamp(std_deg, min=sigma_floor_deg)
-        if sigma_ceil_deg is not None:
-            std_deg = torch.clamp(std_deg, max=sigma_ceil_deg)
-        return mean_deg, std_deg
-
-    # ---- weighted LS for σ using y = log p - log p(μ) ≈ -(x-μ)^2/(2σ^2)
-    x = diff[mask]                          # degrees
-    y = torch.log(p[mask]) - torch.log(p[k])
-    X = x * x
-    w = (p[mask] ** gamma)
-    denom_ls = (w * X * X).sum() + ridge + 1e-12
-    s = (w * X * y).sum() / denom_ls        # slope
-    sigma_ls = torch.sqrt(torch.clamp(-1.0 / (2.0 * s + 1e-12), min=min_std_deg**2))
-
-    # ---- moment-based σ (conservative)
-    mu_local = (w * x).sum() / w.sum()
-    var_local = torch.clamp((w * (x - mu_local) ** 2).sum() / w.sum(), min=min_std_deg**2)
-    sigma_mom = torch.sqrt(var_local)
-
-    # ---- shrink & clamp
-    alpha = float(torch.clamp(torch.tensor(shrink_to_moment), 0.0, 1.0))
-    std_deg = (1 - alpha) * sigma_ls + alpha * sigma_mom
-    if sigma_floor_deg is not None:
-        std_deg = torch.clamp(std_deg, min=sigma_floor_deg)
-    if sigma_ceil_deg is not None:
-        std_deg = torch.clamp(std_deg, max=sigma_ceil_deg)
-    std_deg = torch.clamp(std_deg, min=min_std_deg)
-
-    return mean_deg, std_deg
-
-
-def normal_to_probs(
-    mean_deg: torch.Tensor,
-    std_deg: torch.Tensor,
-    *,
-    n_bins: int,
-    angle_min_deg: float,
-    period_deg: float,
-    bin_width_deg: Optional[float] = None,
-    integrate_bins: bool = True,
-    subsamples_per_bin: int = 7,   # odd recommended (includes center)
-) -> torch.Tensor:
-    """
-    Expand (mean_deg, std_deg) to discrete probs over [angle_min, angle_min+period).
-    If integrate_bins=True, averages inside each bin to approximate bin mass.
-    """
-    if bin_width_deg is None:
-        bin_width_deg = period_deg / n_bins
-    else:
-        if not float(abs(n_bins * bin_width_deg - period_deg)) < 1e-6:
-            raise ValueError("n_bins*bin_width_deg must equal period_deg")
-
-    device, dtype = mean_deg.device, mean_deg.dtype
-    idx = torch.arange(n_bins, device=device, dtype=dtype)
-    centers = angle_min_deg + idx * bin_width_deg
-
-    mean = mean_deg[..., None]
-    std = torch.clamp(std_deg, min=1e-6)[..., None]
-
-    if (not integrate_bins) or subsamples_per_bin <= 1:
-        diff = centers - mean
-        logits = -0.5 * (diff / std) ** 2
-        logits = logits - logits.max(dim=-1, keepdim=True).values
-        probs = torch.exp(logits)
-        probs = probs / probs.sum(dim=-1, keepdim=True)
-        return probs
-
-    J = int(subsamples_per_bin)
-    if J % 2 == 0:
-        J += 1
-    offs = (torch.linspace(-0.5, 0.5, J, device=device, dtype=dtype) * bin_width_deg)  # (J,)
-
-    c = centers.view(1, 1, n_bins)     # (1,J,n)
-    o = offs.view(1, J, 1)             # (1,J,1)
-    m = mean[..., None]                # (...,1,1)
-    s = std[..., None]                 # (...,1,1)
-
-    samp = c + o                       # (...,J,n)
-    diff = samp - m
-    logits = -0.5 * (diff / s) ** 2
-    vals = torch.exp(logits)           # (...,J,n)
-    probs = vals.mean(dim=-2)          # (...,n)
-    probs = probs / probs.sum(dim=-1, keepdim=True)
-    return probs
-
-
-def _kappa_from_resultant(R: torch.Tensor) -> torch.Tensor:
-    # Approx inverse of A(kappa)=I1/I0 (Mardia & Jupp style piecewise)
-    eps = 1e-12
-    R = torch.clamp(R, 0.0, 0.999999)
-    k1 = 2 * R + R**3 + 5 * R**5 / 6
-    k2 = -0.4 + 1.39 * R + 0.43 / (1 - R + eps)
-    k3 = 1.0 / (R**3 - 4 * R**2 + 3 * R + eps)
-    return torch.where(R < 0.53, k1, torch.where(R < 0.85, k2, k3))
-
-
-def probs_to_von_mises(
-    probs: torch.Tensor,
-    *,
-    n_bins: int,
-    angle_min_deg: float,
-    period_deg: float,
-    bin_width_deg: Optional[float] = None,
-    min_kappa: float = 1e-3,
-    window_deg: float = 60.0,        # Increased from 45.0 to capture even more of the distribution
-    peak_frac: float = 0.05,         # Reduced from 0.1 to include even more tail
-    gamma: float = 1.2,              # Reduced from 1.5 to be even less aggressive
-    ridge: float = 0.0,              # small L2 on LS fit (e.g., 1e-4) to tame κ
-    shrink_to_resultant: float = 0.2,  # Reduced from 0.3 to be even less conservative
-    sigma_floor_deg: float = 0.5,    # Reduced from 1.0 to allow even narrower fits
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Fit (mean_deg, kappa) from a discrete circular distribution.
-    - sub-bin peak via quadratic on log p around argmax
-    - κ via weighted LS on log p ≈ -(κ/2) δ^2, shrunk toward resultant-based κ
-    - κ capped so std >= sigma_floor_deg
-    """
-    p = probs.float()
-    assert p.ndim == 1 and p.numel() == n_bins, "probs must be 1D with length n_bins"
-
-    if bin_width_deg is None:
-        bin_width_deg = period_deg / n_bins
-    else:
-        if not float(abs(n_bins * bin_width_deg - period_deg)) < 1e-6:
-            raise ValueError("n_bins*bin_width_deg must equal period_deg")
-
-    eps = 1e-12
-    p = p + eps
-    n = n_bins
-
-    # ---- sub-bin peak
-    k = int(torch.argmax(p).item())
-    km, kp = (k - 1) % n, (k + 1) % n
-    Lm, L0, Lp = torch.log(p[km]), torch.log(p[k]), torch.log(p[kp])
-    denom = (Lm - 2.0 * L0 + Lp)
-    concave = bool((denom < -1e-9).item())
-
-    if concave:
-        delta = 0.5 * (Lm - Lp) / denom
-        delta = torch.clamp(delta, -0.5, 0.5)
-        mean_bins = (torch.tensor(float(k), dtype=p.dtype, device=p.device) + delta) % n
-    else:
-        mean_bins = torch.tensor(float(k), dtype=p.dtype, device=p.device)
-
-    mean_deg = (angle_min_deg + mean_bins * bin_width_deg - angle_min_deg) % period_deg + angle_min_deg
-
-    # ---- local window
-    idx = torch.arange(n, device=p.device, dtype=p.dtype)
-    centers = angle_min_deg + idx * bin_width_deg
-    half = period_deg / 2.0
-    diff_deg = ((centers - mean_deg + half) % period_deg) - half
-
-    peak = p[k]
-    mask = (diff_deg.abs() <= window_deg) & (p >= peak_frac * peak)
-    if int(mask.sum().item()) < 3:
-        # fallback to curvature or minimum
-        if concave:
-            dtheta = torch.deg2rad(torch.tensor(bin_width_deg, device=p.device, dtype=p.dtype))
-            kappa_ls = torch.clamp((-denom) / (dtheta * dtheta), min=min_kappa)
-        else:
-            kappa_ls = torch.tensor(min_kappa, device=p.device, dtype=p.dtype)
-    else:
-        x = torch.deg2rad(diff_deg[mask])                        # δ (rad)
-        y = torch.log(p[mask]) - torch.log(peak)                 # log ratio
-        X = x * x
-        w = (p[mask] ** gamma)
-        # weighted LS through origin with optional ridge
-        denom_ls = (w * X * X).sum() + ridge + 1e-12
-        s = (w * X * y).sum() / denom_ls                         # slope
-        kappa_ls = torch.clamp(-2.0 * s, min=min_kappa)
-
-    # ---- shrink κ toward resultant-based estimate (more conservative)
-    if int(mask.sum().item()) >= 3:
-        x = torch.deg2rad(diff_deg[mask])
-        w = (p[mask] ** gamma)
-        C = (w * torch.cos(x)).sum()
-        S = (w * torch.sin(x)).sum()
-        R = torch.sqrt(C * C + S * S) / (w.sum() + 1e-12)
-        kappa_R = torch.clamp(_kappa_from_resultant(R), min=min_kappa)
-        alpha = float(torch.clamp(torch.tensor(shrink_to_resultant), 0.0, 1.0))
-        kappa = (1 - alpha) * kappa_ls + alpha * kappa_R
-    else:
-        kappa = kappa_ls
-
-    # ---- cap κ so fitted std doesn't go below sigma_floor_deg
-    sigma_floor_rad = torch.deg2rad(torch.tensor(sigma_floor_deg, device=p.device, dtype=p.dtype))
-    kappa_cap = 1.0 / (sigma_floor_rad * sigma_floor_rad + 1e-12)
-    kappa = torch.clamp(kappa, min=min_kappa, max=kappa_cap)
-
-    return mean_deg, kappa
-
-
-def von_mises_to_probs(
-    mean_deg: torch.Tensor,
-    kappa: torch.Tensor,
-    *,
-    n_bins: int,
-    angle_min_deg: float,
-    period_deg: float,
-    bin_width_deg: Optional[float] = None,
-    integrate_bins: bool = True,
-    subsamples_per_bin: int = 7,
-) -> torch.Tensor:
-    """
-    Expand (mean_deg, kappa) to discrete probs. With integrate_bins, approximate bin mass
-    by averaging inside each bin (reduces peak overshoot for large κ).
-    """
-    if bin_width_deg is None:
-        bin_width_deg = period_deg / n_bins
-    else:
-        if not float(abs(n_bins * bin_width_deg - period_deg)) < 1e-6:
-            raise ValueError("n_bins*bin_width_deg must equal period_deg")
-
-    device, dtype = mean_deg.device, mean_deg.dtype
-    idx = torch.arange(n_bins, device=device, dtype=dtype)
-    centers = angle_min_deg + idx * bin_width_deg
-    half = period_deg / 2.0
-
-    mean = mean_deg[..., None]
-    kap = torch.clamp(kappa, min=1e-6)[..., None]
-
-    if (not integrate_bins) or subsamples_per_bin <= 1:
-        diff_deg = ((centers - mean + half) % period_deg) - half
-        diff_rad = torch.deg2rad(diff_deg)
-        logits = kap * torch.cos(diff_rad)
-        logits = logits - logits.max(dim=-1, keepdim=True).values
-        probs = torch.exp(logits)
-        probs = probs / probs.sum(dim=-1, keepdim=True)
-        return probs
-
-    J = int(subsamples_per_bin)
-    if J % 2 == 0:
-        J += 1
-    offs = (torch.linspace(-0.5, 0.5, J, device=device, dtype=dtype) * bin_width_deg)
-
-    c = centers.view(1, 1, n_bins)
-    o = offs.view(1, J, 1)
-    m = mean[..., None]
-
-    samp = c + o
-    diff_deg = ((samp - m + half) % period_deg) - half
-    diff_rad = torch.deg2rad(diff_deg)
-
-    vals = torch.exp(kap[..., None] * torch.cos(diff_rad))      # (..., J, n_bins)
-    probs = vals.mean(dim=-2)                                   # (..., n_bins)
-    probs = probs / probs.sum(dim=-1, keepdim=True)
-    return probs
-
-
-def build_transform_lookup(frames):
-    return {frame["file_path"]: np.asarray(frame["transform_matrix"]) for frame in frames}
-
-
-def get_nerf_ccs_to_normal_ccs_T():
-    """Get the transformation matrix from NeRF CCS to normal CCS."""
-    T = np.asarray([
-        [1, 0, 0, 0],
-        [0, -1, 0, 0],
-        [0, 0, -1, 0],
-        [0, 0, 0, 1]
-    ])
-    return T
-
-
-def get_nerf_ccs_to_orig_nerf_world(filename, transforms_lookup):
-    for k, v in transforms_lookup.items():
-        if os.path.basename(k) == filename:
-            return v
-    raise KeyError(f"No transform found for {filename}")
-
-
-def get_orig_to_final_nerf_world_transform_scale(dataset_transforms_path: str, model_outputdir_path: str = None):
-    """
-    if model output dir path not provided, assumes defaults and computes
-    """
-    dataset_transforms_path = Path(dataset_transforms_path)
-    dataset_transforms_data = json.load(open(dataset_transforms_path, "r"))
-    if model_outputdir_path is not None:
-        model_dp_transforms_path = Path(model_outputdir_path) / "dataparser_transforms.json"
-        model_config_path = Path(model_outputdir_path) / "config.yml"
-        model_dp_transforms_data = json.load(open(model_dp_transforms_path, "r"))
-        model_config = yaml.load(model_config_path.read_text(), Loader=yaml.Loader)
-        loaded_global_transform = np.array(model_dp_transforms_data["transform"])
-        loaded_global_transform_44 = np.vstack([loaded_global_transform, np.array([[0, 0, 0, 1]])])
-        loaded_global_scale = model_dp_transforms_data["scale"]
-        if "applied_transform" in dataset_transforms_data:
-            applied_transform = np.asarray(dataset_transforms_data["applied_transform"])
-            applied_transform_44 = np.vstack([applied_transform, np.array([[0, 0, 0, 1]])])
-        else:
-            applied_transform_44 = np.eye(4)
-        if "applied_scale" in dataset_transforms_data:
-            applied_scale = float(dataset_transforms_data["applied_scale"])
-        else:
-            applied_scale = 1.0
-        T_orig_to_final_nerf_world = loaded_global_transform_44 @ np.linalg.inv(applied_transform_44)
-        orig_to_final_nerf_world_scale = loaded_global_scale / applied_scale
-        return T_orig_to_final_nerf_world, orig_to_final_nerf_world_scale
-    else:
-        # TODO: add asserts to pipeline, model etc to NOT change these defaults
-        _model_default_orientation_method = "up"
-        _model_default_center_method = "poses"
-        _model_default_auto_scale_poses = True
-        _model_default_scale_factor = 1.0
-        # orient and center
-        all_poses = []
-        for frame in dataset_transforms_data["frames"]:
-            pose = np.array(frame["transform_matrix"], dtype=np.float32)
-            all_poses.append(pose)
-        all_poses = torch.from_numpy(np.array(all_poses))
-        if "orientation_override" in dataset_transforms_data:
-            orientation_method = dataset_transforms_data["orientation_override"]
-        else:
-            orientation_method = _model_default_orientation_method
-        center_method = _model_default_center_method
-        oriented_poses, transform_matrix = camera_utils.auto_orient_and_center_poses(all_poses, method=orientation_method, center_method=center_method)
-        transform_matrix_44 = torch.cat([transform_matrix, torch.tensor([[0, 0, 0, 1]], dtype=transform_matrix.dtype)], dim=0)
-        # scale poses
-        scale_factor = 1.0
-        if _model_default_auto_scale_poses:
-            scale_factor /= float(torch.max(torch.abs(oriented_poses[:, :3, 3])))
-        scale_factor *= _model_default_scale_factor
-        return transform_matrix_44.cpu().numpy(), float(scale_factor)
 
 
 def resolve_devices_and_workers(device: torch.device, batch_size_per_gpu: int) -> Tuple[Optional[torch.device], int]:
@@ -554,45 +154,6 @@ def normalize_sam3_masks(raw_masks: Any, image_path: Optional[str] = None) -> np
     return masks.astype(bool)
 
 
-def vector_mode(points: torch.Tensor, radius_deg: float = 12.0, max_anchors: int = 512, unsigned: bool = False) -> torch.Tensor:
-    """Return unit vector mode of a set of 3D vectors using max-support within an angular neighborhood.
-
-    Args:
-        points: (N, 3) vectors (not necessarily unit). If empty, returns zeros(3).
-        radius_deg: Angular radius (degrees) for support region.
-        max_anchors: Subsample anchors for efficiency when N is large.
-        unsigned: If True, treats v and -v as same direction.
-    """
-    if points.numel() == 0:
-        return torch.zeros(3, device=points.device, dtype=points.dtype)
-
-    x = safe_normalize(points.reshape(-1, 3))
-    N = x.shape[0]
-    M = min(N, int(max_anchors))
-
-    if M < N:
-        idx = torch.linspace(0, N - 1, M, device=x.device, dtype=torch.float32).round().long()
-        anchors = x[idx]
-    else:
-        anchors = x
-
-    cos_thr = torch.cos(torch.tensor(radius_deg * math.pi / 180.0, device=x.device, dtype=x.dtype))
-
-    sims = x @ anchors.T
-    if unsigned:
-        sims = sims.abs()
-
-    counts = (sims >= cos_thr).sum(dim=0)
-    center = anchors[counts.argmax()]
-
-    sim_center = x @ center
-    if unsigned:
-        sim_center = sim_center.abs()
-    inliers = sim_center >= cos_thr
-    mode_vec = x[inliers].mean(dim=0)
-    return safe_normalize(mode_vec)
-
-
 class BatchFeatureLoader:
     """Simple batch feature loader for per-image stored features."""
 
@@ -613,14 +174,11 @@ class BatchFeatureLoader:
         self._stream = torch.cuda.Stream() if torch.cuda.is_available() else None
 
         sample_features = self._load_single_image_cpu(0)
-        if feature_type in ("CLIP", "DINO"):
+        if feature_type == "CLIP":
             self.H, self.W, self.C = sample_features.shape
             self.dtype = sample_features.dtype
         elif feature_type.startswith("FOREGROUND_"):
             self.H, self.W, self.C = sample_features.shape
-            self.dtype = sample_features.dtype
-        elif feature_type.startswith("ORIENTANY_") or feature_type.startswith("ORIENTANY2_"):
-            self.H, self.W = sample_features.shape[:2]
             self.dtype = sample_features.dtype
         elif feature_type.startswith("SAM3_"):
             self.K, _, self.H, self.W = sample_features.shape
@@ -629,7 +187,7 @@ class BatchFeatureLoader:
 
     def _load_single_image_cpu(self, img_idx: int):
         """Load features for a single image onto CPU (optionally pinned)."""
-        if self.feature_type in ("CLIP", "DINO"):
+        if self.feature_type == "CLIP":
             data = np.load(self.root / f"image_{img_idx:06d}.npy", mmap_mode="r")
             t = torch.from_numpy(data)
             return t.pin_memory() if self._use_pinned else t
@@ -637,51 +195,6 @@ class BatchFeatureLoader:
             data = np.load(self.root / f"image_{img_idx:06d}.npy", mmap_mode="r")
             t = torch.from_numpy(data)
             return t.pin_memory() if self._use_pinned else t
-        elif self.feature_type.startswith("ORIENTANY_"):
-            pixel_data = np.load(self.root / f"image_{img_idx:06d}_pixel.npy", mmap_mode="r")
-            with open(self.root / f"image_{img_idx:06d}_instances.json", 'r') as f:
-                instance_features = json.load(f)
-
-            h, w, _ = pixel_data.shape
-            full_features = np.zeros((h, w, 9), dtype=np.float16)  # 7D features + 2D foreground
-            full_features[..., 7:9] = pixel_data[..., :2]  # foreground one-hot
-            instance_ids = pixel_data[..., 2]
-            unique_ids = np.unique(instance_ids)
-            for instance_id in unique_ids:
-                if instance_id == 0:  # Skip background
-                    continue
-                instance_id_str = str(int(instance_id))
-                if instance_id_str in instance_features:
-                    mask = (instance_ids == instance_id)
-                    instance_feat = instance_features[instance_id_str]
-                    if isinstance(instance_feat, list):
-                        instance_feat = np.array(instance_feat, dtype=np.float16)
-                    full_features[mask, :7] = instance_feat  # 7D features: R_x, R_z, confidence
-            t = torch.from_numpy(full_features)
-            return t.pin_memory() if self._use_pinned else t
-        elif self.feature_type.startswith("ORIENTANY2_"):
-            pixel_data = np.load(self.root / f"image_{img_idx:06d}_pixel.npy", mmap_mode="r")
-            with open(self.root / f"image_{img_idx:06d}_instances.json", 'r') as f:
-                instance_features = json.load(f)
-
-            h, w, _ = pixel_data.shape
-            full_features = np.zeros((h, w, 18), dtype=np.float16)  # 16D features + 2D foreground
-            full_features[..., 16:18] = pixel_data[..., :2]  # foreground one-hot
-            instance_ids = pixel_data[..., 2]
-            unique_ids = np.unique(instance_ids)
-            for instance_id in unique_ids:
-                if instance_id == 0:  # Skip background
-                    continue
-                instance_id_str = str(int(instance_id))
-                if instance_id_str in instance_features:
-                    mask = (instance_ids == instance_id)
-                    instance_feat = instance_features[instance_id_str]
-                    if isinstance(instance_feat, list):
-                        instance_feat = np.array(instance_feat, dtype=np.float16)
-                    full_features[mask, :16] = instance_feat  # 16D features: alpha, u_z, 4*u_x
-            t = torch.from_numpy(full_features)
-            return t.pin_memory() if self._use_pinned else t
-
         elif self.feature_type.startswith("SAM3_"):
             data = np.load(self.root / f"image_{img_idx:06d}.npz")
             masks = data["masks"]
@@ -729,7 +242,7 @@ class BatchFeatureLoader:
         for cam_idx in unique_indices:
             cam_idx_int = int(cam_idx.item())
             # Only tensor-backed features are cached on GPU. For list/JSON types we fall back to CPU read.
-            if self.feature_type in ("CLIP", "DINO") or self.feature_type.startswith("FOREGROUND_") or self.feature_type.startswith("ORIENTANY_") or self.feature_type.startswith("ORIENTANY2_"):
+            if self.feature_type == "CLIP" or self.feature_type.startswith("FOREGROUND_"):
                 batch_features[cam_idx_int] = self._get_gpu_tensor(cam_idx_int)
             else:
                 # CPU-backed feature types (e.g. SAM3/TEXT)
@@ -738,7 +251,7 @@ class BatchFeatureLoader:
 
     def __getitem__(self, index: int):
         """Direct access by image index for pipeline compatibility."""
-        if self.feature_type in ("CLIP", "DINO") or self.feature_type.startswith("FOREGROUND_") or self.feature_type.startswith("ORIENTANY_") or self.feature_type.startswith("ORIENTANY2_"):
+        if self.feature_type == "CLIP" or self.feature_type.startswith("FOREGROUND_"):
             return self._get_gpu_tensor(index)
         else:
             return self._load_single_image_cpu(index)
