@@ -135,7 +135,7 @@ class FeaturePipeline(VanillaPipeline):
         camera_ray_bundle = camera.generate_rays(camera_indices=0, keep_shape=True)
         # Render full-image outputs and compute base image metrics/artifacts.
         outputs = self._render_outputs_with_progress(
-            camera_ray_bundle, description="Rendering eval image", render_features=True
+            camera_ray_bundle, description="Rendering eval image", render_features=False
         )
         metrics_dict, images_dict = self.model.get_image_metrics_and_images(outputs, batch)
         # Append foreground prediction-vs-GT visualization for eval diagnostics.
@@ -178,7 +178,10 @@ class FeaturePipeline(VanillaPipeline):
             task = progress.add_task("[green]Evaluating all eval images...", total=num_images)
             for i, (camera, batch) in enumerate(self.datamanager.fixed_indices_eval_dataloader):
                 inner_start = time()
-                outputs = self.model.get_outputs_for_camera(camera=camera)
+                outputs = self.model.get_outputs_for_camera_ray_bundle(
+                    camera.generate_rays(camera_indices=0, keep_shape=True),
+                    render_features=False,
+                )
                 height, width = camera.height, camera.width
                 num_rays = height * width
                 metrics_dict, images_dict = self.model.get_image_metrics_and_images(outputs, batch)
