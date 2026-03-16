@@ -196,10 +196,7 @@ class FeaturePipeline(VanillaPipeline):
                 metrics_dict["fps"] = (metrics_dict["num_rays_per_sec"] / (height * width)).item()
                 metrics_dict_list.append(metrics_dict)
 
-                # Aggressive cleanup between images
                 del outputs, images_dict
-                if i > 0 and i % 10 == 0:  # Only clear cache every 10 images
-                    torch.cuda.empty_cache()
                 progress.advance(task)
         metrics_dict = {}
         for key in metrics_dict_list[0]:

@@ -320,8 +320,6 @@ class FeatureFieldModel(NerfactoModel):
                 else:
                     outputs_lists[output_name].append(output.to(input_device))
                 del output
-            if torch.cuda.is_available() and (i // num_rays_per_chunk) % 50 == 0:
-                torch.cuda.empty_cache()
         outputs: Dict[str, torch.Tensor] = {}
         for output_name, outputs_list in outputs_lists.items():
             outputs[output_name] = torch.cat(outputs_list).view(image_height, image_width, -1)
