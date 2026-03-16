@@ -3,6 +3,8 @@ Custom F3RM Trainer.
 """
 
 import functools
+import sys
+import types
 from dataclasses import dataclass, field
 from typing import Any, Dict, Type
 
@@ -11,6 +13,52 @@ from rich.panel import Panel
 from rich.table import Table
 
 from nerfstudio.utils.decorators import check_eval_enabled
+
+
+def _explicit_vis_mode(argv: list[str]) -> str | None:
+    for i, arg in enumerate(argv):
+        if arg.startswith("--vis="):
+            return arg.split("=", 1)[1]
+        if arg == "--vis" and i + 1 < len(argv):
+            return argv[i + 1]
+    return None
+
+
+def _install_nonviewer_import_stubs() -> None:
+    vis_mode = _explicit_vis_mode(sys.argv[1:])
+    if vis_mode not in {"wandb", "tensorboard", "comet"}:
+        return
+
+    # Nerfstudio imports viewer modules eagerly in Trainer even for non-viewer runs.
+    if "nerfstudio.viewer.viewer" not in sys.modules:
+        import nerfstudio.viewer as viewer_pkg
+
+        viewer_module = types.ModuleType("nerfstudio.viewer.viewer")
+
+        class Viewer:
+            def __init__(self, *args, **kwargs):
+                raise RuntimeError("Viewer should not be instantiated when --vis disables viewer modes.")
+
+        viewer_module.Viewer = Viewer
+        sys.modules["nerfstudio.viewer.viewer"] = viewer_module
+        viewer_pkg.viewer = viewer_module
+
+    if "nerfstudio.viewer_legacy.server.viewer_state" not in sys.modules:
+        import nerfstudio.viewer_legacy.server as legacy_pkg
+
+        legacy_module = types.ModuleType("nerfstudio.viewer_legacy.server.viewer_state")
+
+        class ViewerLegacyState:
+            def __init__(self, *args, **kwargs):
+                raise RuntimeError("Legacy viewer should not be instantiated when --vis disables viewer modes.")
+
+        legacy_module.ViewerLegacyState = ViewerLegacyState
+        sys.modules["nerfstudio.viewer_legacy.server.viewer_state"] = legacy_module
+        legacy_pkg.viewer_state = legacy_module
+
+
+_install_nonviewer_import_stubs()
+
 from nerfstudio.engine.trainer import Trainer, TrainerConfig
 from nerfstudio.utils.misc import step_check
 from nerfstudio.utils import profiler, writer

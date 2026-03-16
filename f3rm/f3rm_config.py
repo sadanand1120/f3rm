@@ -3,12 +3,12 @@ from nerfstudio.configs.base_config import ViewerConfig
 from nerfstudio.data.dataparsers.nerfstudio_dataparser import NerfstudioDataParserConfig
 from nerfstudio.engine.optimizers import AdamOptimizerConfig
 from nerfstudio.engine.schedulers import ExponentialDecaySchedulerConfig
-from nerfstudio.plugins.types import MethodSpecification
 
 from f3rm.feature_datamanager import FeatureDataManagerConfig
 from f3rm.model import FeatureFieldModelConfig
 from f3rm.trainer import F3RMTrainerConfig
 from f3rm.pipeline import FeaturePipelineConfig
+from nerfstudio.plugins.types import MethodSpecification
 
 # TODO: Look at https://docs.nerf.studio/nerfology/methods/nerfacto.html, try bigger model for better scenes!
 # TODO: (maybe) revisit PCA implementation for feature visualization (previous speed tests were similar)
