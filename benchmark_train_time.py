@@ -28,7 +28,8 @@ TRAIN_IMAGE_COUNT = 215
 EVAL_IMAGE_COUNT = 11
 MEASURE_SCALE_NUM = 6
 MEASURE_SCALE_DEN = 7
-QUALITY_GUARDRAIL_PCT = 10.0
+QUALITY_CLEAR_PCT = 10.0
+QUALITY_REVIEW_PCT = 15.0
 
 TIMING_TAGS = {
     "train_total_time_s": "Train Total (time)",
@@ -115,7 +116,7 @@ def parse_args() -> argparse.Namespace:
         "--baseline-summary",
         type=Path,
         default=None,
-        help="Optional prior summary.json used to compute the max quality regression guardrail.",
+        help="Optional prior summary.json used to compute quality regression tradeoff bands.",
     )
     parser.add_argument("--dry-run", action="store_true", help="Print the resolved command and exit.")
     return parser.parse_args()
@@ -288,6 +289,9 @@ def compute_quality_guardrail(
     result = {
         "baseline_summary": None if baseline_summary_path is None else str(baseline_summary_path.resolve()),
         "max_regression_pct": None,
+        "comfort_pct": QUALITY_CLEAR_PCT,
+        "review_pct": QUALITY_REVIEW_PCT,
+        "band": None,
         "passed": None,
         "regressions_pct": {},
     }
@@ -308,8 +312,18 @@ def compute_quality_guardrail(
             regressions[name] = max(0.0, (float(baseline_value) - float(current_value)) / denom * 100.0)
 
     max_regression = max(regressions.values(), default=0.0)
+    if max_regression <= QUALITY_CLEAR_PCT:
+        band = "clear"
+        passed: bool | None = True
+    elif max_regression <= QUALITY_REVIEW_PCT:
+        band = "judgment"
+        passed = None
+    else:
+        band = "reject"
+        passed = False
     result["max_regression_pct"] = max_regression
-    result["passed"] = max_regression <= QUALITY_GUARDRAIL_PCT
+    result["band"] = band
+    result["passed"] = passed
     result["regressions_pct"] = regressions
     return result
 
@@ -357,7 +371,8 @@ def summarize_run(
             "train_images_to_sample_from": profile.train_num_images_to_sample_from,
             "train_num_times_to_repeat_images": profile.train_num_times_to_repeat_images,
             "eval_images_to_sample_from": EVAL_IMAGE_COUNT,
-            "quality_guardrail_pct": QUALITY_GUARDRAIL_PCT,
+            "quality_comfort_pct": QUALITY_CLEAR_PCT,
+            "quality_review_pct": QUALITY_REVIEW_PCT,
         },
         **timings,
         **selected_metrics,
@@ -382,6 +397,7 @@ def print_summary(summary: dict[str, Any], summary_path: Path) -> None:
         "eval_all_ssim": selected_metrics.get("eval_all_ssim"),
         "eval_all_lpips": selected_metrics.get("eval_all_lpips"),
         "max_quality_regression_pct": summary.get("max_quality_regression_pct"),
+        "quality_tradeoff_band": summary.get("quality_guardrail", {}).get("band"),
         "quality_guardrail_passed": summary.get("quality_guardrail", {}).get("passed"),
         "summary_path": str(summary_path.resolve()),
     }

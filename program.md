@@ -10,7 +10,8 @@ Primary objective:
 
 Success criterion:
 - `wall_time_s` goes down on the official benchmark
-- `max_quality_regression_pct <= 10.0 (roughly, NOT a hard limit)`
+- `max_quality_regression_pct <= 10.0` is the comfortable zone
+- `10.0 < max_quality_regression_pct <= 15.0` is a judgment band: keep it only if the wall-time win clearly justifies the quality loss
 - the code stays concise, readable, and justified by measured gains
 
 Secondary constraints:
@@ -20,7 +21,7 @@ Secondary constraints:
 
 ## Runtime Contract
 
-All runtime-dependent work must happen inside the container and conda env:
+**NON-NEGOTIABLE: every runtime-dependent command must run inside thecontainer/env workflow. Do not run training, benchmarking, debugging, nerfstudio package inspection, or other environment-sensitive commands on the host.**
 
 - container: `fresh`
 - conda env: `f3rm`
@@ -28,6 +29,7 @@ All runtime-dependent work must happen inside the container and conda env:
 - repo path in runtime (and on host, as its mounted): `/robodata/smodak/repos/f3rm`
 - GPU contract: set `CUDA_VISIBLE_DEVICES=1` for benchmarked runs
 - Nerfstudio package for read-only inspection: `/opt/miniconda3/envs/f3rm/lib/python3.11/site-packages/nerfstudio`
+- canonical order: `docker exec fresh` -> `conda activate f3rm` -> `cd /robodata/smodak/repos/f3rm` -> run command
 
 The benchmark harness itself is meant to be run inside the container, not as a
 host-side Docker wrapper.
@@ -38,10 +40,15 @@ Canonical runtime entry:
 docker exec fresh bash -lc '
   source /opt/miniconda3/etc/profile.d/conda.sh &&
   conda activate f3rm &&
+  export CUDA_VISIBLE_DEVICES=1 &&
   cd /robodata/smodak/repos/f3rm &&
   python benchmark_train_time.py --profile smoke
 '
 ```
+
+Use that wrapper shape for all runtime-dependent commands. If a command depends
+on installed packages, imports, CUDA, or the training environment, it belongs
+inside `fresh` with `f3rm` activated.
 
 ## Benchmark Harness
 
@@ -127,6 +134,13 @@ Fixed files:
 - `program.md`
 - `analysis.py`
 
+Auxiliary notes file:
+- `hypothesis.md`: a living backlog of active hypotheses plus a separate `Out Of Scope Issues For Human` section
+
+Do not create `hypothesis.md` during this contract-edit pass unless the human
+explicitly asks. The experiment loop still must not start until that file
+exists and has been reviewed.
+
 Do not edit Nerfstudio site-packages directly. **If a Nerfstudio patch becomes
 unavoidable, stage it under `nerfstudio_changes/` instead and HAND OFF CONTROL TO THE USER, i.e., STOP the experiment after this run.**
 
@@ -139,21 +153,32 @@ Before starting the loop:
    - `fresh` is running
    - `conda activate f3rm` succeeds
    - current working directory is `/robodata/smodak/repos/f3rm`
+   - the command is being run through the `docker exec fresh ... conda activate f3rm ...` wrapper above
 3. Verify the fixed assets exist:
    - `datasets/f3rm/test/poster/transforms.json`
    - cached `clip` features with `226` per-image files
    - cached `foreground_` features with `226` per-image files
-4. Run the smoke profile once.
-5. Create `results.tsv` if it does not exist, with this header:
+4. Review `hypothesis.md` once it exists. It should contain these section headers:
+
+```md
+# Active Hypotheses
+
+# Out Of Scope Issues For Human
+```
+
+5. If `hypothesis.md` does not exist yet because the human deferred it during artifact generation, stop here and wait for that file before running any baseline or starting the loop.
+6. Refresh `# Active Hypotheses` based on anything new learned during setup validation. Remove stale ideas before running any baseline.
+7. Run the smoke profile once.
+8. Create `results.tsv` if it does not exist, with this header:
 
 ```tsv
 commit	profile	wall_time_s	train_total_time_s	startup_overhead_s	train_iter_time_s	train_rays_per_sec	train_batch_load_s	train_feature_cache_load_s	train_feature_gather_s	train_feature_populate_s	train_model_forward_s	train_metrics_loss_s	eval_batch_load_s	eval_feature_cache_load_s	eval_feature_gather_s	eval_feature_populate_s	eval_image_s	eval_all_images_s	peak_gpu_mem_mb	train_psnr	train_feature_error	train_foreground_acc	eval_all_psnr	eval_all_ssim	eval_all_lpips	max_quality_regression_pct	status	description	summary_path
 ```
 
-6. Run the measure profile once on the current baseline without
+9. Run the measure profile once on the current baseline without
    `--baseline-summary`.
-7. Record that baseline row in `results.tsv` with `max_quality_regression_pct=0.0`.
-8. Use that baseline `summary.json` for all later measure runs.
+10. Record that baseline row in `results.tsv` with `max_quality_regression_pct=0.0`.
+11. Use that baseline `summary.json` for all later measure runs, then begin the loop.
 
 ## Experiment Contract
 
@@ -179,6 +204,9 @@ Guiding principles:
 - keep the code compressed and direct where possible
 - make phase timings explain the speedup, not just the final wall-clock number
 - the official benchmark already uses cached CLIP and foreground features, so feature extraction code matters mainly for cache-hit startup/import overhead unless the cache path is invalidated
+- use `hypothesis.md` as a living backlog, not as a dump of stale notes
+- when you notice promising ideas you cannot pursue yet, record them in `# Active Hypotheses`
+- when you discover an important change that is likely valuable but outside your allowed scope, record it under `# Out Of Scope Issues For Human`
 
 ## Result Format
 
@@ -199,9 +227,50 @@ Field meanings:
 - `peak_gpu_mem_mb`: max logged GPU memory sample
 - `train_*` / `eval_all_*`: representative final unweighted metrics pulled from `summary.json`
 - `max_quality_regression_pct`: worst quality regression against the baseline `summary.json`
+- interpret `max_quality_regression_pct` in bands:
+  - `<= 10.0`: comfortable
+  - `10.0 .. 15.0`: judgment band
+  - `> 15.0`: too much degradation
 - `status`: `keep`, `discard`, or `crash`
 - `description`: one-line summary of the idea
 - `summary_path`: path to the benchmark `summary.json`
+
+`results.tsv` is for actual benchmark outcomes only. Do not mix speculative
+notes into it.
+
+## Hypotheses File
+
+Maintain `hypothesis.md` as a lightweight living backlog with these two
+sections:
+
+- `# Active Hypotheses`
+- `# Out Of Scope Issues For Human`
+
+`# Active Hypotheses` is for:
+
+- follow-up speed hypotheses worth testing later
+- ideas generated during the initial repo scan or later setup work
+- ideas blocked by sequencing, time, or local priority
+- new follow-ups created by recent experiment outcomes
+
+`# Out Of Scope Issues For Human` is for:
+
+- changes that would likely help but violate the current scope boundary
+- architectural or workflow issues that need human judgment
+- bugs or code smells that matter but are not part of the current experiment contract
+
+Keep entries short and concrete. Update the file continuously:
+
+- remove ideas once they have been tested
+- add new follow-ups when experiments create them
+- do not let stale, already-resolved ideas accumulate
+
+A good entry usually includes:
+
+- the date or commit context, if relevant
+- the idea or issue
+- why it matters
+- why it was deferred, if relevant
 
 ## Keep/Discard Rule
 
@@ -209,14 +278,14 @@ Keep a change only if:
 
 - the `measure` run completed successfully
 - `wall_time_s` improved
-- `max_quality_regression_pct <= 10.0 (roughly, NOT a hard limit)`
+- `max_quality_regression_pct <= 10.0`, or it lands in the `10.0 .. 15.0` judgment band and the speedup clearly justifies the loss
 - the code complexity cost is justified by the gain
 
 Discard a change if:
 
 - the benchmark failed or the summary is incomplete
 - `wall_time_s` did not improve enough to justify the change
-- `max_quality_regression_pct > 10.0 (roughly, NOT a hard limit)`
+- `max_quality_regression_pct > 15.0`
 - the speedup comes from breaking the fixed benchmark contract
 
 ## Loop
@@ -231,6 +300,10 @@ Once setup is complete:
 6. Run the official measure command with `--baseline-summary`.
 7. Read `benchmark_runs/measure/<run_id>/summary.json`.
 8. Append the flattened measure row to `results.tsv`.
-9. Keep only accepted commits in history.
-10. Do NOT leave behind any stray processes. Terminate all appropriately.
-11. Move directly to the next idea.
+9. Update `hypothesis.md`:
+   - remove ideas that were just tested
+   - add new follow-up hypotheses created by the result
+   - add any clearly promising but off-scope changes under `# Out Of Scope Issues For Human`
+10. Keep only accepted commits in history.
+11. Do NOT leave behind any stray processes. Terminate all appropriately.
+12. Move directly to the next idea.

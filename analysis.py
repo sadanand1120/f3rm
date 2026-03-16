@@ -1,3 +1,13 @@
+"""
+Passive analysis for F3RM autoresearch runs.
+
+This script consumes the stable `results.tsv` schema defined by `program.md`
+and analyzes the official `measure` rows. If the run also maintains a
+`hypothesis.md` file, treat that as a living qualitative backlog for active
+hypotheses and out-of-scope findings; this script should stay focused on the
+structured benchmark outcomes in `results.tsv`.
+"""
+
 from pathlib import Path
 
 import matplotlib
@@ -22,7 +32,8 @@ OFFICIAL_PROFILE = "measure"
 KEEP_LABEL = "KEEP"
 DISCARD_LABEL = "DISCARD"
 CRASH_LABEL = "CRASH"
-QUALITY_GUARDRAIL_PCT = 10.0
+QUALITY_CLEAR_PCT = 10.0
+QUALITY_REVIEW_PCT = 15.0
 
 NUMERIC_COLUMNS = [
     "wall_time_s",
@@ -71,9 +82,14 @@ def add_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     baseline = float(df.loc[0, METRIC_COLUMN])
-    df["quality_ok"] = df[QUALITY_COLUMN].fillna(0.0) <= QUALITY_GUARDRAIL_PCT
+    quality = df[QUALITY_COLUMN].fillna(0.0)
+    df["quality_clear"] = quality <= QUALITY_CLEAR_PCT
+    df["quality_reviewable"] = quality <= QUALITY_REVIEW_PCT
+    df["quality_band"] = "reject"
+    df.loc[quality <= QUALITY_REVIEW_PCT, "quality_band"] = "judgment"
+    df.loc[quality <= QUALITY_CLEAR_PCT, "quality_band"] = "clear"
     df["completed"] = df[STATUS_COLUMN] != CRASH_LABEL
-    df["valid"] = df["completed"] & df["quality_ok"] & df[METRIC_COLUMN].notna()
+    df["valid"] = df["completed"] & df["quality_reviewable"] & df[METRIC_COLUMN].notna()
     df["speedup_pct"] = 0.0 if baseline == 0 else (baseline - df[METRIC_COLUMN]) / baseline * 100.0
     return df
 
@@ -90,34 +106,49 @@ def print_outcomes(df: pd.DataFrame) -> None:
     print("\nExperiment outcomes:")
     print(counts.to_string())
 
-    quality_ok = int(df["quality_ok"].sum()) if "quality_ok" in df else 0
-    print(f"\nWithin 10% quality guardrail: {quality_ok}/{len(df)}")
+    quality_clear = int(df["quality_clear"].sum()) if "quality_clear" in df else 0
+    quality_review = int((df["quality_band"] == "judgment").sum()) if "quality_band" in df else 0
+    quality_reject = int((df["quality_band"] == "reject").sum()) if "quality_band" in df else 0
+    print(f"\nWithin 10% comfort zone: {quality_clear}/{len(df)}")
+    print(f"In 10-15% judgment band: {quality_review}/{len(df)}")
+    print(f"Over 15% quality degradation: {quality_reject}/{len(df)}")
 
 
 def print_fastest_valid_runs(df: pd.DataFrame) -> None:
     valid = df[df["valid"]].copy().sort_values(METRIC_COLUMN)
     if valid.empty:
-        print("\nNo quality-valid completed runs.")
+        print("\nNo completed runs within the 15% quality review window.")
         return
 
     baseline = float(df.loc[0, METRIC_COLUMN])
     best = valid.iloc[0]
-    print("\nFastest quality-valid run:")
+    print("\nFastest review-eligible run:")
     print(
         f"  {best[COMMIT_COLUMN]}  wall_time_s={best[METRIC_COLUMN]:.3f}  "
-        f"speedup={best['speedup_pct']:.2f}%  quality_regression={best[QUALITY_COLUMN]:.2f}%"
+        f"speedup={best['speedup_pct']:.2f}%  quality_regression={best[QUALITY_COLUMN]:.2f}%  "
+        f"band={best['quality_band']}"
     )
     print(f"  {best[DESCRIPTION_COLUMN]}")
     if SUMMARY_PATH_COLUMN in best:
         print(f"  summary={best[SUMMARY_PATH_COLUMN]}")
 
-    print("\nTop quality-valid runs:")
+    print("\nTop review-eligible runs:")
     for _, row in valid.head(10).iterrows():
         print(
             f"  {row[COMMIT_COLUMN]}  wall_time_s={row[METRIC_COLUMN]:.3f}  "
             f"speedup={row['speedup_pct']:.2f}%  quality_regression={row[QUALITY_COLUMN]:.2f}%  "
-            f"{row[DESCRIPTION_COLUMN]}"
+            f"band={row['quality_band']}  {row[DESCRIPTION_COLUMN]}"
         )
+
+    clear = valid[valid["quality_band"] == "clear"]
+    if not clear.empty:
+        best_clear = clear.iloc[0]
+        print("\nFastest run in the <=10% comfort zone:")
+        print(
+            f"  {best_clear[COMMIT_COLUMN]}  wall_time_s={best_clear[METRIC_COLUMN]:.3f}  "
+            f"speedup={best_clear['speedup_pct']:.2f}%  quality_regression={best_clear[QUALITY_COLUMN]:.2f}%"
+        )
+        print(f"  {best_clear[DESCRIPTION_COLUMN]}")
 
     print(f"\nBaseline wall_time_s: {baseline:.3f}")
 
@@ -128,7 +159,7 @@ def print_kept_runs(df: pd.DataFrame) -> None:
     for idx, row in kept.iterrows():
         print(
             f"  #{idx:03d}  {row[COMMIT_COLUMN]}  wall_time_s={row[METRIC_COLUMN]:.3f}  "
-            f"quality_regression={row[QUALITY_COLUMN]:.2f}%  {row[DESCRIPTION_COLUMN]}"
+            f"quality_regression={row[QUALITY_COLUMN]:.2f}%  band={row['quality_band']}  {row[DESCRIPTION_COLUMN]}"
         )
 
 
@@ -170,7 +201,7 @@ def plot_progress(df: pd.DataFrame) -> None:
     ax_time.legend(loc="best")
 
     tradeoff = non_crash.copy()
-    colors = tradeoff["quality_ok"].map({True: "#2b8c56", False: "#f28e2b"})
+    colors = tradeoff["quality_band"].map({"clear": "#2b8c56", "judgment": "#f28e2b", "reject": "#b2182b"})
     ax_tradeoff.scatter(
         tradeoff[METRIC_COLUMN],
         tradeoff[QUALITY_COLUMN].fillna(0.0),
@@ -178,7 +209,8 @@ def plot_progress(df: pd.DataFrame) -> None:
         s=36,
         alpha=0.9,
     )
-    ax_tradeoff.axhline(QUALITY_GUARDRAIL_PCT, color="#b2182b", linestyle="--", linewidth=1.2, label="10% guardrail")
+    ax_tradeoff.axhline(QUALITY_CLEAR_PCT, color="#4c78a8", linestyle="--", linewidth=1.2, label="10% comfort")
+    ax_tradeoff.axhline(QUALITY_REVIEW_PCT, color="#b2182b", linestyle="--", linewidth=1.2, label="15% ceiling")
     ax_tradeoff.axvline(baseline, color="#4c78a8", linestyle="--", linewidth=1.2, label="Baseline wall time")
     ax_tradeoff.set_title("Speed vs Quality Regression")
     ax_tradeoff.set_xlabel("wall_time_s")
