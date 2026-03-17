@@ -22,10 +22,9 @@ from nerfstudio.viewer.server.viewer_elements import (
 from torch.nn import Parameter
 
 from f3rm.feature_field import FeatureField
-from f3rm.pca_colormap import apply_pca_colormap_return_proj
-from f3rm.renderer import FeatureRenderer, ScalarRenderer
 from f3rm.features.utils import compute_similarity_scores, parse_comma_separated_labels
-from f3rm.shaders import ProbFromProbsShader
+from f3rm.pca_colormap import apply_pca_colormap_return_proj
+from f3rm.renderer import FeatureRenderer
 
 
 @dataclass
@@ -43,11 +42,6 @@ class FeatureFieldModelConfig(NerfactoModelConfig):
     feat_features_per_level: int = 8
     feat_hidden_dim: int = 64
     feat_num_layers: int = 2
-    share_aux_encodings: bool = False
-    foreground_loss_weight: float = 1e-3
-    foreground_train_ray_ratio: float = 1.0
-    foreground_hidden_dim: int = 64
-    foreground_num_layers: int = 1
 
 
 @dataclass
@@ -155,15 +149,10 @@ class FeatureFieldModel(NerfactoModel):
             features_per_level=self.config.feat_features_per_level,
             hidden_dim=self.config.feat_hidden_dim,
             num_layers=self.config.feat_num_layers,
-            foreground_hidden_dim=self.config.foreground_hidden_dim,
-            foreground_num_layers=self.config.foreground_num_layers,
-            share_encoding=self.config.share_aux_encodings,
             implementation=self.config.implementation,
         )
 
         self.renderer_feature = FeatureRenderer()
-        self.renderer_spread = ScalarRenderer()
-        self.prob_from_probs_shader = ProbFromProbsShader()
         self.setup_gui()
 
     def setup_gui(self):
@@ -233,59 +222,31 @@ class FeatureFieldModel(NerfactoModel):
         # Always use detached weights to avoid gradients flowing to NeRF/cameras
         custom_weights = weights.detach()
 
-        fg_indices = None
-        fg_ray_samples = ray_samples
-        fg_weights = custom_weights
-        if self.training and subsample_supervision_rays:
-            fg_indices = self._select_training_ray_indices(custom_weights, self.config.foreground_train_ray_ratio)
-            if fg_indices is not None:
-                fg_ray_samples = ray_samples[fg_indices]
-                fg_weights = custom_weights[fg_indices]
-
         feat_indices = None
         feat_ray_samples = ray_samples
         feat_weights = custom_weights
         if render_features and self.training and subsample_supervision_rays:
-            if fg_indices is not None and self.config.feat_train_ray_ratio == self.config.foreground_train_ray_ratio:
-                feat_indices = fg_indices
-                feat_ray_samples = fg_ray_samples
-                feat_weights = fg_weights
-            else:
-                feat_indices = self._select_training_ray_indices(custom_weights, self.config.feat_train_ray_ratio)
-            if feat_indices is not None and feat_ray_samples is ray_samples:
+            feat_indices = self._select_training_ray_indices(custom_weights, self.config.feat_train_ray_ratio)
+            if feat_indices is not None:
                 feat_ray_samples = ray_samples[feat_indices]
                 feat_weights = custom_weights[feat_indices]
 
-        feat_vals = None
-        if render_features and feat_ray_samples is fg_ray_samples:
-            feat_vals, fg_vals = self.feature_field.get_feature_and_foreground(fg_ray_samples)
-        else:
-            fg_vals = self.feature_field.get_foreground(fg_ray_samples)
-        foreground_logits = self.renderer_spread(values=fg_vals, weights=fg_weights)
-        del fg_vals
-
         if render_features:
-            if feat_vals is None:
-                feat_vals = self.feature_field.get_feature(feat_ray_samples)
+            feat_vals = self.feature_field.get_feature(feat_ray_samples)
             features = self.renderer_feature(features=feat_vals, weights=feat_weights)
-            del feat_vals
 
         outputs_feature_indices = feat_indices if render_features and feat_indices is not None else None
-        outputs_foreground_indices = fg_indices if subsample_supervision_rays else None
 
         outputs = {
             "rgb": rgb,
             "accumulation": accumulation,
             "depth": depth,
             "expected_depth": expected_depth,
-            "foreground_logits": foreground_logits,
         }
         if render_features:
             outputs["feature"] = features
         if outputs_feature_indices is not None:
             outputs["feature_ray_indices"] = outputs_feature_indices
-        if outputs_foreground_indices is not None:
-            outputs["foreground_ray_indices"] = outputs_foreground_indices
 
         if self.config.predict_normals:
             normals = self.renderer_normals(normals=field_outputs[FieldHeadNames.NORMALS], weights=weights)
@@ -317,12 +278,6 @@ class FeatureFieldModel(NerfactoModel):
         """Modified from nerfacto.get_outputs to include feature field outputs."""
         return self._get_outputs_internal(ray_bundle, render_features=True)
 
-    @staticmethod
-    def _foreground_target_index(fg_target: torch.Tensor) -> torch.Tensor:
-        if fg_target.ndim == 1:
-            return fg_target.to(dtype=torch.long)
-        return fg_target.argmax(dim=-1)
-
     def _feature_targets(self, outputs, batch) -> torch.Tensor:
         feature_ray_indices = outputs.get("feature_ray_indices")
         target_feats = batch["feature"].to(device=self.device, dtype=torch.float32)
@@ -336,15 +291,6 @@ class FeatureFieldModel(NerfactoModel):
         target_feats = self._feature_targets(outputs, batch)
         pred_feats = outputs["feature"].to(dtype=torch.float32)
         metrics_dict["feature_error"] = F.mse_loss(pred_feats, target_feats)
-        # Foreground metrics
-        probs = torch.softmax(outputs["foreground_logits"].to(dtype=torch.float32), dim=-1)
-        foreground_ray_indices = outputs.get("foreground_ray_indices")
-        fg_target = batch["foreground"].to(self.device)
-        if foreground_ray_indices is not None:
-            fg_target = fg_target[foreground_ray_indices]
-        pred = probs.argmax(dim=-1)
-        targ = self._foreground_target_index(fg_target)
-        metrics_dict["foreground_acc"] = (pred == targ).float().mean()
         return metrics_dict
 
     def get_loss_dict(self, outputs, batch, metrics_dict=None):
@@ -355,15 +301,6 @@ class FeatureFieldModel(NerfactoModel):
             pred_feats = outputs["feature"].to(dtype=torch.float32)
             feature_error = F.mse_loss(pred_feats, self._feature_targets(outputs, batch))
         loss_dict["feature_loss"] = self.config.feat_loss_weight * feature_error
-        # Foreground loss
-        fg_logits = outputs["foreground_logits"].to(dtype=torch.float32).view(-1, 2)
-        foreground_ray_indices = outputs.get("foreground_ray_indices")
-        fg_target = batch["foreground"].to(self.device)
-        if foreground_ray_indices is not None:
-            fg_target = fg_target[foreground_ray_indices]
-        fg_target_idx = self._foreground_target_index(fg_target).view(-1)
-        ce = F.cross_entropy(fg_logits, fg_target_idx)
-        loss_dict["foreground_loss"] = self.config.foreground_loss_weight * ce
         return loss_dict
 
     @torch.no_grad()
@@ -434,10 +371,6 @@ class FeatureFieldModel(NerfactoModel):
         # pred normals
         if "pred_normals" in outputs:
             images_dict["pred_normals"] = outputs["pred_normals"]
-
-        # foreground probability
-        probs = torch.softmax(outputs["foreground_logits"], dim=-1)[..., 1:2]
-        images_dict["foreground_prob_rgb"] = self.prob_from_probs_shader(probs)
 
         # feature PCA
         if "feature" in outputs:

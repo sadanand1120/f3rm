@@ -55,7 +55,6 @@ f3rm_method = MethodSpecification(
         pipeline=FeaturePipelineConfig(
             datamanager=FeatureDataManagerConfig(
                 feature_type="CLIP",
-                foreground_feature_type="FOREGROUND_",
                 images_on_gpu=True,
                 pin_cpu_feature_cache=False,
                 cpu_feature_cache_images=32,
@@ -85,11 +84,6 @@ f3rm_method = MethodSpecification(
                 feat_features_per_level=4,
                 feat_hidden_dim=64,
                 feat_num_layers=2,
-                share_aux_encodings=True,
-                foreground_loss_weight=1e-3,
-                foreground_train_ray_ratio=0.125,
-                foreground_hidden_dim=64,
-                foreground_num_layers=2,
             ),
             steps_per_train_image_viz=0,
         ),

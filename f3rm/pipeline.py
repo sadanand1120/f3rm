@@ -75,14 +75,6 @@ class FeaturePipeline(VanillaPipeline):
             return int(image_idx.item())
         return int(image_idx)
 
-    @staticmethod
-    def _foreground_prob_map(fg_map: torch.Tensor) -> torch.Tensor:
-        if fg_map.ndim == 2:
-            fg_prob = fg_map.unsqueeze(-1)
-        else:
-            fg_prob = fg_map[..., 1:2]
-        return fg_prob.float()
-
     def _get_deterministic_eval_camera_and_batch(self, step: int):
         """Pick eval image deterministically to keep eval logs reproducible."""
         if hasattr(self.datamanager, "fixed_indices_eval_dataloader") and self.datamanager.eval_dataset is not None:
@@ -112,14 +104,6 @@ class FeaturePipeline(VanillaPipeline):
         # Convert model outputs into standard image artifacts for logging.
         full_batch = self.datamanager.train_dataset.get_data(ci)
         _, images_dict = self.model.get_image_metrics_and_images(outputs, full_batch)
-        # Append foreground prediction-vs-GT visualization for train diagnostics.
-        ci_global = ci
-        fg_map = self.datamanager.fg_loader[ci_global]
-        fg_gt_prob = self._foreground_prob_map(fg_map)
-        fg_gt_rgb = self.model.prob_from_probs_shader(fg_gt_prob)
-
-        images_dict["foreground_prob_gt"] = fg_gt_rgb
-        images_dict["foreground_prob_vs_gt"] = torch.cat([images_dict["foreground_prob_rgb"], fg_gt_rgb], dim=1)
 
         for key, img in images_dict.items():
             writer.put_image(name=f"Train Images/{key}", image=img, step=step)
@@ -136,17 +120,8 @@ class FeaturePipeline(VanillaPipeline):
             camera_ray_bundle, description="Rendering eval image", render_features=False
         )
         metrics_dict, images_dict = self.model.get_image_metrics_and_images(outputs, batch)
-        # Append foreground prediction-vs-GT visualization for eval diagnostics.
-        image_idx = self._image_idx_from_batch(batch)
-        ci_global = image_idx + getattr(self.datamanager, "eval_offset", 0)
-        fg_map = self.datamanager.fg_loader[ci_global]
-        fg_gt_prob = self._foreground_prob_map(fg_map)
-        fg_gt_rgb = self.model.prob_from_probs_shader(fg_gt_prob)
-
-        images_dict["foreground_prob_gt"] = fg_gt_rgb
-        images_dict["foreground_prob_vs_gt"] = torch.cat([images_dict["foreground_prob_rgb"], fg_gt_rgb], dim=1)
-
         # Add metadata expected by trainer-side eval logging.
+        image_idx = self._image_idx_from_batch(batch)
         assert "image_idx" not in metrics_dict
         metrics_dict["image_idx"] = image_idx
         assert "num_rays" not in metrics_dict

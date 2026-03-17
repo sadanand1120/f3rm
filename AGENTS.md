@@ -32,5 +32,5 @@
 
 ## F3RM Abstract
 - F3RM keeps standard Nerfacto RGB/density training as the geometric/base path.
-- In parallel, it trains a feature field that predicts per-ray semantic features and foreground logits.
-- The datamanager injects per-ray supervision (`feature`, `foreground`) from precomputed maps, and training jointly optimizes base Nerfacto losses + feature/foreground losses.
+- In parallel, it trains a feature field that predicts per-ray CLIP features.
+- The datamanager injects per-ray CLIP supervision from precomputed feature maps, and training jointly optimizes base Nerfacto losses plus CLIP feature distillation loss.

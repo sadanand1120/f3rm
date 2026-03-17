@@ -23,7 +23,6 @@ from f3rm.timing import put_timing
 class FeatureDataManagerConfig(VanillaDataManagerConfig):
     _target: Type = field(default_factory=lambda: FeatureDataManager)
     feature_type: Literal["CLIP"] = "CLIP"
-    foreground_feature_type: str = "FOREGROUND_"
     enable_cache: bool = True
     """Whether to cache extracted features."""
     pin_cpu_feature_cache: bool = True
@@ -147,22 +146,12 @@ class FeatureDataManager(VanillaDataManager):
         )
         CONSOLE.print(f"Created batch loader for {self.config.feature_type} features")
 
-        self.fg_loader = extract_features_for_dataset(
-            feature_type=self.config.foreground_feature_type,
-            device=self.device,
-            max_cpu_images=self.config.cpu_feature_cache_images,
-            max_gpu_images=self.config.gpu_feature_cache_images,
-            **loader_kwargs,
-        )
-        CONSOLE.print(f"Created batch loader for {self.config.foreground_feature_type} maps")
-
         # Metadata required by downstream model construction
         self.train_dataset.metadata["feature_type"] = self.config.feature_type
         self.train_dataset.metadata["feature_dim"] = self.feature_loader.C
 
         # Validate camera dimensions and compute scaling into feature grids
         feat_h, feat_w = self.feature_loader.H, self.feature_loader.W
-        fg_h, fg_w = self.fg_loader.H, self.fg_loader.W
         im_h = set(self.train_dataset.cameras.image_height.squeeze().tolist())
         im_w = set(self.train_dataset.cameras.image_width.squeeze().tolist())
         assert len(im_h) == 1, "All images must have the same height"
@@ -170,13 +159,10 @@ class FeatureDataManager(VanillaDataManager):
         im_h, im_w = im_h.pop(), im_w.pop()
         self.feat_scale_h = feat_h / im_h
         self.feat_scale_w = feat_w / im_w
-        self.fg_scale_h = fg_h / im_h
-        self.fg_scale_w = fg_w / im_w
         CONSOLE.print(
             f"Feat h: {feat_h}, Feat w: {feat_w}, Feat c: {self.feature_loader.C}, Im h: {im_h}, Im w: {im_w}"
         )
         CONSOLE.print(f"Feat scale h: {self.feat_scale_h}, Feat scale w: {self.feat_scale_w}")
-        CONSOLE.print(f"FG scale h: {self.fg_scale_h}, FG scale w: {self.fg_scale_w}")
 
         self._train_window_cache: Dict[str, torch.Tensor | int] = {}
         self._eval_window_cache: Dict[str, torch.Tensor | int] = {}
@@ -189,19 +175,17 @@ class FeatureDataManager(VanillaDataManager):
         image = image_batch["image"]
         return image.data_ptr() if torch.is_tensor(image) else id(image)
 
-    def _get_window_cache(self, image_batch: Dict, is_eval: bool) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _get_window_cache(self, image_batch: Dict, is_eval: bool) -> Tuple[torch.Tensor, torch.Tensor]:
         cache = self._eval_window_cache if is_eval else self._train_window_cache
         token = self._window_token(image_batch)
         if cache.get("token") == token:
-            return cache["feature"], cache["foreground"], cache["lookup"]  # type: ignore[return-value]
+            return cache["feature"], cache["lookup"]  # type: ignore[return-value]
 
         image_ids = image_batch["image_idx"]
         loader_ids = image_ids + self.eval_offset if is_eval else image_ids
         feature_dict = self.feature_loader.load_batch_images(loader_ids)
-        fg_dict = self.fg_loader.load_batch_images(loader_ids)
         ordered_loader_ids = loader_ids.tolist()
         feature_window = torch.stack([feature_dict[int(idx)] for idx in ordered_loader_ids], dim=0)
-        foreground_window = torch.stack([fg_dict[int(idx)] for idx in ordered_loader_ids], dim=0)
 
         lookup_size = len(self.eval_dataset) if is_eval else len(self.train_dataset)
         lookup = torch.full((lookup_size,), -1, dtype=torch.long, device=image_ids.device)
@@ -210,9 +194,8 @@ class FeatureDataManager(VanillaDataManager):
         cache.clear()
         cache["token"] = token
         cache["feature"] = feature_window
-        cache["foreground"] = foreground_window
         cache["lookup"] = lookup
-        return feature_window, foreground_window, lookup
+        return feature_window, lookup
 
     @staticmethod
     def _gather_from_window(
@@ -234,15 +217,13 @@ class FeatureDataManager(VanillaDataManager):
         prefix = "Eval" if is_eval else "Train"
         populate_start = perf_counter()
         camera_idx, y_feat, x_feat = self._index_triplet(batch, self.feat_scale_h, self.feat_scale_w)
-        cam_fg, y_fg, x_fg = self._index_triplet(batch, self.fg_scale_h, self.fg_scale_w)
 
         load_start = perf_counter()
-        feature_window, foreground_window, lookup = self._get_window_cache(image_batch, is_eval)
+        feature_window, lookup = self._get_window_cache(image_batch, is_eval)
         self._put_timing(f"Timing/{prefix}/feature_cache_load", perf_counter() - load_start, step)
 
         gather_start = perf_counter()
         batch["feature"] = self._gather_from_window(feature_window, lookup, camera_idx, y_feat, x_feat)
-        batch["foreground"] = self._gather_from_window(foreground_window, lookup, cam_fg, y_fg, x_fg)
         self._put_timing(f"Timing/{prefix}/feature_gather", perf_counter() - gather_start, step)
         self._put_timing(f"Timing/{prefix}/feature_populate", perf_counter() - populate_start, step)
 
