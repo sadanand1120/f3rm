@@ -21,11 +21,11 @@ f3rm_method = MethodSpecification(
     config=F3RMTrainerConfig(
         method_name="f3rm",
         steps_per_eval_batch=500,
-        steps_per_eval_image=7500,   # HACK TODO: for rapid testing, since its too slow
-        steps_per_eval_all_images=7700,  # HACK TODO: for rapid testing, since its too slow
+        steps_per_eval_image=6600,   # Keep one near-end eval image when max_num_iterations is reduced.
+        steps_per_eval_all_images=6800,  # Keep one near-end eval-all pass when max_num_iterations is reduced.
         save_only_latest_checkpoint=True,
         steps_per_save=3700,
-        max_num_iterations=8100,
+        max_num_iterations=7200,
         mixed_precision=True,
         use_grad_scaler=True,
         pipeline=FeaturePipelineConfig(
@@ -37,9 +37,9 @@ f3rm_method = MethodSpecification(
                 cpu_feature_cache_images=32,
                 gpu_feature_cache_images=0,
                 dataparser=NerfstudioDataParserConfig(train_split_fraction=0.95),
-                train_num_rays_per_batch=1 << 13,
+                train_num_rays_per_batch=9_216,
                 train_num_images_to_sample_from=32,
-                train_num_times_to_repeat_images=512,
+                train_num_times_to_repeat_images=464,
                 eval_num_rays_per_batch=1 << 12,
                 eval_num_images_to_sample_from=32,
                 eval_num_times_to_repeat_images=512,
@@ -71,19 +71,19 @@ f3rm_method = MethodSpecification(
         optimizers={
             "proposal_networks": {
                 "optimizer": AdamOptimizerConfig(lr=1e-2, eps=1e-15, max_norm=1.0),
-                "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, warmup_steps=1000, max_steps=8100),
+                "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, warmup_steps=900, max_steps=7200),
             },
             "fields": {
                 "optimizer": AdamOptimizerConfig(lr=1e-2, eps=1e-15, max_norm=1.0),
-                "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, warmup_steps=1000, max_steps=8100),
+                "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, warmup_steps=900, max_steps=7200),
             },
             "feature_field": {
                 "optimizer": AdamOptimizerConfig(lr=5e-2, eps=1e-15, max_norm=1.0),
-                "scheduler": ExponentialDecaySchedulerConfig(lr_final=5e-3, warmup_steps=1000, max_steps=8100),
+                "scheduler": ExponentialDecaySchedulerConfig(lr_final=5e-3, warmup_steps=900, max_steps=7200),
             },
             "camera_opt": {
                 "optimizer": AdamOptimizerConfig(lr=1e-4, eps=1e-8, weight_decay=0.0, max_norm=0.5),
-                "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-5, warmup_steps=3000, max_steps=8100),
+                "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-5, warmup_steps=2700, max_steps=7200),
             },
         },
         viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
