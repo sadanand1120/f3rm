@@ -1,5 +1,5 @@
 from nerfstudio.cameras.camera_optimizers import CameraOptimizerConfig
-from nerfstudio.configs.base_config import LoggingConfig, ViewerConfig
+from nerfstudio.configs.base_config import LocalWriterConfig, LoggingConfig, ViewerConfig
 from nerfstudio.data.dataparsers.nerfstudio_dataparser import NerfstudioDataParserConfig
 from nerfstudio.engine.optimizers import AdamOptimizerConfig
 from nerfstudio.engine.schedulers import ExponentialDecaySchedulerConfig
@@ -20,7 +20,7 @@ from nerfstudio.plugins.types import MethodSpecification
 f3rm_method = MethodSpecification(
     config=F3RMTrainerConfig(
         method_name="f3rm",
-        logging=LoggingConfig(steps_per_log=200, profiler="none"),
+        logging=LoggingConfig(steps_per_log=200, local_writer=LocalWriterConfig(enable=False), profiler="none"),
         steps_per_eval_batch=0,
         steps_per_eval_image=0,
         steps_per_eval_all_images=4799,  # Only the final eval-all pass is needed for the benchmark summary.
