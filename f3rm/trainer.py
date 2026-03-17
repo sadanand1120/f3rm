@@ -91,10 +91,10 @@ class F3RMTrainer(Trainer):
         torch.use_deterministic_algorithms(False)
 
         super().__init__(config, local_rank, world_size)
-        self._latest_train_metrics: Dict[str, float] = {}
-        self._latest_eval_batch_metrics: Dict[str, float] = {}
-        self._latest_eval_image_metrics: Dict[str, float] = {}
-        self._latest_eval_all_metrics: Dict[str, float] = {}
+        self._latest_train_metrics: Dict[str, Any] = {}
+        self._latest_eval_batch_metrics: Dict[str, Any] = {}
+        self._latest_eval_image_metrics: Dict[str, Any] = {}
+        self._latest_eval_all_metrics: Dict[str, Any] = {}
 
     @staticmethod
     def _extract_scalar_metrics(metrics_dict: Dict[str, Any]) -> Dict[str, float]:
@@ -106,6 +106,23 @@ class F3RMTrainer(Trainer):
                 if value.numel() != 1:
                     continue
                 scalar_metrics[key] = float(value.detach().cpu())
+                continue
+            try:
+                scalar_metrics[key] = float(value)
+            except (TypeError, ValueError):
+                continue
+        return scalar_metrics
+
+    @staticmethod
+    def _detach_scalar_metrics(metrics_dict: Dict[str, Any]) -> Dict[str, Any]:
+        scalar_metrics: Dict[str, Any] = {}
+        for key, value in metrics_dict.items():
+            if key in FINAL_METRIC_METADATA_KEYS:
+                continue
+            if torch.is_tensor(value):
+                if value.numel() != 1:
+                    continue
+                scalar_metrics[key] = value.detach()
                 continue
             try:
                 scalar_metrics[key] = float(value)
@@ -168,8 +185,7 @@ class F3RMTrainer(Trainer):
         with torch.autocast(device_type=cpu_or_cuda_str, enabled=self.mixed_precision):
             _, loss_dict, metrics_dict = self.pipeline.get_train_loss_dict(step=step)
             loss = functools.reduce(torch.add, loss_dict.values())
-        self._latest_train_metrics = self._extract_scalar_metrics(metrics_dict)
-        writer.put_scalar(name="current_step", scalar=float(step), step=step)
+        self._latest_train_metrics = self._detach_scalar_metrics(metrics_dict)
         if not torch.isfinite(loss):
             self._sanitize_all_optimizer_groups()
             return loss, loss_dict, metrics_dict
@@ -221,7 +237,7 @@ class F3RMTrainer(Trainer):
         """Run eval iteration while keeping the latest unweighted eval metrics for final reporting."""
         if step_check(step, self.config.steps_per_eval_batch):
             _, eval_loss_dict, eval_metrics_dict = self.pipeline.get_eval_loss_dict(step=step)
-            self._latest_eval_batch_metrics = self._extract_scalar_metrics(eval_metrics_dict)
+            self._latest_eval_batch_metrics = self._detach_scalar_metrics(eval_metrics_dict)
             eval_loss = functools.reduce(torch.add, eval_loss_dict.values())
             writer.put_scalar(name="Eval Loss", scalar=eval_loss, step=step)
             writer.put_dict(name="Eval Loss Dict", scalar_dict=eval_loss_dict, step=step)
@@ -230,7 +246,7 @@ class F3RMTrainer(Trainer):
         if step_check(step, self.config.steps_per_eval_image):
             with writer.TimeWriter(writer, writer.EventName.TEST_RAYS_PER_SEC, write=False) as test_t:
                 metrics_dict, images_dict = self.pipeline.get_eval_image_metrics_and_images(step=step)
-            self._latest_eval_image_metrics = self._extract_scalar_metrics(metrics_dict)
+            self._latest_eval_image_metrics = self._detach_scalar_metrics(metrics_dict)
             writer.put_time(
                 name=writer.EventName.TEST_RAYS_PER_SEC,
                 duration=metrics_dict["num_rays"] / test_t.duration,
@@ -244,15 +260,15 @@ class F3RMTrainer(Trainer):
 
         if step_check(step, self.config.steps_per_eval_all_images):
             metrics_dict = self.pipeline.get_average_eval_image_metrics(step=step)
-            self._latest_eval_all_metrics = self._extract_scalar_metrics(metrics_dict)
+            self._latest_eval_all_metrics = self._detach_scalar_metrics(metrics_dict)
             writer.put_dict(name="Eval Images Metrics Dict (all images)", scalar_dict=metrics_dict, step=step)
 
     def _get_final_metric_groups(self) -> list[tuple[str, Dict[str, float]]]:
         metric_groups = [
-            ("Train Batch", self._latest_train_metrics),
-            ("Eval Batch", self._latest_eval_batch_metrics),
-            ("Eval Image", self._latest_eval_image_metrics),
-            ("Eval All Images", self._latest_eval_all_metrics),
+            ("Train Batch", self._extract_scalar_metrics(self._latest_train_metrics)),
+            ("Eval Batch", self._extract_scalar_metrics(self._latest_eval_batch_metrics)),
+            ("Eval Image", self._extract_scalar_metrics(self._latest_eval_image_metrics)),
+            ("Eval All Images", self._extract_scalar_metrics(self._latest_eval_all_metrics)),
         ]
         return [(group_name, metrics) for group_name, metrics in metric_groups if metrics]
 
