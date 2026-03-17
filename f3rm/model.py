@@ -323,13 +323,17 @@ class FeatureFieldModel(NerfactoModel):
             return fg_target.to(dtype=torch.long)
         return fg_target.argmax(dim=-1)
 
-    def get_metrics_dict(self, outputs, batch):
-        metrics_dict = super().get_metrics_dict(outputs, batch)
-        # Feature metrics
+    def _feature_targets(self, outputs, batch) -> torch.Tensor:
         feature_ray_indices = outputs.get("feature_ray_indices")
         target_feats = batch["feature"].to(device=self.device, dtype=torch.float32)
         if feature_ray_indices is not None:
             target_feats = target_feats[feature_ray_indices]
+        return target_feats
+
+    def get_metrics_dict(self, outputs, batch):
+        metrics_dict = super().get_metrics_dict(outputs, batch)
+        # Feature metrics
+        target_feats = self._feature_targets(outputs, batch)
         pred_feats = outputs["feature"].to(dtype=torch.float32)
         metrics_dict["feature_error"] = F.mse_loss(pred_feats, target_feats)
         # Foreground metrics
@@ -346,12 +350,11 @@ class FeatureFieldModel(NerfactoModel):
     def get_loss_dict(self, outputs, batch, metrics_dict=None):
         loss_dict = super().get_loss_dict(outputs, batch, metrics_dict)
         # Feature loss
-        feature_ray_indices = outputs.get("feature_ray_indices")
-        target_feats = batch["feature"].to(device=self.device, dtype=torch.float32)
-        if feature_ray_indices is not None:
-            target_feats = target_feats[feature_ray_indices]
-        pred_feats = outputs["feature"].to(dtype=torch.float32)
-        loss_dict["feature_loss"] = self.config.feat_loss_weight * F.mse_loss(pred_feats, target_feats)
+        feature_error = metrics_dict.get("feature_error") if metrics_dict is not None else None
+        if feature_error is None:
+            pred_feats = outputs["feature"].to(dtype=torch.float32)
+            feature_error = F.mse_loss(pred_feats, self._feature_targets(outputs, batch))
+        loss_dict["feature_loss"] = self.config.feat_loss_weight * feature_error
         # Foreground loss
         fg_logits = outputs["foreground_logits"].to(dtype=torch.float32).view(-1, 2)
         foreground_ray_indices = outputs.get("foreground_ray_indices")
