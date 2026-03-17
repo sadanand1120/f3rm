@@ -1,3 +1,4 @@
+import concurrent.futures
 import gc
 from dataclasses import dataclass, field
 from time import perf_counter
@@ -10,6 +11,7 @@ from nerfstudio.data.datamanagers.base_datamanager import (
     VanillaDataManagerConfig,
 )
 from nerfstudio.data.datasets.base_dataset import InputDataset
+from nerfstudio.data.utils.dataloaders import CacheDataloader
 from nerfstudio.utils.rich_utils import CONSOLE
 
 from f3rm.features.extract_features_standalone import extract_features_for_dataset
@@ -36,6 +38,55 @@ class UInt8InputDataset(InputDataset):
         return self.get_data(image_idx, image_type="uint8")
 
 
+class PrefetchCacheDataloader(CacheDataloader):
+    """Train-image cache dataloader that prepares the next sampled window ahead of the refresh boundary."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._prefetch_executor = None
+        self._prefetch_future = None
+        if not self.cache_all_images and self.num_times_to_repeat_images != -1:
+            self._prefetch_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+    def _submit_prefetch(self) -> None:
+        if self._prefetch_executor is None or self._prefetch_future is not None:
+            return
+        self._prefetch_future = self._prefetch_executor.submit(self._get_collated_batch)
+
+    def _next_collated_batch(self):
+        if self._prefetch_future is None:
+            collated_batch = self._get_collated_batch()
+        else:
+            collated_batch = self._prefetch_future.result()
+            self._prefetch_future = None
+        self._submit_prefetch()
+        return collated_batch
+
+    def __iter__(self):
+        self._submit_prefetch()
+        while True:
+            if self.cache_all_images:
+                collated_batch = self.cached_collated_batch
+            elif self.first_time or (
+                self.num_times_to_repeat_images != -1 and self.num_repeated >= self.num_times_to_repeat_images
+            ):
+                self.num_repeated = 0
+                collated_batch = self._next_collated_batch()
+                self.cached_collated_batch = collated_batch if self.num_times_to_repeat_images != 0 else None
+                self.first_time = False
+            else:
+                collated_batch = self.cached_collated_batch
+                self.num_repeated += 1
+            yield collated_batch
+
+    def __del__(self):
+        if self._prefetch_executor is not None:
+            try:
+                self._prefetch_executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+
+
 class FeatureDataManager(VanillaDataManager):
     config: FeatureDataManagerConfig
 
@@ -48,6 +99,24 @@ class FeatureDataManager(VanillaDataManager):
             dataparser_outputs=self.train_dataparser_outputs,
             scale_factor=self.config.camera_res_scale_factor,
         )
+
+    def setup_train(self):
+        """Use a prefetched train-image cache to hide image-window refresh stalls."""
+        assert self.train_dataset is not None
+        CONSOLE.print("Setting up training dataset...")
+        self.train_image_dataloader = PrefetchCacheDataloader(
+            self.train_dataset,
+            num_images_to_sample_from=self.config.train_num_images_to_sample_from,
+            num_times_to_repeat_images=self.config.train_num_times_to_repeat_images,
+            device=self.device,
+            num_workers=self.world_size * 4,
+            pin_memory=True,
+            collate_fn=self.config.collate_fn,
+            exclude_batch_keys_from_device=self.exclude_batch_keys_from_device,
+        )
+        self.iter_train_image_dataloader = iter(self.train_image_dataloader)
+        self.train_pixel_sampler = self._get_pixel_sampler(self.train_dataset, self.config.train_num_rays_per_batch)
+        self.train_ray_generator = FeatureRayGenerator(self.train_dataset.cameras.to(self.device))
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
