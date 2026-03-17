@@ -56,6 +56,10 @@ class FeatureField(Field):
                 implementation=implementation,
             )
 
+        feature_enc_out_dim = self.feature_hash_encoding.get_out_dim()
+        if self.feature_pe_encoding is not None:
+            feature_enc_out_dim += self.feature_pe_encoding.get_out_dim()
+
         self.foreground_hash_encoding = HashEncoding(
             num_levels=num_levels,
             min_res=start_res,
@@ -73,11 +77,6 @@ class FeatureField(Field):
                 max_freq_exp=pe_n_freq - 1,
                 implementation=implementation,
             )
-
-        feature_enc_out_dim = self.feature_hash_encoding.get_out_dim()
-        if self.feature_pe_encoding is not None:
-            feature_enc_out_dim += self.feature_pe_encoding.get_out_dim()
-
         foreground_enc_out_dim = self.foreground_hash_encoding.get_out_dim()
         if self.foreground_pe_encoding is not None:
             foreground_enc_out_dim += self.foreground_pe_encoding.get_out_dim()

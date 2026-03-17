@@ -32,8 +32,10 @@ f3rm_method = MethodSpecification(
             datamanager=FeatureDataManagerConfig(
                 feature_type="CLIP",
                 foreground_feature_type="FOREGROUND_",
-                cpu_feature_cache_images=256,
-                gpu_feature_cache_images=128,
+                images_on_gpu=True,
+                pin_cpu_feature_cache=False,
+                cpu_feature_cache_images=32,
+                gpu_feature_cache_images=0,
                 dataparser=NerfstudioDataParserConfig(train_split_fraction=0.95),
                 train_num_rays_per_batch=1 << 13,
                 train_num_images_to_sample_from=32,
@@ -43,15 +45,24 @@ f3rm_method = MethodSpecification(
                 eval_num_times_to_repeat_images=1024,
             ),
             model=FeatureFieldModelConfig(
-                camera_optimizer=CameraOptimizerConfig(mode="SO3xR3"),  # "SO3xR3" or "off"
+                camera_optimizer=CameraOptimizerConfig(mode="off"),  # "SO3xR3" or "off"
                 implementation="tcnn",  # other option is "torch"
-                eval_num_rays_per_chunk=1 << 14,
-                predict_normals=True,
-                num_proposal_iterations=2,  # May reduce proposal iterations for speed
+                eval_num_rays_per_chunk=1 << 16,
+                predict_normals=False,
+                use_appearance_embedding=True,
+                num_proposal_iterations=1,  # May reduce proposal iterations for speed
+                num_proposal_samples_per_ray=(128, 96),
+                num_nerf_samples_per_ray=24,
+                distortion_loss_mult=0.0025,
                 feat_loss_weight=1e-3,
+                feat_train_ray_ratio=0.5,
+                feat_use_pe=False,
+                feat_num_levels=10,
+                feat_features_per_level=4,
                 feat_hidden_dim=64,
                 feat_num_layers=2,
                 foreground_loss_weight=1e-3,
+                foreground_train_ray_ratio=0.25,
                 foreground_hidden_dim=64,
                 foreground_num_layers=2,
             ),

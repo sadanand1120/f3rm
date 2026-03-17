@@ -10,8 +10,9 @@ from nerfstudio.data.datamanagers.base_datamanager import VanillaDataManager
 from nerfstudio.utils import writer
 from nerfstudio.utils import profiler
 from nerfstudio.utils.misc import step_check
-from rich.progress import Progress, BarColumn, TimeElapsedColumn, TextColumn
 from PIL import Image
+
+from f3rm.timing import put_timing
 
 
 @dataclass
@@ -23,7 +24,7 @@ class FeaturePipelineConfig(VanillaPipelineConfig):
 class FeaturePipeline(VanillaPipeline):
     @staticmethod
     def _put_timing(name: str, duration: float, step: int, avg_over_steps: bool = True) -> None:
-        writer.put_time(name=name, duration=duration, step=step, avg_over_steps=avg_over_steps)
+        put_timing(name=name, duration=duration, step=step, avg_over_steps=avg_over_steps)
 
     def __init__(
         self,
@@ -63,19 +64,6 @@ class FeaturePipeline(VanillaPipeline):
     def _render_outputs_with_progress(
         self, camera_ray_bundle, description: str, render_features: bool = True
     ) -> Dict[str, torch.Tensor]:
-        if self._local_rank == 0:
-            with Progress(
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                TimeElapsedColumn(),
-                transient=True,
-            ) as progress:
-                task = progress.add_task(description, total=1)
-                outputs = self.model.get_outputs_for_camera_ray_bundle(
-                    camera_ray_bundle, render_features=render_features
-                )
-                progress.advance(task)
-            return outputs
         return self.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle, render_features=render_features)
 
     @staticmethod
@@ -84,6 +72,14 @@ class FeaturePipeline(VanillaPipeline):
         if torch.is_tensor(image_idx):
             return int(image_idx.item())
         return int(image_idx)
+
+    @staticmethod
+    def _foreground_prob_map(fg_map: torch.Tensor) -> torch.Tensor:
+        if fg_map.ndim == 2:
+            fg_prob = fg_map.unsqueeze(-1)
+        else:
+            fg_prob = fg_map[..., 1:2]
+        return fg_prob.float()
 
     def _get_deterministic_eval_camera_and_batch(self, step: int):
         """Pick eval image deterministically to keep eval logs reproducible."""
@@ -117,7 +113,7 @@ class FeaturePipeline(VanillaPipeline):
         # Append foreground prediction-vs-GT visualization for train diagnostics.
         ci_global = ci
         fg_map = self.datamanager.fg_loader[ci_global]
-        fg_gt_prob = fg_map[..., 1:2]
+        fg_gt_prob = self._foreground_prob_map(fg_map)
         fg_gt_rgb = self.model.prob_from_probs_shader(fg_gt_prob)
 
         images_dict["foreground_prob_gt"] = fg_gt_rgb
@@ -142,7 +138,7 @@ class FeaturePipeline(VanillaPipeline):
         image_idx = self._image_idx_from_batch(batch)
         ci_global = image_idx + getattr(self.datamanager, "eval_offset", 0)
         fg_map = self.datamanager.fg_loader[ci_global]
-        fg_gt_prob = fg_map[..., 1:2]
+        fg_gt_prob = self._foreground_prob_map(fg_map)
         fg_gt_rgb = self.model.prob_from_probs_shader(fg_gt_prob)
 
         images_dict["foreground_prob_gt"] = fg_gt_rgb
@@ -169,35 +165,27 @@ class FeaturePipeline(VanillaPipeline):
         num_images = len(self.datamanager.fixed_indices_eval_dataloader)
         if output_path is not None:
             output_path.mkdir(exist_ok=True, parents=True)
-        with Progress(
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TimeElapsedColumn(),
-            transient=True,
-        ) as progress:
-            task = progress.add_task("[green]Evaluating all eval images...", total=num_images)
-            for i, (camera, batch) in enumerate(self.datamanager.fixed_indices_eval_dataloader):
-                inner_start = time()
-                outputs = self.model.get_outputs_for_camera_ray_bundle(
-                    camera.generate_rays(camera_indices=0, keep_shape=True),
-                    render_features=False,
-                )
-                height, width = camera.height, camera.width
-                num_rays = height * width
-                metrics_dict, images_dict = self.model.get_image_metrics_and_images(outputs, batch)
+        for i, (camera, batch) in enumerate(self.datamanager.fixed_indices_eval_dataloader):
+            inner_start = time()
+            outputs = self.model.get_outputs_for_camera_ray_bundle(
+                camera.generate_rays(camera_indices=0, keep_shape=True),
+                render_features=False,
+            )
+            height, width = camera.height, camera.width
+            num_rays = height * width
+            metrics_dict, images_dict = self.model.get_image_metrics_and_images(outputs, batch)
 
-                if output_path is not None:
-                    image_idx = self._image_idx_from_batch(batch)
-                    for key, val in images_dict.items():
-                        Image.fromarray((val * 255).byte().cpu().numpy()).save(
-                            output_path / "{0:06d}-{1}.jpg".format(image_idx, key)
-                        )
-                metrics_dict["num_rays_per_sec"] = (num_rays / (time() - inner_start)).item()
-                metrics_dict["fps"] = (metrics_dict["num_rays_per_sec"] / (height * width)).item()
-                metrics_dict_list.append(metrics_dict)
+            if output_path is not None:
+                image_idx = self._image_idx_from_batch(batch)
+                for key, val in images_dict.items():
+                    Image.fromarray((val * 255).byte().cpu().numpy()).save(
+                        output_path / "{0:06d}-{1}.jpg".format(image_idx, key)
+                    )
+            metrics_dict["num_rays_per_sec"] = (num_rays / (time() - inner_start)).item()
+            metrics_dict["fps"] = (metrics_dict["num_rays_per_sec"] / (height * width)).item()
+            metrics_dict_list.append(metrics_dict)
 
-                del outputs, images_dict
-                progress.advance(task)
+            del outputs, images_dict
         metrics_dict = {}
         for key in metrics_dict_list[0]:
             if get_std:

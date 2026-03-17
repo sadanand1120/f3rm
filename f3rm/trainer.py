@@ -190,7 +190,6 @@ class F3RMTrainer(Trainer):
             loss = functools.reduce(torch.add, loss_dict.values())
         self._latest_train_metrics = self._extract_scalar_metrics(metrics_dict)
         writer.put_scalar(name="current_step", scalar=float(step), step=step)
-
         if not torch.isfinite(loss):
             self._sanitize_all_optimizer_groups()
             return loss, loss_dict, metrics_dict
@@ -211,9 +210,6 @@ class F3RMTrainer(Trainer):
             max_norm = self.optimizers.config[group]["optimizer"].max_norm
             params = list(self.optimizers.parameters[group])
 
-            self._sanitize_parameter_tensors(params)
-            self._sanitize_optimizer_state(optimizer)
-
             has_grad = any(any(param.grad is not None for param in pg["params"]) for pg in optimizer.param_groups)
             if not has_grad:
                 continue
@@ -223,7 +219,9 @@ class F3RMTrainer(Trainer):
                 self.grad_scaler.unscale_(optimizer)
 
             if self._has_nonfinite_gradients(params):
+                self._sanitize_parameter_tensors(params)
                 self._sanitize_nonfinite_gradients(params)
+                self._sanitize_optimizer_state(optimizer)
                 continue
 
             if self.use_grad_scaler:

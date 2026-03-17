@@ -17,7 +17,6 @@ Usage:
 Supported feature types: CLIP, SAM3_*, TEXT, FOREGROUND_*
 """
 
-import argparse
 import gc
 import json
 import math
@@ -26,9 +25,7 @@ from typing import List, Literal, Optional, Callable, Any, Type
 
 import torch
 import numpy as np
-from nerfstudio.data.dataparsers.nerfstudio_dataparser import NerfstudioDataParserConfig
 from nerfstudio.utils.rich_utils import CONSOLE
-from tqdm.auto import tqdm
 
 from f3rm.features.utils import run_async_in_any_context, BatchFeatureLoader, get_cache_paths
 
@@ -50,6 +47,49 @@ def _lazy_import_components(feature_type: str):
         from f3rm.features.text_extract import TextArgs, TextExtractor
         return TextArgs, TextExtractor, None, None
     raise ValueError(f"Unknown feature type: {feature_type}")
+
+
+def _current_feature_args_id(feature_type: str) -> Optional[dict[str, Any]]:
+    """Return a lightweight cache fingerprint without importing extractor modules."""
+    if feature_type == "CLIP":
+        return {
+            "model_name": "ViT-L-14-336-quickgelu",
+            "model_pretrained": "openai",
+            "load_size": 2048,
+            "skip_center_crop": True,
+            "agg_scales": [0.25, 0.5, 1.0, 1.5],
+            "agg_weights": [1.5, 3, 6, 3],
+        }
+    if feature_type.startswith("FOREGROUND_"):
+        return {
+            "min_instance_percent": 1.0,
+        }
+    if feature_type.startswith("SAM3_"):
+        return {
+            "bpe_path": "/robodata/smodak/repos/sam3/sam3/assets/bpe_simple_vocab_16e6.txt.gz",
+            "confidence_threshold": 0.5,
+            "resolution": 1008,
+            "precision": "bfloat16",
+            "compile": False,
+        }
+    if feature_type == "TEXT":
+        prompt_dir = Path(__file__).parent / "text_prompts"
+        return {
+            "vlm_server": {
+                "base_url": "http://10.0.0.212:8069/v1",
+                "api_key": None,
+                "model": "qwen2p5-vl-72b",
+            },
+            "llm_server": {
+                "base_url": "http://10.0.0.211:8002/v1",
+                "api_key": None,
+                "model": "r1-qwen-32b",
+            },
+            "temperature": 0.1,
+            "vlm_prompt": (prompt_dir / "vlm_prompt.md").read_text().strip(),
+            "llm_prompt": (prompt_dir / "llm_prompt.md").read_text().strip(),
+        }
+    return None
 
 
 def create_feature_visualization(data_dir: Path, feature_type: str):
@@ -83,6 +123,8 @@ async def _save_per_image_generic(
     device: torch.device,
     batch_size: int,
 ):
+    from tqdm.auto import tqdm
+
     root, meta = get_cache_paths(data_dir, feature_type)
     root.mkdir(parents=True, exist_ok=True)
     if batch_size <= 0:
@@ -119,7 +161,7 @@ async def _save_per_image_generic(
                 img_data = data[j].cpu().half()
                 np.save(root / f"image_{img_idx:06d}.npy", img_data.numpy(), allow_pickle=False)
             elif feature_type.startswith("FOREGROUND_"):
-                img_data = data[j].astype(np.float16)
+                img_data = data[j]
                 np.save(root / f"image_{img_idx:06d}.npy", img_data, allow_pickle=False)
             elif feature_type.startswith("SAM3_"):
                 masks = data[j].astype(np.bool_)
@@ -133,7 +175,8 @@ async def _save_per_image_generic(
             torch.cuda.empty_cache()
             gc.collect()
 
-    torch.save({"args": args_cls.id_dict(), "image_fnames": image_fnames}, meta)
+    normalized_image_fnames = [_normalize_image_path_for_cache(str(fname), data_dir) for fname in image_fnames]
+    torch.save({"args": args_cls.id_dict(), "image_fnames": image_fnames, "normalized_image_fnames": normalized_image_fnames}, meta)
     CONSOLE.print(f"Saved {feature_type} per-image features → {root}")
 
 
@@ -165,7 +208,7 @@ def _normalize_image_path_for_cache(path_like: str, data_dir: Path) -> str:
     return str((Path.cwd() / p).resolve())
 
 
-def feature_loader(image_fnames: List[str], extract_args, data_dir: Path, feature_type: str) -> bool:
+def feature_loader(image_fnames: List[str], current_args: dict[str, Any], data_dir: Path, feature_type: str) -> bool:
     """Return True if cached features are valid for the current args and image ordering."""
     root, meta = get_cache_paths(data_dir, feature_type)
 
@@ -180,19 +223,20 @@ def feature_loader(image_fnames: List[str], extract_args, data_dir: Path, featur
         return False
 
     # Check args match
-    current_args = extract_args.id_dict()
     cached_args = md.get("args")
     args_match = cached_args == current_args
 
     # Check image filenames match
     cached_fnames = md.get("image_fnames")
-    current_fnames_str = [_normalize_image_path_for_cache(str(fname), data_dir) for fname in image_fnames]
-    cached_fnames_str = (
-        [_normalize_image_path_for_cache(str(fname), data_dir) for fname in cached_fnames]
-        if cached_fnames
-        else None
-    )
-    fnames_match = cached_fnames_str == current_fnames_str
+    current_fnames_raw = [str(fname) for fname in image_fnames]
+    if cached_fnames == current_fnames_raw:
+        fnames_match = True
+    else:
+        current_fnames_str = [_normalize_image_path_for_cache(fname, data_dir) for fname in current_fnames_raw]
+        cached_fnames_str = md.get("normalized_image_fnames")
+        if cached_fnames_str is None and cached_fnames:
+            cached_fnames_str = [_normalize_image_path_for_cache(str(fname), data_dir) for fname in cached_fnames]
+        fnames_match = cached_fnames_str == current_fnames_str
 
     if not args_match or not fnames_match:
         CONSOLE.print(f"[DEBUG] {feature_type}: CACHE MISS - {'Args' if not args_match else 'Filenames'} don't match")
@@ -208,6 +252,8 @@ def feature_loader(image_fnames: List[str], extract_args, data_dir: Path, featur
 
 def get_image_filenames_from_dataparser(data_dir: Path) -> List[str]:
     """Get image filenames in the same order as the training pipeline."""
+    from nerfstudio.data.dataparsers.nerfstudio_dataparser import NerfstudioDataParserConfig
+
     # Use the EXACT same dataparser configuration as the training pipeline in f3rm/f3rm_config.py
     dataparser_config = NerfstudioDataParserConfig(
         data=data_dir,
@@ -236,6 +282,7 @@ def extract_features_for_dataset(
     device: torch.device,
     batch_size: int = 64,
     enable_cache: bool = True,
+    pin_cpu_tensors: bool = True,
     force: bool = False,
     max_cpu_images: int = 128,
     max_gpu_images: int = 16,
@@ -252,20 +299,24 @@ def extract_features_for_dataset(
     if batch_size <= 0:
         raise ValueError(f"batch_size must be > 0, got {batch_size}")
 
-    args_cls, extractor_cls, parse_fn, _ = _lazy_import_components(feature_type)
-
     CONSOLE.print(f"[DEBUG] {feature_type}: enable_cache={enable_cache}, checking for cached features...")
-    cache_hit = (
-        feature_loader(image_fnames, args_cls, data_dir, feature_type)
-        if enable_cache and not force
-        else False
-    )
+    current_args = _current_feature_args_id(feature_type)
+    cache_hit = feature_loader(image_fnames, current_args, data_dir, feature_type) if enable_cache and not force and current_args is not None else False
 
     if cache_hit:
         CONSOLE.print(f"[{feature_type}] Using cached features")
-        return BatchFeatureLoader(data_dir, feature_type, image_fnames, device, max_cpu_images=max_cpu_images, max_gpu_images=max_gpu_images)
+        return BatchFeatureLoader(
+            data_dir,
+            feature_type,
+            image_fnames,
+            device,
+            max_cpu_images=max_cpu_images,
+            max_gpu_images=max_gpu_images,
+            pin_cpu_tensors=pin_cpu_tensors,
+        )
 
     CONSOLE.print(f"[{feature_type}] Extracting features...")
+    args_cls, extractor_cls, parse_fn, _ = _lazy_import_components(feature_type)
 
     async def _run():
         await _save_per_image_generic(
@@ -282,7 +333,15 @@ def extract_features_for_dataset(
     run_async_in_any_context(_run)
 
     # Return the batch loader
-    return BatchFeatureLoader(data_dir, feature_type, image_fnames, device, max_cpu_images=max_cpu_images, max_gpu_images=max_gpu_images)
+    return BatchFeatureLoader(
+        data_dir,
+        feature_type,
+        image_fnames,
+        device,
+        max_cpu_images=max_cpu_images,
+        max_gpu_images=max_gpu_images,
+        pin_cpu_tensors=pin_cpu_tensors,
+    )
 
 
 def extract_features_standalone(
@@ -325,6 +384,8 @@ def extract_features_standalone(
 
 
 def main():
+    import argparse
+
     parser = argparse.ArgumentParser(
         description="Extract features for F3RM training independently of the training pipeline.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter

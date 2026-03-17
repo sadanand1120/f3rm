@@ -86,13 +86,10 @@ class FOREGROUNDWorker:
         if masks.size == 0:
             with Image.open(image_path) as img:
                 h, w = img.height, img.width
-            fg = np.zeros((h, w), dtype=bool)
-            one_hot = np.stack([~fg, fg], axis=-1).astype(np.float16)
-            return one_hot
+            return np.zeros((h, w), dtype=np.uint8)
 
         fg_mask = np.logical_or.reduce(masks, axis=0)
-        one_hot = np.stack([~fg_mask, fg_mask], axis=-1).astype(np.float16)
-        return one_hot
+        return fg_mask.astype(np.uint8)
 
     async def compute_foreground_for_image_async(self, image_path: str) -> np.ndarray:
         return await asyncio.to_thread(self._compute_foreground_for_image, image_path)
@@ -161,10 +158,8 @@ def examine_saved(foreground_feat_dir: str):
 
     for i in tqdm(range(n_images), desc="Creating FOREGROUND features video"):
         feat_path = os.path.join(foreground_feat_dir, f"image_{i:06d}.npy")
-        feat = np.load(feat_path)  # Shape: (H, W, 2) - background/foreground one-hot
-
-        # Visualize foreground channel (index 1)
-        fg_map = feat[..., 1]  # Foreground channel
+        feat = np.load(feat_path)
+        fg_map = feat[..., 1] if feat.ndim == 3 else feat
         frame = (fg_map * 255).astype(np.uint8)
         frame_bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
         out.write(frame_bgr)

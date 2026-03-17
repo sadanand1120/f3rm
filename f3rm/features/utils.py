@@ -157,8 +157,16 @@ def normalize_sam3_masks(raw_masks: Any, image_path: Optional[str] = None) -> np
 class BatchFeatureLoader:
     """Simple batch feature loader for per-image stored features."""
 
-    def __init__(self, data_dir: Path, feature_type: str, image_fnames: List[str], device: torch.device,
-                 max_cpu_images: int = 128, max_gpu_images: int = 16):
+    def __init__(
+        self,
+        data_dir: Path,
+        feature_type: str,
+        image_fnames: List[str],
+        device: torch.device,
+        max_cpu_images: int = 128,
+        max_gpu_images: int = 16,
+        pin_cpu_tensors: bool = True,
+    ):
         self.data_dir = data_dir
         self.feature_type = feature_type
         self.image_fnames = image_fnames
@@ -169,7 +177,7 @@ class BatchFeatureLoader:
         self.max_gpu_images = int(max_gpu_images)
         self._cpu_cache: "OrderedDict[int, torch.Tensor]" = OrderedDict()
         self._gpu_cache: "OrderedDict[int, torch.Tensor]" = OrderedDict()
-        self._use_pinned = torch.cuda.is_available()
+        self._use_pinned = torch.cuda.is_available() and bool(pin_cpu_tensors)
         # Prefetch stream for async H2D
         self._stream = torch.cuda.Stream() if torch.cuda.is_available() else None
 
@@ -178,7 +186,11 @@ class BatchFeatureLoader:
             self.H, self.W, self.C = sample_features.shape
             self.dtype = sample_features.dtype
         elif feature_type.startswith("FOREGROUND_"):
-            self.H, self.W, self.C = sample_features.shape
+            if sample_features.ndim == 2:
+                self.H, self.W = sample_features.shape
+                self.C = 1
+            else:
+                self.H, self.W, self.C = sample_features.shape
             self.dtype = sample_features.dtype
         elif feature_type.startswith("SAM3_"):
             self.K, _, self.H, self.W = sample_features.shape
