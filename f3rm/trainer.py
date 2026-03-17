@@ -133,25 +133,6 @@ class F3RMTrainer(Trainer):
                 did_sanitize = True
         return did_sanitize
 
-    @staticmethod
-    def _has_nonfinite_gradients(parameters) -> bool:
-        for param in parameters:
-            grad = getattr(param, "grad", None)
-            if grad is not None and not torch.isfinite(grad).all():
-                return True
-        return False
-
-    @staticmethod
-    def _sanitize_nonfinite_gradients(parameters) -> bool:
-        did_sanitize = False
-        for param in parameters:
-            grad = getattr(param, "grad", None)
-            if grad is not None and not torch.isfinite(grad).all():
-                with torch.no_grad():
-                    torch.nan_to_num_(grad, nan=0.0, posinf=0.0, neginf=0.0)
-                did_sanitize = True
-        return did_sanitize
-
     def _sanitize_camera_opt_params_if_needed(self) -> None:
         """Prevent a non-finite camera optimizer state from poisoning subsequent steps."""
         camera_optimizer = getattr(self.pipeline.model, "camera_optimizer", None)
@@ -168,7 +149,6 @@ class F3RMTrainer(Trainer):
         for group in self.optimizers.parameters.keys():
             params = list(self.optimizers.parameters[group])
             self._sanitize_parameter_tensors(params)
-            self._sanitize_nonfinite_gradients(params)
             optimizer = self.optimizers.optimizers[group]
             self._sanitize_optimizer_state(optimizer)
 
@@ -205,33 +185,17 @@ class F3RMTrainer(Trainer):
             if step % self.gradient_accumulation_steps[group] == self.gradient_accumulation_steps[group] - 1
         ]
 
-        for group in needs_step:
-            optimizer = self.optimizers.optimizers[group]
-            max_norm = self.optimizers.config[group]["optimizer"].max_norm
-            params = list(self.optimizers.parameters[group])
-
-            has_grad = any(any(param.grad is not None for param in pg["params"]) for pg in optimizer.param_groups)
-            if not has_grad:
-                continue
-
-            if self.use_grad_scaler:
-                # Non-finite checks must run on unscaled grads, otherwise large scaler values create false positives.
-                self.grad_scaler.unscale_(optimizer)
-
-            if self._has_nonfinite_gradients(params):
-                self._sanitize_parameter_tensors(params)
-                self._sanitize_nonfinite_gradients(params)
-                self._sanitize_optimizer_state(optimizer)
-                continue
-
-            if self.use_grad_scaler:
+        if self.use_grad_scaler:
+            self.optimizers.optimizer_scaler_step_some(self.grad_scaler, needs_step)
+        else:
+            for group in needs_step:
+                optimizer = self.optimizers.optimizers[group]
+                max_norm = self.optimizers.config[group]["optimizer"].max_norm
+                params = self.optimizers.parameters[group]
                 if max_norm is not None:
                     torch.nn.utils.clip_grad_norm_(params, max_norm)
-                self.grad_scaler.step(optimizer)
-            else:
-                if max_norm is not None:
-                    torch.nn.utils.clip_grad_norm_(params, max_norm)
-                optimizer.step()
+                if any(any(param.grad is not None for param in pg["params"]) for pg in optimizer.param_groups):
+                    optimizer.step()
 
         if self.config.log_gradients:
             total_grad = 0.0
