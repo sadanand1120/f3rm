@@ -246,18 +246,25 @@ class FeatureFieldModel(NerfactoModel):
         if render_features and self.training and subsample_supervision_rays:
             if fg_indices is not None and self.config.feat_train_ray_ratio == self.config.foreground_train_ray_ratio:
                 feat_indices = fg_indices
+                feat_ray_samples = fg_ray_samples
+                feat_weights = fg_weights
             else:
                 feat_indices = self._select_training_ray_indices(custom_weights, self.config.feat_train_ray_ratio)
-            if feat_indices is not None:
+            if feat_indices is not None and feat_ray_samples is ray_samples:
                 feat_ray_samples = ray_samples[feat_indices]
                 feat_weights = custom_weights[feat_indices]
 
-        fg_vals = self.feature_field.get_foreground(fg_ray_samples)
+        feat_vals = None
+        if render_features and feat_ray_samples is fg_ray_samples:
+            feat_vals, fg_vals = self.feature_field.get_feature_and_foreground(fg_ray_samples)
+        else:
+            fg_vals = self.feature_field.get_foreground(fg_ray_samples)
         foreground_logits = self.renderer_spread(values=fg_vals, weights=fg_weights)
         del fg_vals
 
         if render_features:
-            feat_vals = self.feature_field.get_feature(feat_ray_samples)
+            if feat_vals is None:
+                feat_vals = self.feature_field.get_feature(feat_ray_samples)
             features = self.renderer_feature(features=feat_vals, weights=feat_weights)
             del feat_vals
 

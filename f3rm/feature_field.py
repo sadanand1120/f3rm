@@ -108,9 +108,18 @@ class FeatureField(Field):
         self, ray_samples: RaySamples, hash_encoding: HashEncoding, pe_encoding: Optional[NeRFEncoding]
     ) -> Tensor:
         """Apply scene contraction and encode positions for a specific branch."""
+        positions_flat, _ = self._flatten_positions(ray_samples)
+        return self._encode_flat_positions(positions_flat, hash_encoding, pe_encoding)
+
+    def _flatten_positions(self, ray_samples: RaySamples) -> Tuple[Tensor, torch.Size]:
         positions = ray_samples.frustums.get_positions().detach()
         positions = self._preprocess_positions(positions)
-        positions_flat = positions.view(-1, 3)
+        return positions.reshape(-1, 3), ray_samples.frustums.directions.shape[:-1]
+
+    @staticmethod
+    def _encode_flat_positions(
+        positions_flat: Tensor, hash_encoding: HashEncoding, pe_encoding: Optional[NeRFEncoding]
+    ) -> Tensor:
         encoded = [hash_encoding(positions_flat)]
         if pe_encoding is not None:
             encoded.append(pe_encoding(positions_flat))
@@ -123,22 +132,28 @@ class FeatureField(Field):
         return positions
 
     def get_feature(self, ray_samples: RaySamples) -> Tensor:
-        encoded_base = self._encode_positions(
-            ray_samples=ray_samples,
-            hash_encoding=self.feature_hash_encoding,
-            pe_encoding=self.feature_pe_encoding,
-        )
-        features = self.mlp_feature(encoded_base).view(*ray_samples.frustums.directions.shape[:-1], -1)
+        positions_flat, sample_shape = self._flatten_positions(ray_samples)
+        encoded_base = self._encode_flat_positions(positions_flat, self.feature_hash_encoding, self.feature_pe_encoding)
+        features = self.mlp_feature(encoded_base).view(*sample_shape, -1)
         return features
 
     def get_foreground(self, ray_samples: RaySamples) -> Tensor:
-        encoded_base = self._encode_positions(
-            ray_samples=ray_samples,
-            hash_encoding=self.foreground_hash_encoding,
-            pe_encoding=self.foreground_pe_encoding,
+        positions_flat, sample_shape = self._flatten_positions(ray_samples)
+        encoded_base = self._encode_flat_positions(
+            positions_flat, self.foreground_hash_encoding, self.foreground_pe_encoding
         )
-        logits = self.mlp_foreground(encoded_base).view(*ray_samples.frustums.directions.shape[:-1], -1)
+        logits = self.mlp_foreground(encoded_base).view(*sample_shape, -1)
         return logits
+
+    def get_feature_and_foreground(self, ray_samples: RaySamples) -> Tuple[Tensor, Tensor]:
+        positions_flat, sample_shape = self._flatten_positions(ray_samples)
+        feature_encoded = self._encode_flat_positions(positions_flat, self.feature_hash_encoding, self.feature_pe_encoding)
+        foreground_encoded = self._encode_flat_positions(
+            positions_flat, self.foreground_hash_encoding, self.foreground_pe_encoding
+        )
+        features = self.mlp_feature(feature_encoded).view(*sample_shape, -1)
+        foreground = self.mlp_foreground(foreground_encoded).view(*sample_shape, -1)
+        return features, foreground
 
     def get_outputs(self, ray_samples: RaySamples, density_embedding: Optional[Tensor] = None) -> Dict[str, Tensor]:
         """Compute all field outputs."""
