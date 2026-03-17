@@ -58,7 +58,9 @@ class FeaturePipeline(VanillaPipeline):
         self._put_timing("Timing/Train/metrics_loss", perf_counter() - metrics_start, step)
 
         if self.config.steps_per_train_image_viz and step_check(step, self.config.steps_per_train_image_viz):
+            viz_start = perf_counter()
             self._log_train_images_for_step(batch, step)
+            self._put_timing("Timing/Train/image_viz", perf_counter() - viz_start, step)
         return model_outputs, loss_dict, metrics_dict
 
     def _render_outputs_with_progress(

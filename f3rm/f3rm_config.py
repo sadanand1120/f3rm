@@ -39,10 +39,10 @@ f3rm_method = MethodSpecification(
                 dataparser=NerfstudioDataParserConfig(train_split_fraction=0.95),
                 train_num_rays_per_batch=1 << 13,
                 train_num_images_to_sample_from=32,
-                train_num_times_to_repeat_images=1024,
+                train_num_times_to_repeat_images=512,
                 eval_num_rays_per_batch=1 << 12,
                 eval_num_images_to_sample_from=32,
-                eval_num_times_to_repeat_images=1024,
+                eval_num_times_to_repeat_images=512,
             ),
             model=FeatureFieldModelConfig(
                 camera_optimizer=CameraOptimizerConfig(mode="off"),  # "SO3xR3" or "off"
