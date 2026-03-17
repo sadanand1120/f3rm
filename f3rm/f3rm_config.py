@@ -62,7 +62,7 @@ f3rm_method = MethodSpecification(
                 feat_hidden_dim=64,
                 feat_num_layers=2,
                 foreground_loss_weight=1e-3,
-                foreground_train_ray_ratio=0.25,
+                foreground_train_ray_ratio=0.125,
                 foreground_hidden_dim=64,
                 foreground_num_layers=2,
             ),
