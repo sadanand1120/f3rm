@@ -204,7 +204,9 @@ class FeatureFieldModel(NerfactoModel):
             return None
         return torch.linspace(0, num_rays - 1, steps=keep, device=weights.device).round().long().unique(sorted=True)
 
-    def _get_outputs_internal(self, ray_bundle: RayBundle, render_features: bool):
+    def _get_outputs_internal(
+        self, ray_bundle: RayBundle, render_features: bool, subsample_supervision_rays: bool = True
+    ):
         """Core rendering that can optionally skip feature-field computation."""
         # Match Nerfacto behavior: apply learned camera pose deltas during training.
         if self.training:
@@ -232,7 +234,7 @@ class FeatureFieldModel(NerfactoModel):
         fg_indices = None
         fg_ray_samples = ray_samples
         fg_weights = custom_weights
-        if self.training:
+        if self.training and subsample_supervision_rays:
             fg_indices = self._select_training_ray_indices(custom_weights, self.config.foreground_train_ray_ratio)
             if fg_indices is not None:
                 fg_ray_samples = ray_samples[fg_indices]
@@ -241,7 +243,7 @@ class FeatureFieldModel(NerfactoModel):
         feat_indices = None
         feat_ray_samples = ray_samples
         feat_weights = custom_weights
-        if render_features and self.training:
+        if render_features and self.training and subsample_supervision_rays:
             if fg_indices is not None and self.config.feat_train_ray_ratio == self.config.foreground_train_ray_ratio:
                 feat_indices = fg_indices
             else:
@@ -260,7 +262,7 @@ class FeatureFieldModel(NerfactoModel):
             del feat_vals
 
         outputs_feature_indices = feat_indices if render_features and feat_indices is not None else None
-        outputs_foreground_indices = fg_indices
+        outputs_foreground_indices = fg_indices if subsample_supervision_rays else None
 
         outputs = {
             "rgb": rgb,
@@ -367,7 +369,11 @@ class FeatureFieldModel(NerfactoModel):
             ray_bundle = ray_bundle.to(self.device)
             if self.collider is not None:
                 ray_bundle = self.collider(ray_bundle)
-            outputs_chunk = self._get_outputs_internal(ray_bundle, render_features=render_features)
+            outputs_chunk = self._get_outputs_internal(
+                ray_bundle,
+                render_features=render_features,
+                subsample_supervision_rays=False,
+            )
             for output_name, output in outputs_chunk.items():
                 if not torch.is_tensor(output):
                     continue
