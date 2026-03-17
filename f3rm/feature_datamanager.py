@@ -12,6 +12,7 @@ from nerfstudio.data.datamanagers.base_datamanager import (
 from nerfstudio.utils.rich_utils import CONSOLE
 
 from f3rm.features.extract_features_standalone import extract_features_for_dataset
+from f3rm.ray_generator import FeatureRayGenerator
 from f3rm.timing import put_timing
 
 
@@ -36,6 +37,8 @@ class FeatureDataManager(VanillaDataManager):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.train_ray_generator = FeatureRayGenerator(self.train_dataset.cameras.to(self.device))
+        self.eval_ray_generator = FeatureRayGenerator(self.eval_dataset.cameras.to(self.device))
 
         # Dataset and device setup
         if isinstance(self.device, str):
