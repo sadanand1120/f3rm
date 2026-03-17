@@ -1,5 +1,5 @@
 from nerfstudio.cameras.camera_optimizers import CameraOptimizerConfig
-from nerfstudio.configs.base_config import ViewerConfig
+from nerfstudio.configs.base_config import LoggingConfig, ViewerConfig
 from nerfstudio.data.dataparsers.nerfstudio_dataparser import NerfstudioDataParserConfig
 from nerfstudio.engine.optimizers import AdamOptimizerConfig
 from nerfstudio.engine.schedulers import ExponentialDecaySchedulerConfig
@@ -20,6 +20,7 @@ from nerfstudio.plugins.types import MethodSpecification
 f3rm_method = MethodSpecification(
     config=F3RMTrainerConfig(
         method_name="f3rm",
+        logging=LoggingConfig(steps_per_log=20),
         steps_per_eval_batch=500,
         steps_per_eval_image=4791,   # Match baseline eval-image residue while staying near run end.
         steps_per_eval_all_images=4793,  # Keep one near-end eval-all pass near the final iterations.
