@@ -9,6 +9,7 @@ from nerfstudio.data.datamanagers.base_datamanager import (
     VanillaDataManager,
     VanillaDataManagerConfig,
 )
+from nerfstudio.data.datasets.base_dataset import InputDataset
 from nerfstudio.utils.rich_utils import CONSOLE
 
 from f3rm.features.extract_features_standalone import extract_features_for_dataset
@@ -28,12 +29,25 @@ class FeatureDataManagerConfig(VanillaDataManagerConfig):
     gpu_feature_cache_images: int = 16
 
 
+class UInt8InputDataset(InputDataset):
+    """Train dataset variant that keeps cached images in uint8 until after pixel sampling."""
+
+    def __getitem__(self, image_idx: int) -> Dict:
+        return self.get_data(image_idx, image_type="uint8")
+
+
 class FeatureDataManager(VanillaDataManager):
     config: FeatureDataManagerConfig
 
     @staticmethod
     def _put_timing(name: str, duration: float, step: int) -> None:
         put_timing(name=name, duration=duration, step=step, avg_over_steps=True)
+
+    def create_train_dataset(self) -> InputDataset:
+        return UInt8InputDataset(
+            dataparser_outputs=self.train_dataparser_outputs,
+            scale_factor=self.config.camera_res_scale_factor,
+        )
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -163,6 +177,16 @@ class FeatureDataManager(VanillaDataManager):
         self._put_timing(f"Timing/{prefix}/feature_gather", perf_counter() - gather_start, step)
         self._put_timing(f"Timing/{prefix}/feature_populate", perf_counter() - populate_start, step)
 
+    def _prepare_sampled_image(self, batch: Dict) -> None:
+        image = batch["image"]
+        if image.dtype == torch.uint8:
+            if image.device != self.device:
+                image = image.to(self.device, non_blocking=True)
+            batch["image"] = image.float().mul_(1.0 / 255.0)
+            return
+        if image.device != self.device:
+            batch["image"] = image.to(self.device, non_blocking=True)
+
     def next_train(self, step: int) -> Tuple[RayBundle, Dict]:
         batch_start = perf_counter()
         self.train_count += 1
@@ -171,7 +195,7 @@ class FeatureDataManager(VanillaDataManager):
         assert isinstance(image_batch, dict)
         batch = self.train_pixel_sampler.sample(image_batch)
         ray_bundle = self.train_ray_generator(batch["indices"])
-        batch["image"] = batch["image"].to(self.device, non_blocking=True)
+        self._prepare_sampled_image(batch)
         self._populate_batch_features(image_batch, batch, step=step, is_eval=False)
         self._put_timing("Timing/Train/batch_load", perf_counter() - batch_start, step)
         return ray_bundle, batch
@@ -184,7 +208,7 @@ class FeatureDataManager(VanillaDataManager):
         assert isinstance(image_batch, dict)
         batch = self.eval_pixel_sampler.sample(image_batch)
         ray_bundle = self.eval_ray_generator(batch["indices"])
-        batch["image"] = batch["image"].to(self.device, non_blocking=True)
+        self._prepare_sampled_image(batch)
         self._populate_batch_features(image_batch, batch, step=step, is_eval=True)
         self._put_timing("Timing/Eval/batch_load", perf_counter() - batch_start, step)
         return ray_bundle, batch
