@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import math
 import os
-import re
 import shlex
 import shutil
 import subprocess
@@ -16,8 +16,11 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
+from f3rm.train_schedule import derive_train_schedule
+
 
 REPO_ROOT = Path(__file__).resolve().parent
+CONFIG_PATH = REPO_ROOT / "f3rm" / "f3rm_config.py"
 DATA_PATH = REPO_ROOT / "datasets/f3rm/test/poster"
 BENCHMARK_RUNS_ROOT = REPO_ROOT / "benchmark_runs"
 BENCHMARK_OUTPUTS_ROOT = REPO_ROOT / "benchmark_outputs"
@@ -25,13 +28,57 @@ EXPERIMENT_NAME = "poster-train-time"
 METHOD_NAME = "f3rm"
 EXPECTED_CONDA_PREFIX = "/opt/miniconda3/envs/f3rm"
 EXPECTED_FEATURE_CACHES = ("clip", "foreground_")
-TOTAL_DATASET_IMAGES = 226
 BENCHMARK_SEED = 0
 PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"
 RESULTS_TSV_FILENAME = "results_row.tsv"
 RESULTS_TSV_NUMERIC_PRECISION = 2
-TRAIN_IMAGE_COUNT = 215
-TRAIN_TOTAL_PIXELS = 429_828_000
+SCHEDULE_FLAG_NAMES = (
+    "NUM_IMAGES_TOTAL",
+    "TRAIN_SPLIT_FRACTION",
+    "TRAIN_IMAGE_WH",
+    "TRAIN_NUM_RAYS_PER_BATCH",
+    "TRAIN_NUM_IMAGES_TO_SAMPLE_FROM",
+    "PIXEL_VISITATION",
+    "WINDOW_COVERAGE",
+)
+
+
+def load_schedule_flags(config_path: Path) -> dict[str, int | float]:
+    module = ast.parse(config_path.read_text(encoding="utf-8"), filename=str(config_path))
+    values: dict[str, int | float] = {}
+    for node in module.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+            continue
+        name = node.targets[0].id
+        if name not in SCHEDULE_FLAG_NAMES:
+            continue
+        values[name] = ast.literal_eval(node.value)
+    missing = [name for name in SCHEDULE_FLAG_NAMES if name not in values]
+    if missing:
+        raise RuntimeError(f"missing schedule flags in {config_path}: {missing}")
+    return values
+
+
+ACTIVE_SCHEDULE_FLAGS = load_schedule_flags(CONFIG_PATH)
+NUM_IMAGES_TOTAL = int(ACTIVE_SCHEDULE_FLAGS["NUM_IMAGES_TOTAL"])
+TRAIN_SPLIT_FRACTION = float(ACTIVE_SCHEDULE_FLAGS["TRAIN_SPLIT_FRACTION"])
+TRAIN_IMAGE_WH = tuple(int(value) for value in ACTIVE_SCHEDULE_FLAGS["TRAIN_IMAGE_WH"])
+TRAIN_NUM_RAYS_PER_BATCH = int(ACTIVE_SCHEDULE_FLAGS["TRAIN_NUM_RAYS_PER_BATCH"])
+TRAIN_NUM_IMAGES_TO_SAMPLE_FROM = int(ACTIVE_SCHEDULE_FLAGS["TRAIN_NUM_IMAGES_TO_SAMPLE_FROM"])
+PIXEL_VISITATION = float(ACTIVE_SCHEDULE_FLAGS["PIXEL_VISITATION"])
+WINDOW_COVERAGE = float(ACTIVE_SCHEDULE_FLAGS["WINDOW_COVERAGE"])
+TOTAL_DATASET_IMAGES = NUM_IMAGES_TOTAL
+ACTIVE_TRAIN_SCHEDULE = derive_train_schedule(
+    num_images_total=NUM_IMAGES_TOTAL,
+    train_split_fraction=TRAIN_SPLIT_FRACTION,
+    train_image_wh=TRAIN_IMAGE_WH,
+    train_num_rays_per_batch=TRAIN_NUM_RAYS_PER_BATCH,
+    train_num_images_to_sample_from=TRAIN_NUM_IMAGES_TO_SAMPLE_FROM,
+    pixel_visitation=PIXEL_VISITATION,
+    window_coverage=WINDOW_COVERAGE,
+)
+TRAIN_IMAGE_COUNT = ACTIVE_TRAIN_SCHEDULE.train_image_count
+TRAIN_TOTAL_PIXELS = ACTIVE_TRAIN_SCHEDULE.train_total_pixels
 BASELINE_MAX_NUM_ITERATIONS = 8100
 BASELINE_TRAIN_NUM_RAYS_PER_BATCH = 1 << 13
 BASELINE_TRAIN_NUM_IMAGES_TO_SAMPLE_FROM = 32
@@ -343,31 +390,6 @@ def compute_quality_guardrail(final_metrics: dict[str, float], baseline_summary_
     return result
 
 
-def load_run_config_text(run_dir: Path) -> str | None:
-    config_path = run_dir / "config.yml"
-    if not config_path.exists():
-        return None
-    return config_path.read_text(encoding="utf-8")
-
-
-def find_numeric_config_value(config_text: str, key: str) -> float | None:
-    pattern = re.compile(rf"(?m)^\s*{re.escape(key)}:\s*([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)\s*$")
-    unique_values = sorted({float(value) for value in pattern.findall(config_text)})
-    if not unique_values:
-        return None
-    if len(unique_values) > 1:
-        raise ValueError(f"expected one numeric value for {key}, found {unique_values}")
-    return unique_values[0]
-
-
-def to_serializable_number(value: float | None) -> float | int | None:
-    if value is None:
-        return None
-    if float(value).is_integer():
-        return int(value)
-    return float(value)
-
-
 def pct_diff_from_baseline(value: float | None, baseline: float) -> float | None:
     if value is None:
         return None
@@ -389,35 +411,18 @@ def summarize_coverage(run_dir: Path) -> dict[str, Any]:
         "window_coverage_w_pct_diff": None,
     }
 
-    try:
-        config_text = load_run_config_text(run_dir)
-        if config_text is None:
-            return coverage
-
-        max_num_iterations = find_numeric_config_value(config_text, "max_num_iterations")
-        train_num_rays_per_batch = find_numeric_config_value(config_text, "train_num_rays_per_batch")
-        train_num_images_to_sample_from = find_numeric_config_value(config_text, "train_num_images_to_sample_from")
-        train_num_times_to_repeat_images = find_numeric_config_value(config_text, "train_num_times_to_repeat_images")
-    except Exception as exc:
-        coverage["error"] = str(exc)
-        return coverage
-
+    max_num_iterations = ACTIVE_TRAIN_SCHEDULE.max_num_iterations
+    train_num_rays_per_batch = TRAIN_NUM_RAYS_PER_BATCH
+    train_num_images_to_sample_from = TRAIN_NUM_IMAGES_TO_SAMPLE_FROM
+    train_num_times_to_repeat_images = ACTIVE_TRAIN_SCHEDULE.train_num_times_to_repeat_images
     coverage.update(
         {
-            "max_num_iterations": to_serializable_number(max_num_iterations),
-            "train_num_rays_per_batch": to_serializable_number(train_num_rays_per_batch),
-            "train_num_images_to_sample_from": to_serializable_number(train_num_images_to_sample_from),
-            "train_num_times_to_repeat_images": to_serializable_number(train_num_times_to_repeat_images),
+            "max_num_iterations": max_num_iterations,
+            "train_num_rays_per_batch": train_num_rays_per_batch,
+            "train_num_images_to_sample_from": train_num_images_to_sample_from,
+            "train_num_times_to_repeat_images": train_num_times_to_repeat_images,
         }
     )
-
-    if None in (
-        max_num_iterations,
-        train_num_rays_per_batch,
-        train_num_images_to_sample_from,
-        train_num_times_to_repeat_images,
-    ):
-        return coverage
 
     pixel_visit_x = float(max_num_iterations) * float(train_num_rays_per_batch) / TRAIN_TOTAL_PIXELS
     window_coverage_w = (
@@ -481,8 +486,15 @@ def summarize_run(
             "pythonhashseed": BENCHMARK_SEED,
             "cuda_visible_devices": "1",
             "pytorch_cuda_alloc_conf": PYTORCH_CUDA_ALLOC_CONF,
+            "config_num_images_total": NUM_IMAGES_TOTAL,
+            "config_train_split_fraction": TRAIN_SPLIT_FRACTION,
+            "config_train_image_wh": list(TRAIN_IMAGE_WH),
             "train_image_count": TRAIN_IMAGE_COUNT,
             "train_total_pixels": TRAIN_TOTAL_PIXELS,
+            "config_train_num_rays_per_batch": TRAIN_NUM_RAYS_PER_BATCH,
+            "config_train_num_images_to_sample_from": TRAIN_NUM_IMAGES_TO_SAMPLE_FROM,
+            "config_pixel_visitation": PIXEL_VISITATION,
+            "config_window_coverage_w": WINDOW_COVERAGE,
             "baseline_reference_max_iterations": BASELINE_MAX_NUM_ITERATIONS,
             "baseline_reference_train_num_rays_per_batch": BASELINE_TRAIN_NUM_RAYS_PER_BATCH,
             "baseline_reference_train_num_images_to_sample_from": BASELINE_TRAIN_NUM_IMAGES_TO_SAMPLE_FROM,

@@ -8,7 +8,30 @@ from f3rm.feature_datamanager import FeatureDataManagerConfig
 from f3rm.model import FeatureFieldModelConfig
 from f3rm.trainer import F3RMTrainerConfig
 from f3rm.pipeline import FeaturePipelineConfig
+from f3rm.train_schedule import derive_train_schedule
 from nerfstudio.plugins.types import MethodSpecification
+
+# Transfer these knobs to another dataset and keep the same schedule density.
+NUM_IMAGES_TOTAL = 226  # Increase => total work: up; end-to-end time: up; quality: usually up because training covers more images.
+TRAIN_SPLIT_FRACTION = 0.95  # Increase => total work: up; end-to-end time: up; quality: usually up because more images move into train.
+TRAIN_IMAGE_WH = (1050, 1904)  # Increase => total work: up; end-to-end time: up; quality: usually up because each train image has more pixels to visit.
+TRAIN_NUM_RAYS_PER_BATCH = 15_104  # Increase => total work: about flat; end-to-end time: usually down until GPU saturation, then can go up; quality: often near-flat, but too high can hurt.
+TRAIN_NUM_IMAGES_TO_SAMPLE_FROM = 32  # Increase => total work: about flat; end-to-end time: usually up from wider window/cache churn; quality: usually up because each refresh sees more images.
+# num times a pixel gets trained on through whole run
+PIXEL_VISITATION = 0.15436842644034357  # Increase => total work: up directly; end-to-end time: up directly; quality: usually up because pixels are revisited more.
+# num times an image gets chosen in the batch through whole run
+WINDOW_COVERAGE = 2.3813953488372093  # Increase => total work: about flat; end-to-end time: usually up from more window refreshes; quality: usually up because training touches more images.
+GPU_FEATURE_CACHE_IMAGES = 8  # Increase => total work: unchanged; end-to-end time: can go down or up depending on cache-hit gains vs VRAM pressure; quality: unchanged.
+
+TRAIN_SCHEDULE = derive_train_schedule(
+    num_images_total=NUM_IMAGES_TOTAL,
+    train_split_fraction=TRAIN_SPLIT_FRACTION,
+    train_image_wh=TRAIN_IMAGE_WH,
+    train_num_rays_per_batch=TRAIN_NUM_RAYS_PER_BATCH,
+    train_num_images_to_sample_from=TRAIN_NUM_IMAGES_TO_SAMPLE_FROM,
+    pixel_visitation=PIXEL_VISITATION,
+    window_coverage=WINDOW_COVERAGE,
+)
 
 # TODO: Look at https://docs.nerf.studio/nerfology/methods/nerfacto.html, try bigger model for better scenes!
 # TODO: (maybe) revisit PCA implementation for feature visualization (previous speed tests were similar)
@@ -23,10 +46,10 @@ f3rm_method = MethodSpecification(
         logging=LoggingConfig(steps_per_log=200, local_writer=LocalWriterConfig(enable=False), profiler="none"),
         steps_per_eval_batch=0,
         steps_per_eval_image=0,
-        steps_per_eval_all_images=4392,  # Keep the only eval-all pass at the final step.
+        steps_per_eval_all_images=TRAIN_SCHEDULE.steps_per_eval_all_images,  # Keep the only eval-all pass at the final step.
         save_only_latest_checkpoint=True,
         steps_per_save=0,
-        max_num_iterations=4393,
+        max_num_iterations=TRAIN_SCHEDULE.max_num_iterations,
         mixed_precision=True,
         use_grad_scaler=True,
         pipeline=FeaturePipelineConfig(
@@ -36,13 +59,13 @@ f3rm_method = MethodSpecification(
                 images_on_gpu=True,
                 pin_cpu_feature_cache=False,
                 cpu_feature_cache_images=32,
-                gpu_feature_cache_images=8,
-                dataparser=NerfstudioDataParserConfig(train_split_fraction=0.95),
-                train_num_rays_per_batch=15_104,
-                train_num_images_to_sample_from=32,
-                train_num_times_to_repeat_images=275,
+                gpu_feature_cache_images=GPU_FEATURE_CACHE_IMAGES,
+                dataparser=NerfstudioDataParserConfig(train_split_fraction=TRAIN_SPLIT_FRACTION),
+                train_num_rays_per_batch=TRAIN_NUM_RAYS_PER_BATCH,
+                train_num_images_to_sample_from=TRAIN_NUM_IMAGES_TO_SAMPLE_FROM,
+                train_num_times_to_repeat_images=TRAIN_SCHEDULE.train_num_times_to_repeat_images,
                 eval_num_rays_per_batch=1 << 12,
-                eval_num_images_to_sample_from=32,
+                eval_num_images_to_sample_from=TRAIN_NUM_IMAGES_TO_SAMPLE_FROM,
                 eval_num_times_to_repeat_images=512,
             ),
             model=FeatureFieldModelConfig(
@@ -73,19 +96,27 @@ f3rm_method = MethodSpecification(
         optimizers={
             "proposal_networks": {
                 "optimizer": AdamOptimizerConfig(lr=1e-2, eps=1e-15, max_norm=1.0),
-                "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, warmup_steps=600, max_steps=4393),
+                "scheduler": ExponentialDecaySchedulerConfig(
+                    lr_final=1e-4, warmup_steps=600, max_steps=TRAIN_SCHEDULE.max_num_iterations
+                ),
             },
             "fields": {
                 "optimizer": AdamOptimizerConfig(lr=1e-2, eps=1e-15, max_norm=1.0),
-                "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, warmup_steps=600, max_steps=4393),
+                "scheduler": ExponentialDecaySchedulerConfig(
+                    lr_final=1e-4, warmup_steps=600, max_steps=TRAIN_SCHEDULE.max_num_iterations
+                ),
             },
             "feature_field": {
                 "optimizer": AdamOptimizerConfig(lr=5e-2, eps=1e-15, max_norm=1.0),
-                "scheduler": ExponentialDecaySchedulerConfig(lr_final=5e-3, warmup_steps=600, max_steps=4393),
+                "scheduler": ExponentialDecaySchedulerConfig(
+                    lr_final=5e-3, warmup_steps=600, max_steps=TRAIN_SCHEDULE.max_num_iterations
+                ),
             },
             "camera_opt": {
                 "optimizer": AdamOptimizerConfig(lr=1e-4, eps=1e-8, weight_decay=0.0, max_norm=0.5),
-                "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-5, warmup_steps=1800, max_steps=4393),
+                "scheduler": ExponentialDecaySchedulerConfig(
+                    lr_final=1e-5, warmup_steps=1800, max_steps=TRAIN_SCHEDULE.max_num_iterations
+                ),
             },
         },
         viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
