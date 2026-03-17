@@ -66,7 +66,7 @@ f3rm_method = MethodSpecification(
                 foreground_hidden_dim=64,
                 foreground_num_layers=2,
             ),
-            steps_per_train_image_viz=3800,
+            steps_per_train_image_viz=0,
         ),
         optimizers={
             "proposal_networks": {
