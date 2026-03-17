@@ -43,6 +43,7 @@ class FeatureFieldModelConfig(NerfactoModelConfig):
     feat_features_per_level: int = 8
     feat_hidden_dim: int = 64
     feat_num_layers: int = 2
+    share_aux_encodings: bool = False
     foreground_loss_weight: float = 1e-3
     foreground_train_ray_ratio: float = 1.0
     foreground_hidden_dim: int = 64
@@ -156,6 +157,7 @@ class FeatureFieldModel(NerfactoModel):
             num_layers=self.config.feat_num_layers,
             foreground_hidden_dim=self.config.foreground_hidden_dim,
             foreground_num_layers=self.config.foreground_num_layers,
+            share_encoding=self.config.share_aux_encodings,
             implementation=self.config.implementation,
         )
 

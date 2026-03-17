@@ -32,13 +32,15 @@ class FeatureField(Field):
         num_layers: int = 2,
         foreground_hidden_dim: int = 64,
         foreground_num_layers: int = 1,
+        share_encoding: bool = False,
         implementation: Literal["tcnn", "torch"] = "tcnn",
     ):
         super().__init__()
         self.feature_dim = feature_dim
         self.spatial_distortion = spatial_distortion
+        self.share_encoding = share_encoding
 
-        self.feature_hash_encoding = HashEncoding(
+        feature_hash_encoding = HashEncoding(
             num_levels=num_levels,
             min_res=start_res,
             max_res=max_res,
@@ -46,9 +48,9 @@ class FeatureField(Field):
             features_per_level=features_per_level,
             implementation=implementation,
         )
-        self.feature_pe_encoding: Optional[NeRFEncoding] = None
+        feature_pe_encoding: Optional[NeRFEncoding] = None
         if use_pe:
-            self.feature_pe_encoding = NeRFEncoding(
+            feature_pe_encoding = NeRFEncoding(
                 in_dim=3,
                 num_frequencies=pe_n_freq,
                 min_freq_exp=0,
@@ -56,30 +58,40 @@ class FeatureField(Field):
                 implementation=implementation,
             )
 
-        feature_enc_out_dim = self.feature_hash_encoding.get_out_dim()
-        if self.feature_pe_encoding is not None:
-            feature_enc_out_dim += self.feature_pe_encoding.get_out_dim()
+        feature_enc_out_dim = feature_hash_encoding.get_out_dim()
+        if feature_pe_encoding is not None:
+            feature_enc_out_dim += feature_pe_encoding.get_out_dim()
 
-        self.foreground_hash_encoding = HashEncoding(
-            num_levels=num_levels,
-            min_res=start_res,
-            max_res=max_res,
-            log2_hashmap_size=log2_hashmap_size,
-            features_per_level=features_per_level,
-            implementation=implementation,
-        )
-        self.foreground_pe_encoding: Optional[NeRFEncoding] = None
-        if use_pe:
-            self.foreground_pe_encoding = NeRFEncoding(
-                in_dim=3,
-                num_frequencies=pe_n_freq,
-                min_freq_exp=0,
-                max_freq_exp=pe_n_freq - 1,
+        if share_encoding:
+            foreground_hash_encoding = feature_hash_encoding
+            foreground_pe_encoding = feature_pe_encoding
+            foreground_enc_out_dim = feature_enc_out_dim
+        else:
+            foreground_hash_encoding = HashEncoding(
+                num_levels=num_levels,
+                min_res=start_res,
+                max_res=max_res,
+                log2_hashmap_size=log2_hashmap_size,
+                features_per_level=features_per_level,
                 implementation=implementation,
             )
-        foreground_enc_out_dim = self.foreground_hash_encoding.get_out_dim()
-        if self.foreground_pe_encoding is not None:
-            foreground_enc_out_dim += self.foreground_pe_encoding.get_out_dim()
+            foreground_pe_encoding = None
+            if use_pe:
+                foreground_pe_encoding = NeRFEncoding(
+                    in_dim=3,
+                    num_frequencies=pe_n_freq,
+                    min_freq_exp=0,
+                    max_freq_exp=pe_n_freq - 1,
+                    implementation=implementation,
+                )
+            foreground_enc_out_dim = foreground_hash_encoding.get_out_dim()
+            if foreground_pe_encoding is not None:
+                foreground_enc_out_dim += foreground_pe_encoding.get_out_dim()
+
+        self.feature_hash_encoding = feature_hash_encoding
+        self.feature_pe_encoding = feature_pe_encoding
+        self.foreground_hash_encoding = foreground_hash_encoding
+        self.foreground_pe_encoding = foreground_pe_encoding
 
         self.mlp_feature = MLP(
             in_dim=feature_enc_out_dim,
