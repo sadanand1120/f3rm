@@ -36,7 +36,7 @@ f3rm_method = MethodSpecification(
                 images_on_gpu=True,
                 pin_cpu_feature_cache=False,
                 cpu_feature_cache_images=32,
-                gpu_feature_cache_images=0,
+                gpu_feature_cache_images=8,
                 dataparser=NerfstudioDataParserConfig(train_split_fraction=0.95),
                 train_num_rays_per_batch=13_824,
                 train_num_images_to_sample_from=32,
