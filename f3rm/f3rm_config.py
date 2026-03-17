@@ -15,7 +15,7 @@ from nerfstudio.plugins.types import MethodSpecification
 NUM_IMAGES_TOTAL = 226  # Increase => total work: up; end-to-end time: up; quality: usually up because training covers more images.
 TRAIN_SPLIT_FRACTION = 0.95  # Increase => total work: up; end-to-end time: up; quality: usually up because more images move into train.
 TRAIN_IMAGE_WH = (1050, 1904)  # Increase => total work: up; end-to-end time: up; quality: usually up because each train image has more pixels to visit.
-TRAIN_NUM_RAYS_PER_BATCH = 15_104  # Increase => total work: about flat; end-to-end time: usually down until GPU saturation, then can go up; quality: often near-flat, but too high can hurt.
+TRAIN_NUM_RAYS_PER_BATCH = 1 << 16  # Increase => total work: about flat; end-to-end time: usually down until GPU saturation, then can go up; quality: often near-flat, but too high can hurt.
 TRAIN_NUM_IMAGES_TO_SAMPLE_FROM = 32  # Increase => total work: about flat; end-to-end time: usually up from wider window/cache churn; quality: usually up because each refresh sees more images.
 # num times a pixel gets trained on through whole run
 PIXEL_VISITATION = 0.15436842644034357  # Increase => total work: up directly; end-to-end time: up directly; quality: usually up because pixels are revisited more.
@@ -43,7 +43,7 @@ TRAIN_SCHEDULE = derive_train_schedule(
 f3rm_method = MethodSpecification(
     config=F3RMTrainerConfig(
         method_name="f3rm",
-        logging=LoggingConfig(steps_per_log=200, local_writer=LocalWriterConfig(enable=False), profiler="none"),
+        logging=LoggingConfig(steps_per_log=10, local_writer=LocalWriterConfig(enable=True), profiler="none"),
         steps_per_eval_batch=0,
         steps_per_eval_image=0,
         steps_per_eval_all_images=TRAIN_SCHEDULE.steps_per_eval_all_images,  # Keep the only eval-all pass at the final step.
