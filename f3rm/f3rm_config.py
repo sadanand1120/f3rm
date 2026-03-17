@@ -20,7 +20,7 @@ from nerfstudio.plugins.types import MethodSpecification
 f3rm_method = MethodSpecification(
     config=F3RMTrainerConfig(
         method_name="f3rm",
-        logging=LoggingConfig(steps_per_log=50, profiler="none"),
+        logging=LoggingConfig(steps_per_log=100, profiler="none"),
         steps_per_eval_batch=0,
         steps_per_eval_image=0,
         steps_per_eval_all_images=4799,  # Only the final eval-all pass is needed for the benchmark summary.
