@@ -107,7 +107,14 @@ class AsyncMultiWrapper:
             else:
                 resolved_devices = resolved_devices[:num_objects]
 
-        self._workers = [worker_cls(device=device, **worker_kwargs) for device in resolved_devices]
+        def _build_worker(device: Union[str, torch.device]) -> Any:
+            return worker_cls(device=device, **worker_kwargs)
+
+        if num_objects == 1:
+            self._workers = [_build_worker(resolved_devices[0])]
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=num_objects) as ex:
+                self._workers = list(ex.map(_build_worker, resolved_devices))
         self._rr_index = 0
 
     @property
