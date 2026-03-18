@@ -63,6 +63,7 @@ from nerfstudio.engine.trainer import Trainer, TrainerConfig
 from nerfstudio.utils.misc import step_check
 from nerfstudio.utils import profiler, writer
 from nerfstudio.utils.rich_utils import CONSOLE
+from f3rm.timing import flush_final_timings
 
 
 FINAL_METRIC_METADATA_KEYS = {"image_idx", "num_rays"}
@@ -299,5 +300,6 @@ class F3RMTrainer(Trainer):
     def _after_train(self) -> None:
         metric_groups = self._get_final_metric_groups()
         self._queue_final_metrics(metric_groups)
+        flush_final_timings(step=self.step)
         super()._after_train()
         self._print_final_metrics(metric_groups)

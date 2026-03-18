@@ -9,6 +9,7 @@ batch loading during training.
 import gc
 import math
 from pathlib import Path
+from time import perf_counter
 from typing import Any, List
 
 import numpy as np
@@ -17,6 +18,10 @@ from nerfstudio.utils.rich_utils import CONSOLE
 
 from f3rm.features.clip_extract import CLIPArgs, CLIPExtractor, examine_saved
 from f3rm.features.utils import BatchFeatureLoader, get_cache_paths
+
+
+def _emit_timing(name: str, duration: float) -> None:
+    CONSOLE.print(f"[F3RM_TIMING] {name}={duration:.6f}")
 
 
 def _current_feature_args_id(feature_type: str) -> dict[str, Any]:
@@ -62,16 +67,22 @@ def _save_per_image_clip(
     extractor = CLIPExtractor(device=device, verbose=True)
     n_imgs = len(image_fnames)
     n_batches = math.ceil(n_imgs / batch_size)
+    batch_compute_s = 0.0
+    image_write_s = 0.0
 
     for i in tqdm(range(n_batches), desc="CLIP: extracting", position=0):
         s, e = i * batch_size, min((i + 1) * batch_size, n_imgs)
         batch_paths = image_fnames[s:e]
+        batch_start = perf_counter()
         data = extractor.extract_batch(batch_paths)
+        batch_compute_s += perf_counter() - batch_start
 
+        write_start = perf_counter()
         for j in range(len(batch_paths)):
             img_idx = s + j
             img_data = data[j].cpu().half()
             np.save(root / f"image_{img_idx:06d}.npy", img_data.numpy(), allow_pickle=False)
+        image_write_s += perf_counter() - write_start
 
         del data
         if torch.cuda.is_available() and ((i + 1) % 10 == 0 or i == n_batches - 1):
@@ -79,6 +90,7 @@ def _save_per_image_clip(
             gc.collect()
 
     normalized_image_fnames = [_normalize_image_path_for_cache(str(fname), data_dir) for fname in image_fnames]
+    meta_start = perf_counter()
     torch.save(
         {
             "args": CLIPArgs.id_dict(),
@@ -87,6 +99,9 @@ def _save_per_image_clip(
         },
         meta,
     )
+    _emit_timing("extract.batch_compute_s", batch_compute_s)
+    _emit_timing("extract.per_image_write_s", image_write_s)
+    _emit_timing("extract.meta_write_s", perf_counter() - meta_start)
     CONSOLE.print(f"Saved CLIP per-image features -> {root}")
 
 
@@ -191,11 +206,14 @@ def extract_features_for_dataset(
 
     CONSOLE.print(f"[DEBUG] {feature_type}: enable_cache={enable_cache}, checking for cached features...")
     current_args = _current_feature_args_id(feature_type)
+    cache_check_start = perf_counter()
     cache_hit = feature_loader(image_fnames, current_args, data_dir, feature_type) if enable_cache and not force else False
+    _emit_timing("extract.cache_check_s", perf_counter() - cache_check_start)
 
     if cache_hit:
         CONSOLE.print(f"[{feature_type}] Using cached features")
-        return BatchFeatureLoader(
+        loader_start = perf_counter()
+        loader = BatchFeatureLoader(
             data_dir,
             feature_type,
             image_fnames,
@@ -204,16 +222,21 @@ def extract_features_for_dataset(
             max_gpu_images=max_gpu_images,
             pin_cpu_tensors=pin_cpu_tensors,
         )
+        _emit_timing("extract.loader_init_s", perf_counter() - loader_start)
+        return loader
 
     CONSOLE.print(f"[{feature_type}] Extracting features...")
+    extract_start = perf_counter()
     _save_per_image_clip(
         image_fnames=image_fnames,
         data_dir=data_dir,
         device=device,
         batch_size=batch_size,
     )
+    _emit_timing("extract.cache_build_s", perf_counter() - extract_start)
 
-    return BatchFeatureLoader(
+    loader_start = perf_counter()
+    loader = BatchFeatureLoader(
         data_dir,
         feature_type,
         image_fnames,
@@ -222,6 +245,8 @@ def extract_features_for_dataset(
         max_gpu_images=max_gpu_images,
         pin_cpu_tensors=pin_cpu_tensors,
     )
+    _emit_timing("extract.loader_init_s", perf_counter() - loader_start)
+    return loader
 
 
 def extract_features_standalone(
@@ -240,8 +265,11 @@ def extract_features_standalone(
         device = torch.device(device)
 
     CONSOLE.print(f"Using device: {device}")
+    dataparser_start = perf_counter()
     image_fnames = get_image_filenames_from_dataparser(data_dir)
+    _emit_timing("extract.dataparser_scan_s", perf_counter() - dataparser_start)
 
+    pipeline_start = perf_counter()
     batch_loader = extract_features_for_dataset(
         image_fnames=image_fnames,
         data_dir=data_dir,
@@ -251,6 +279,7 @@ def extract_features_standalone(
         enable_cache=True,
         force=force,
     )
+    _emit_timing("extract.total_pipeline_s", perf_counter() - pipeline_start)
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -295,6 +324,11 @@ def main():
         action="store_true",
         help="Force re-extraction even if cache exists",
     )
+    parser.add_argument(
+        "--skip-visualization",
+        action="store_true",
+        help="Skip PCA video generation. Useful for pure extraction/training benchmarks.",
+    )
 
     args = parser.parse_args()
 
@@ -315,8 +349,11 @@ def main():
         force=args.force,
     )
 
-    CONSOLE.print("Creating visualization video...")
-    create_feature_visualization(args.data, args.feature_type)
+    if not args.skip_visualization:
+        CONSOLE.print("Creating visualization video...")
+        viz_start = perf_counter()
+        create_feature_visualization(args.data, args.feature_type)
+        _emit_timing("extract.visualization_s", perf_counter() - viz_start)
 
 
 if __name__ == "__main__":

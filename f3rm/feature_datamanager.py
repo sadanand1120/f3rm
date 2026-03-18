@@ -175,28 +175,6 @@ class FeatureDataManager(VanillaDataManager):
         image = image_batch["image"]
         return image.data_ptr() if torch.is_tensor(image) else id(image)
 
-    def _get_window_cache(self, image_batch: Dict, is_eval: bool) -> Tuple[torch.Tensor, torch.Tensor]:
-        cache = self._eval_window_cache if is_eval else self._train_window_cache
-        token = self._window_token(image_batch)
-        if cache.get("token") == token:
-            return cache["feature"], cache["lookup"]  # type: ignore[return-value]
-
-        image_ids = image_batch["image_idx"]
-        loader_ids = image_ids + self.eval_offset if is_eval else image_ids
-        feature_dict = self.feature_loader.load_batch_images(loader_ids)
-        ordered_loader_ids = loader_ids.tolist()
-        feature_window = torch.stack([feature_dict[int(idx)] for idx in ordered_loader_ids], dim=0)
-
-        lookup_size = len(self.eval_dataset) if is_eval else len(self.train_dataset)
-        lookup = torch.full((lookup_size,), -1, dtype=torch.long, device=image_ids.device)
-        lookup[image_ids] = torch.arange(len(ordered_loader_ids), dtype=torch.long, device=image_ids.device)
-
-        cache.clear()
-        cache["token"] = token
-        cache["feature"] = feature_window
-        cache["lookup"] = lookup
-        return feature_window, lookup
-
     @staticmethod
     def _gather_from_window(
         window: torch.Tensor, lookup: torch.Tensor, camera_idx: torch.Tensor, y_idx: torch.Tensor, x_idx: torch.Tensor
@@ -219,7 +197,37 @@ class FeatureDataManager(VanillaDataManager):
         camera_idx, y_feat, x_feat = self._index_triplet(batch, self.feat_scale_h, self.feat_scale_w)
 
         load_start = perf_counter()
-        feature_window, lookup = self._get_window_cache(image_batch, is_eval)
+        cache = self._eval_window_cache if is_eval else self._train_window_cache
+        token = self._window_token(image_batch)
+        if cache.get("token") == token:
+            feature_window, lookup = cache["feature"], cache["lookup"]  # type: ignore[assignment]
+            self._put_timing(f"Timing/{prefix}/feature_cache_hit", 1.0, step)
+            self._put_timing(f"Timing/{prefix}/feature_cache_miss", 0.0, step)
+        else:
+            image_ids = image_batch["image_idx"]
+            loader_ids = image_ids + self.eval_offset if is_eval else image_ids
+
+            fetch_start = perf_counter()
+            feature_dict = self.feature_loader.load_batch_images(loader_ids)
+            self._put_timing(f"Timing/{prefix}/feature_window_fetch", perf_counter() - fetch_start, step)
+
+            stack_start = perf_counter()
+            ordered_loader_ids = loader_ids.tolist()
+            feature_window = torch.stack([feature_dict[int(idx)] for idx in ordered_loader_ids], dim=0)
+            self._put_timing(f"Timing/{prefix}/feature_window_stack", perf_counter() - stack_start, step)
+
+            lookup_start = perf_counter()
+            lookup_size = len(self.eval_dataset) if is_eval else len(self.train_dataset)
+            lookup = torch.full((lookup_size,), -1, dtype=torch.long, device=image_ids.device)
+            lookup[image_ids] = torch.arange(len(ordered_loader_ids), dtype=torch.long, device=image_ids.device)
+            self._put_timing(f"Timing/{prefix}/feature_lookup_build", perf_counter() - lookup_start, step)
+
+            cache.clear()
+            cache["token"] = token
+            cache["feature"] = feature_window
+            cache["lookup"] = lookup
+            self._put_timing(f"Timing/{prefix}/feature_cache_hit", 0.0, step)
+            self._put_timing(f"Timing/{prefix}/feature_cache_miss", 1.0, step)
         self._put_timing(f"Timing/{prefix}/feature_cache_load", perf_counter() - load_start, step)
 
         gather_start = perf_counter()

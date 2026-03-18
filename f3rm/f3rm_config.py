@@ -8,20 +8,18 @@ from f3rm.feature_datamanager import FeatureDataManagerConfig
 from f3rm.model import FeatureFieldModelConfig
 from f3rm.trainer import F3RMTrainerConfig
 from f3rm.pipeline import FeaturePipelineConfig
-from f3rm.train_schedule import derive_train_schedule
+from f3rm.train_schedule import derive_train_schedule, env_float, env_int, env_int_tuple
 from nerfstudio.plugins.types import MethodSpecification
 
 # Transfer these knobs to another dataset and keep the same schedule density.
-NUM_IMAGES_TOTAL = 159  # Increase => total work: up; end-to-end time: up; quality: usually up because training covers more images.
-TRAIN_SPLIT_FRACTION = 0.95  # Increase => total work: up; end-to-end time: up; quality: usually up because more images move into train.
-TRAIN_IMAGE_WH = (1050, 1904)  # Increase => total work: up; end-to-end time: up; quality: usually up because each train image has more pixels to visit.
-TRAIN_NUM_RAYS_PER_BATCH = 1 << 16  # Increase => total work: about flat; end-to-end time: usually down until GPU saturation, then can go up; quality: often near-flat, but too high can hurt.
-TRAIN_NUM_IMAGES_TO_SAMPLE_FROM = 32  # Increase => total work: about flat; end-to-end time: usually up from wider window/cache churn; quality: usually up because each refresh sees more images.
-# num times a pixel gets trained on through whole run
-PIXEL_VISITATION = 0.4  # Increase => total work: up directly; end-to-end time: up directly; quality: usually up because pixels are revisited more.
-# num times an image gets chosen in the batch through whole run
-WINDOW_COVERAGE = 2.0  # Increase => total work: about flat; end-to-end time: usually up from more window refreshes; quality: usually up because training touches more images.
-GPU_FEATURE_CACHE_IMAGES = 8  # Increase => total work: unchanged; end-to-end time: can go down or up depending on cache-hit gains vs VRAM pressure; quality: unchanged.
+NUM_IMAGES_TOTAL = env_int("F3RM_NUM_IMAGES_TOTAL", 159)  # Increase => total work: up; end-to-end time: up; quality: usually up because training covers more images.
+TRAIN_SPLIT_FRACTION = env_float("F3RM_TRAIN_SPLIT_FRACTION", 0.95)  # Increase => total work: up; end-to-end time: up; quality: usually up because more images move into train.
+TRAIN_IMAGE_WH = env_int_tuple("F3RM_TRAIN_IMAGE_WH", (1050, 1904))  # Increase => total work: up; end-to-end time: up; quality: usually up because each train image has more pixels to visit.
+TRAIN_NUM_RAYS_PER_BATCH = env_int("F3RM_TRAIN_NUM_RAYS_PER_BATCH", 1 << 16)  # Increase => total work: about flat; end-to-end time: usually down until GPU saturation, then can go up; quality: often near-flat, but too high can hurt.
+TRAIN_NUM_IMAGES_TO_SAMPLE_FROM = env_int("F3RM_TRAIN_NUM_IMAGES_TO_SAMPLE_FROM", 32)  # Increase => total work: about flat; end-to-end time: usually up from wider window/cache churn; quality: usually up because each refresh sees more images.
+PIXEL_VISITATION = env_float("F3RM_PIXEL_VISITATION", 0.4)  # Increase => total work: up directly; end-to-end time: up directly; quality: usually up because pixels are revisited more.
+WINDOW_COVERAGE = env_float("F3RM_WINDOW_COVERAGE", 2.0)  # Increase => total work: about flat; end-to-end time: usually up from more window refreshes; quality: usually up because training touches more images.
+GPU_FEATURE_CACHE_IMAGES = env_int("F3RM_GPU_FEATURE_CACHE_IMAGES", 8)  # Increase => total work: unchanged; end-to-end time: can go down or up depending on cache-hit gains vs VRAM pressure; quality: unchanged.
 
 TRAIN_SCHEDULE = derive_train_schedule(
     num_images_total=NUM_IMAGES_TOTAL,

@@ -1,4 +1,5 @@
 import math
+import os
 from dataclasses import dataclass
 
 
@@ -9,6 +10,19 @@ class DerivedTrainSchedule:
     max_num_iterations: int
     steps_per_eval_all_images: int
     train_num_times_to_repeat_images: int
+
+
+def env_int(name: str, default: int) -> int:
+    return int(os.getenv(name, default))
+
+
+def env_float(name: str, default: float) -> float:
+    return float(os.getenv(name, default))
+
+
+def env_int_tuple(name: str, default: tuple[int, int]) -> tuple[int, int]:
+    value = os.getenv(name)
+    return default if value is None else tuple(int(part.strip()) for part in value.split(",", maxsplit=1))
 
 
 def derive_train_schedule(

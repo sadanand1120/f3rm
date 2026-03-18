@@ -7,6 +7,8 @@ _ORIGINAL_PUT_TIME = getattr(writer, "_f3rm_original_put_time", writer.put_time)
 writer._f3rm_original_put_time = _ORIGINAL_PUT_TIME
 _TIMING_BUFFERS: dict[str, deque[float]] = {}
 _WRITER_TIME_BUFFERS: dict[str, deque[float]] = {}
+_TIMING_TOTALS: dict[str, float] = {}
+_TIMING_COUNTS: dict[str, int] = {}
 
 
 def _get_buffer(buffers: dict[str, deque[float]], name: str) -> deque[float]:
@@ -68,8 +70,26 @@ writer.put_time = _throttled_writer_put_time
 
 def put_timing(name: str, duration: float, step: int, avg_over_steps: bool = True) -> None:
     """Log custom timing scalars without writing every per-step sample to event storage."""
+    _TIMING_TOTALS[name] = _TIMING_TOTALS.get(name, 0.0) + duration
+    _TIMING_COUNTS[name] = _TIMING_COUNTS.get(name, 0) + 1
     if not avg_over_steps:
         writer.put_time(name=name, duration=duration, step=step, avg_over_steps=False)
         return
 
     _put_average_scalar(name=name, value=duration, step=step, buffers=_TIMING_BUFFERS)
+
+
+def flush_final_timings(step: int) -> None:
+    """Write full-run timing aggregates once near the end of training."""
+    for name in sorted(_TIMING_TOTALS):
+        total = _TIMING_TOTALS[name]
+        count = _TIMING_COUNTS[name]
+        if count <= 0:
+            continue
+        base_name = name.removeprefix("Timing/")
+        writer.put_scalar(name=f"Final Timing/{base_name}/avg_s", scalar=total / count, step=step)
+        writer.put_scalar(name=f"Final Timing/{base_name}/total_s", scalar=total, step=step)
+        writer.put_scalar(name=f"Final Timing/{base_name}/count", scalar=count, step=step)
+
+    _TIMING_TOTALS.clear()
+    _TIMING_COUNTS.clear()

@@ -1,0 +1,11 @@
+# Active Hypotheses
+
+- 2026-03-18: Replace wave-based CLIP scheduling with dynamic worker dispatch. `CLIPExtractor._extract_batch_async()` currently submits exactly `num_workers` tasks at a time, waits for the whole wave, then launches the next one. In a smoke extraction probe on `poster_smoke`, both GPUs were active together, but there were still multi-second stretches where one GPU sat at `0%` while the other kept working.
+- 2026-03-18: Parallelize CLIP worker initialization and warmup. `AsyncMultiWrapper` constructs `_CLIPWorker` instances sequentially, and `CLIPExtractor` warms them one-by-one in round-robin order. The same smoke probe showed a long front-loaded startup where memory ramped onto GPU 1 first and GPU 2 later before real extraction started.
+- 2026-03-18: Make extraction accessory work optional in the benchmark path. The standalone extractor always rendered `features_viz.mp4` after cache creation. On the smoke probe this added roughly another 18 seconds after feature extraction had already completed, and it is not part of the true training workload.
+- 2026-03-18: Reduce feature-window assembly overhead during training. `FeatureDataManager` currently asks `BatchFeatureLoader` for a dict of tensors, then stacks them into a new window tensor and rebuilds a lookup tensor on cache misses. The new timing splits should show whether `feature_window_fetch`, `feature_window_stack`, or `feature_lookup_build` is the real culprit.
+- 2026-03-18: Batch or overlap H2D feature transfers more aggressively. `BatchFeatureLoader` moves images one-by-one through `_get_gpu_tensor()`, which can leave transfer and lookup overhead exposed whenever the image window refreshes.
+- 2026-03-18: Revisit extraction worker count vs. GPU residency. With `CUDA_VISIBLE_DEVICES=1,2`, the current resolver creates `num_gpus * CLIPArgs.batch_size_per_gpu` workers, which means multiple full OpenCLIP copies per GPU. This may help throughput, but it also creates heavy startup and VRAM pressure that could be slower than fewer workers plus better scheduling.
+- 2026-03-18: Keep looking for startup-only lazy imports. The trainer already stubs viewer imports in non-viewer modes, but there may still be low-value import or setup work in extraction and startup paths that can move behind actual usage.
+
+# Out Of Scope Issues For Human

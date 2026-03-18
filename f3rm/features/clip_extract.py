@@ -3,6 +3,7 @@ import gc
 import glob
 import os
 from pathlib import Path
+from time import perf_counter
 from typing import List, Optional, Sequence, Union
 
 import cv2
@@ -20,6 +21,11 @@ from f3rm.features.utils import AsyncMultiWrapper, apply_pca_colormap, resolve_d
 
 CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
 CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
+
+
+def _emit_timing(name: str, duration: float, enabled: bool) -> None:
+    if enabled:
+        print(f"[F3RM_TIMING] {name}={duration:.6f}")
 
 
 class CLIPArgs:
@@ -328,6 +334,8 @@ class CLIPExtractor:
         devices_param, num_workers = resolve_devices_and_workers(device, CLIPArgs.batch_size_per_gpu)
         if verbose:
             print("Initializing CLIP workers")
+            print(f"[F3RM_INFO] extract.num_workers={num_workers}")
+        init_start = perf_counter()
         self.client = AsyncMultiWrapper(
             _CLIPWorker,
             num_objects=num_workers,
@@ -336,8 +344,10 @@ class CLIPExtractor:
             pretrained=CLIPArgs.model_pretrained,
         )
         self.num_workers = num_workers
+        _emit_timing("extract.worker_init_s", perf_counter() - init_start, verbose)
         if verbose:
             print("Warming up CLIP workers...")
+        warmup_start = perf_counter()
         tiny = Image.new("RGB", (8, 8), color=0)
         for _ in range(self.num_workers):
             _ = self.client.extract_agg(
@@ -349,6 +359,7 @@ class CLIPExtractor:
                 interpolation_mode="bilinear",
                 padding_mode="constant",
             )
+        _emit_timing("extract.worker_warmup_s", perf_counter() - warmup_start, verbose)
 
     async def _extract_batch_async(self, image_paths: List[str]) -> torch.Tensor:
         batches = []
