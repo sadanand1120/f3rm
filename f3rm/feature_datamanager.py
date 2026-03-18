@@ -166,6 +166,9 @@ class FeatureDataManager(VanillaDataManager):
 
         self._train_window_cache: Dict[str, torch.Tensor | int] = {}
         self._eval_window_cache: Dict[str, torch.Tensor | int] = {}
+        self._train_feature_prefetch_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self._train_feature_prefetch_future: concurrent.futures.Future | None = None
+        self._train_feature_prefetch_source_id: int | None = None
 
         torch.cuda.empty_cache()
         gc.collect()
@@ -191,6 +194,55 @@ class FeatureDataManager(VanillaDataManager):
         x_idx = (ray_indices[:, 2] * scale_w).long()
         return camera_idx, y_idx, x_idx
 
+    def _resolve_loader_ids(self, image_batch: Dict, is_eval: bool) -> Tuple[torch.Tensor, torch.Tensor]:
+        image_ids = image_batch["image_idx"]
+        loader_ids = image_ids + self.eval_offset if is_eval else image_ids
+        return image_ids, loader_ids
+
+    @staticmethod
+    def _stack_feature_window(feature_dict: Dict[int, torch.Tensor], loader_ids: torch.Tensor) -> torch.Tensor:
+        ordered_loader_ids = loader_ids.tolist()
+        return torch.stack([feature_dict[int(idx)] for idx in ordered_loader_ids], dim=0)
+
+    def _build_feature_lookup(self, image_ids: torch.Tensor, is_eval: bool) -> torch.Tensor:
+        lookup_size = len(self.eval_dataset) if is_eval else len(self.train_dataset)
+        lookup = torch.full((lookup_size,), -1, dtype=torch.long, device=image_ids.device)
+        lookup[image_ids] = torch.arange(len(image_ids), dtype=torch.long, device=image_ids.device)
+        return lookup
+
+    def _prefetch_train_feature_dict(
+        self, source_future: concurrent.futures.Future
+    ) -> Tuple[int, torch.Tensor, torch.Tensor, Dict[int, torch.Tensor]]:
+        image_batch = source_future.result()
+        image_ids, loader_ids = self._resolve_loader_ids(image_batch, is_eval=False)
+        feature_dict = self.feature_loader.load_batch_images(loader_ids)
+        return self._window_token(image_batch), image_ids, loader_ids, feature_dict
+
+    def _consume_train_feature_prefetch(
+        self, image_batch: Dict
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[int, torch.Tensor]] | None:
+        future = self._train_feature_prefetch_future
+        if future is None:
+            return None
+        prefetched = future.result()
+        self._train_feature_prefetch_future = None
+        if prefetched[0] != self._window_token(image_batch):
+            return None
+        return prefetched[1], prefetched[2], prefetched[3]
+
+    def _arm_train_feature_prefetch(self) -> None:
+        source_future = getattr(self.train_image_dataloader, "_prefetch_future", None)
+        if source_future is None:
+            return
+        source_id = id(source_future)
+        if self._train_feature_prefetch_source_id == source_id:
+            return
+        self._train_feature_prefetch_source_id = source_id
+        self._train_feature_prefetch_future = self._train_feature_prefetch_executor.submit(
+            self._prefetch_train_feature_dict,
+            source_future,
+        )
+
     def _populate_batch_features(self, image_batch: Dict, batch: Dict, step: int, is_eval: bool) -> None:
         prefix = "Eval" if is_eval else "Train"
         populate_start = perf_counter()
@@ -204,22 +256,24 @@ class FeatureDataManager(VanillaDataManager):
             self._put_timing(f"Timing/{prefix}/feature_cache_hit", 1.0, step)
             self._put_timing(f"Timing/{prefix}/feature_cache_miss", 0.0, step)
         else:
-            image_ids = image_batch["image_idx"]
-            loader_ids = image_ids + self.eval_offset if is_eval else image_ids
-
-            fetch_start = perf_counter()
-            feature_dict = self.feature_loader.load_batch_images(loader_ids)
-            self._put_timing(f"Timing/{prefix}/feature_window_fetch", perf_counter() - fetch_start, step)
+            image_ids, loader_ids = self._resolve_loader_ids(image_batch, is_eval=is_eval)
+            prefetched = None if is_eval else self._consume_train_feature_prefetch(image_batch)
+            if prefetched is None:
+                fetch_start = perf_counter()
+                feature_dict = self.feature_loader.load_batch_images(loader_ids)
+                self._put_timing(f"Timing/{prefix}/feature_window_fetch", perf_counter() - fetch_start, step)
+            else:
+                image_ids, loader_ids, feature_dict = prefetched
+                if self.feature_loader._stream is not None:
+                    torch.cuda.current_stream().wait_stream(self.feature_loader._stream)
+                self._put_timing(f"Timing/{prefix}/feature_window_fetch", 0.0, step)
 
             stack_start = perf_counter()
-            ordered_loader_ids = loader_ids.tolist()
-            feature_window = torch.stack([feature_dict[int(idx)] for idx in ordered_loader_ids], dim=0)
+            feature_window = self._stack_feature_window(feature_dict, loader_ids)
             self._put_timing(f"Timing/{prefix}/feature_window_stack", perf_counter() - stack_start, step)
 
             lookup_start = perf_counter()
-            lookup_size = len(self.eval_dataset) if is_eval else len(self.train_dataset)
-            lookup = torch.full((lookup_size,), -1, dtype=torch.long, device=image_ids.device)
-            lookup[image_ids] = torch.arange(len(ordered_loader_ids), dtype=torch.long, device=image_ids.device)
+            lookup = self._build_feature_lookup(image_ids, is_eval=is_eval)
             self._put_timing(f"Timing/{prefix}/feature_lookup_build", perf_counter() - lookup_start, step)
 
             cache.clear()
@@ -255,6 +309,7 @@ class FeatureDataManager(VanillaDataManager):
         ray_bundle = self.train_ray_generator(batch["indices"])
         self._prepare_sampled_image(batch)
         self._populate_batch_features(image_batch, batch, step=step, is_eval=False)
+        self._arm_train_feature_prefetch()
         self._put_timing("Timing/Train/batch_load", perf_counter() - batch_start, step)
         return ray_bundle, batch
 
@@ -270,3 +325,11 @@ class FeatureDataManager(VanillaDataManager):
         self._populate_batch_features(image_batch, batch, step=step, is_eval=True)
         self._put_timing("Timing/Eval/batch_load", perf_counter() - batch_start, step)
         return ray_bundle, batch
+
+    def __del__(self):
+        executor = getattr(self, "_train_feature_prefetch_executor", None)
+        if executor is not None:
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
