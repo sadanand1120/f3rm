@@ -240,7 +240,7 @@ class BatchFeatureLoader:
             self._cpu_cache.popitem(last=False)
         return tensor
 
-    def _get_gpu_tensor(self, img_idx: int) -> torch.Tensor:
+    def _get_gpu_tensor(self, img_idx: int, wait_for_copy: bool = True) -> torch.Tensor:
         if img_idx in self._gpu_cache:
             tensor = self._gpu_cache.pop(img_idx)
             self._gpu_cache[img_idx] = tensor
@@ -249,7 +249,8 @@ class BatchFeatureLoader:
         if self._stream:
             with torch.cuda.stream(self._stream):
                 gpu_tensor = cpu_tensor.to(self.device, non_blocking=True)
-            torch.cuda.current_stream().wait_stream(self._stream)
+            if wait_for_copy:
+                torch.cuda.current_stream().wait_stream(self._stream)
         else:
             gpu_tensor = cpu_tensor.to(self.device, non_blocking=True)
         self._gpu_cache[img_idx] = gpu_tensor
@@ -261,7 +262,9 @@ class BatchFeatureLoader:
         batch_features: Dict[int, torch.Tensor] = {}
         for cam_idx in camera_indices.unique():
             cam_idx_int = int(cam_idx.item())
-            batch_features[cam_idx_int] = self._get_gpu_tensor(cam_idx_int)
+            batch_features[cam_idx_int] = self._get_gpu_tensor(cam_idx_int, wait_for_copy=False)
+        if self._stream:
+            torch.cuda.current_stream().wait_stream(self._stream)
         return batch_features
 
     def __getitem__(self, index: int) -> torch.Tensor:
