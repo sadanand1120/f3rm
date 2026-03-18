@@ -13,6 +13,7 @@
 - 2026-03-18: Revisit extraction worker count vs. GPU residency. With `CUDA_VISIBLE_DEVICES=6,7`, the current resolver still creates multiple full CLIP workers per GPU, and the official `measure` baseline peaked at `25334 MB` on extraction GPUs before any code changes.
 - 2026-03-18: Revisit CLIP startup now that training fetch improved. Even after `exp16`, `extract.worker_init_s=13.620226` is still materially larger than `extract.worker_warmup_s=0.237247`, so parallel worker construction is still the strongest clean extractor-side lever.
 - 2026-03-18: If startup is revisited, parallelize CLIP worker construction across devices but not within the same device. The naive full fan-out patch already failed on the 8-worker smoke path, but the current contract only needs two visible GPUs and four workers, so per-device scoped construction is still plausible.
+- 2026-03-18: Scoped per-device CLIP worker init is not a keep on this box. `exp23` tried one constructor thread per visible GPU on top of the `exp22` cache config, but `extract.worker_init_s` rose to `15.566122`, `extract_batch_compute_s` rose to `328.030005`, and `end_to_end_wall_s` regressed to `441.01442344195675`.
 - 2026-03-18: Keep looking for startup-only lazy imports or setup work around extraction and training startup. This is now lower priority than worker init, feature writes, and window fetches, but it is still plausible cleanup work if the primary bottlenecks flatten out.
 
 # Out Of Scope Issues For Human

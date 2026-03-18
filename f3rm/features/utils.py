@@ -107,24 +107,7 @@ class AsyncMultiWrapper:
             else:
                 resolved_devices = resolved_devices[:num_objects]
 
-        def _build_worker(device: Union[str, torch.device]) -> Any:
-            return worker_cls(device=device, **worker_kwargs)
-
-        indexed_devices: "OrderedDict[str, List[Tuple[int, Union[str, torch.device]]]]" = OrderedDict()
-        for idx, device in enumerate(resolved_devices):
-            indexed_devices.setdefault(str(device), []).append((idx, device))
-
-        if len(indexed_devices) <= 1:
-            self._workers = [_build_worker(device) for device in resolved_devices]
-        else:
-            def _build_group(group: List[Tuple[int, Union[str, torch.device]]]) -> List[Tuple[int, Any]]:
-                return [(idx, _build_worker(device)) for idx, device in group]
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=len(indexed_devices)) as ex:
-                built_groups = list(ex.map(_build_group, indexed_devices.values()))
-            indexed_workers = [item for group in built_groups for item in group]
-            indexed_workers.sort(key=lambda item: item[0])
-            self._workers = [worker for _, worker in indexed_workers]
+        self._workers = [worker_cls(device=device, **worker_kwargs) for device in resolved_devices]
         self._rr_index = 0
 
     @property
