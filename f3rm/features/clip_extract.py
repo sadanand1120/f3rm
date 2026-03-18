@@ -63,12 +63,15 @@ def _resolve_resized_hw(width: int, height: int, size: int) -> tuple[int, int]:
     return new_height, new_width
 
 
-def _load_rgb_tensor(image: Union[str, Path, Image.Image]) -> torch.Tensor:
+def _load_rgb_tensor(image: Union[str, Path, Image.Image, torch.Tensor]) -> torch.Tensor:
     if isinstance(image, (str, Path)):
         return read_image(str(image), mode=ImageReadMode.RGB).to(torch.float32).div_(255.0)
     if isinstance(image, Image.Image):
         array = np.array(image.convert("RGB"), dtype=np.float32, copy=True) / 255.0
         return torch.from_numpy(array).permute(2, 0, 1)
+    if torch.is_tensor(image):
+        tensor = image.to(torch.float32)
+        return tensor.div(255.0) if tensor.max().item() > 1.0 else tensor
     raise TypeError("image must be a path or PIL image")
 
 
@@ -83,7 +86,7 @@ def _pad_to_multiple_bchw(batch: torch.Tensor, patch_size: int, mode: str = "con
 
 
 def _preprocess_rgb(
-    image: Union[str, Path, Image.Image],
+    image: Union[str, Path, Image.Image, torch.Tensor],
     load_size: Optional[int],
     center_crop: bool,
     patch_size: int,
@@ -248,7 +251,7 @@ class _CLIPWorker(nn.Module):
 
     def _extract_single_scale(
         self,
-        image: Union[str, Path, Image.Image],
+        image: Union[str, Path, Image.Image, torch.Tensor],
         load_size: Optional[int],
         center_crop: bool,
         padding_mode: str,
@@ -265,7 +268,7 @@ class _CLIPWorker(nn.Module):
     @torch.inference_mode()
     def extract_agg(
         self,
-        image: Union[str, Path, Image.Image],
+        image: Union[str, Path, Image.Image, torch.Tensor],
         agg_scales: Optional[Sequence[float]] = None,
         agg_weights: Optional[Sequence[float]] = None,
         load_size: Optional[int] = 1024,
@@ -280,10 +283,11 @@ class _CLIPWorker(nn.Module):
         if agg_weights is not None and len(agg_weights) != len(scales):
             raise ValueError("agg_weights must match agg_scales length")
 
+        image_tensor = _load_rgb_tensor(image)
         weights = [float(weight) for weight in agg_weights] if agg_weights is not None else [1.0] * len(scales)
         ref_idx = scales.index(1.0)
         ref_patch = self._extract_single_scale(
-            image=image,
+            image=image_tensor,
             load_size=load_size,
             center_crop=center_crop,
             padding_mode=padding_mode,
@@ -305,7 +309,7 @@ class _CLIPWorker(nn.Module):
             if scaled_load_size <= 0:
                 continue
             patch_features = self._extract_single_scale(
-                image=image,
+                image=image_tensor,
                 load_size=scaled_load_size,
                 center_crop=center_crop,
                 padding_mode=padding_mode,

@@ -267,10 +267,6 @@ class BatchFeatureLoader:
             torch.cuda.current_stream().wait_stream(self._stream)
         return batch_features
 
-    def warm_batch_images(self, camera_indices: torch.Tensor) -> None:
-        for cam_idx in camera_indices.unique():
-            self._get_cpu_tensor(int(cam_idx.item()))
-
     def __getitem__(self, index: int) -> torch.Tensor:
         return self._get_gpu_tensor(index)
 
