@@ -4,7 +4,7 @@ import glob
 import os
 from pathlib import Path
 from time import perf_counter
-from typing import List, Optional, Sequence, Union
+from typing import Callable, List, Optional, Sequence, Union
 
 import cv2
 import matplotlib.pyplot as plt
@@ -272,6 +272,7 @@ class _CLIPWorker(nn.Module):
         center_crop: bool = False,
         interpolation_mode: str = "bilinear",
         padding_mode: str = "constant",
+        output_dtype: Optional[torch.dtype] = None,
     ) -> torch.Tensor:
         scales = list(agg_scales or [1.0])
         if 1.0 not in scales:
@@ -326,7 +327,10 @@ class _CLIPWorker(nn.Module):
 
         if weight_accum <= 0.0:
             raise ValueError("Sum of weights must be > 0")
-        return (agg_tensor / weight_accum).permute(1, 2, 0).contiguous().cpu()
+        result = (agg_tensor / weight_accum).permute(1, 2, 0).contiguous()
+        if output_dtype is not None:
+            result = result.to(dtype=output_dtype)
+        return result.cpu()
 
     async def extract_agg_async(self, **kwargs) -> torch.Tensor:
         loop = asyncio.get_running_loop()
@@ -366,7 +370,24 @@ class CLIPExtractor:
             )
         _emit_timing("extract.worker_warmup_s", perf_counter() - warmup_start, verbose)
 
-    async def _extract_batch_async(self, image_paths: List[str]) -> torch.Tensor:
+    @staticmethod
+    def _extract_one(worker: _CLIPWorker, image_path: str, output_dtype: Optional[torch.dtype]) -> torch.Tensor:
+        return worker.extract_agg(
+            image=image_path,
+            agg_scales=CLIPArgs.agg_scales,
+            agg_weights=CLIPArgs.agg_weights,
+            load_size=CLIPArgs.load_size,
+            center_crop=not CLIPArgs.skip_center_crop,
+            interpolation_mode="bilinear",
+            padding_mode="constant",
+            output_dtype=output_dtype,
+        )
+
+    async def _extract_batch_async(
+        self,
+        image_paths: List[str],
+        output_dtype: Optional[torch.dtype] = None,
+    ) -> torch.Tensor:
         if not image_paths:
             return torch.empty(0)
 
@@ -385,15 +406,7 @@ class CLIPExtractor:
 
                     result = await loop.run_in_executor(
                         None,
-                        lambda path=image_path, clip_worker=worker: clip_worker.extract_agg(
-                            image=path,
-                            agg_scales=CLIPArgs.agg_scales,
-                            agg_weights=CLIPArgs.agg_weights,
-                            load_size=CLIPArgs.load_size,
-                            center_crop=not CLIPArgs.skip_center_crop,
-                            interpolation_mode="bilinear",
-                            padding_mode="constant",
-                        ),
+                        lambda path=image_path, clip_worker=worker: self._extract_one(clip_worker, path, output_dtype),
                     )
                     results[image_idx] = result.cpu()
                     pbar.update(1)
@@ -403,8 +416,48 @@ class CLIPExtractor:
         gc.collect()
         return torch.stack([result for result in results if result is not None], dim=0)
 
-    def extract_batch(self, image_paths: List[str]) -> torch.Tensor:
-        return run_async_in_any_context(lambda: self._extract_batch_async(image_paths))
+    async def _stream_batch_async(
+        self,
+        image_paths: List[str],
+        on_result: Callable[[int, torch.Tensor], None],
+        output_dtype: Optional[torch.dtype] = None,
+    ) -> None:
+        if not image_paths:
+            return
+
+        loop = asyncio.get_running_loop()
+        workers = self.client.workers
+        queue = iter(enumerate(image_paths))
+
+        with tqdm(total=len(image_paths), desc="CLIP tasks", leave=False) as pbar:
+            async def _worker_loop_with_progress(worker: _CLIPWorker) -> None:
+                while True:
+                    try:
+                        image_idx, image_path = next(queue)
+                    except StopIteration:
+                        return
+
+                    result = await loop.run_in_executor(
+                        None,
+                        lambda path=image_path, clip_worker=worker: self._extract_one(clip_worker, path, output_dtype),
+                    )
+                    on_result(image_idx, result)
+                    pbar.update(1)
+
+            await asyncio.gather(*(_worker_loop_with_progress(worker) for worker in workers))
+
+        gc.collect()
+
+    def extract_batch(self, image_paths: List[str], output_dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+        return run_async_in_any_context(lambda: self._extract_batch_async(image_paths, output_dtype=output_dtype))
+
+    def stream_batch(
+        self,
+        image_paths: List[str],
+        on_result: Callable[[int, torch.Tensor], None],
+        output_dtype: Optional[torch.dtype] = None,
+    ) -> None:
+        run_async_in_any_context(lambda: self._stream_batch_async(image_paths, on_result, output_dtype=output_dtype))
 
 
 def examine_saved(clip_feat_dir: str):

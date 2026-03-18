@@ -80,29 +80,28 @@ def _save_per_image_clip(
     def _save_one_image(img_idx: int, img_tensor: torch.Tensor) -> None:
         np.save(root / f"image_{img_idx:06d}.npy", img_tensor.numpy(), allow_pickle=False)
 
-    for i in tqdm(range(n_batches), desc="CLIP: extracting", position=0):
-        s, e = i * batch_size, min((i + 1) * batch_size, n_imgs)
-        batch_paths = image_fnames[s:e]
-        batch_start = perf_counter()
-        data = extractor.extract_batch(batch_paths)
-        batch_compute_s += perf_counter() - batch_start
+    with concurrent.futures.ThreadPoolExecutor(max_workers=write_threads) as executor:
+        for i in tqdm(range(n_batches), desc="CLIP: extracting", position=0):
+            s, e = i * batch_size, min((i + 1) * batch_size, n_imgs)
+            batch_paths = image_fnames[s:e]
+            pending_writes = []
 
-        write_start = perf_counter()
-        image_payloads = [(s + j, data[j].cpu().half()) for j in range(len(batch_paths))]
-        if write_threads == 1:
-            for img_idx, img_data in image_payloads:
-                _save_one_image(img_idx, img_data)
-        else:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=write_threads) as executor:
-                futures = [executor.submit(_save_one_image, img_idx, img_data) for img_idx, img_data in image_payloads]
-                for future in futures:
-                    future.result()
-        image_write_s += perf_counter() - write_start
+            # Save each image as soon as its worker finishes to avoid staging a full CPU float32 batch.
+            def _submit_write(local_idx: int, img_tensor: torch.Tensor) -> None:
+                pending_writes.append(executor.submit(_save_one_image, s + local_idx, img_tensor))
 
-        del data
-        if torch.cuda.is_available() and ((i + 1) % 10 == 0 or i == n_batches - 1):
-            torch.cuda.empty_cache()
-            gc.collect()
+            batch_start = perf_counter()
+            extractor.stream_batch(batch_paths, on_result=_submit_write, output_dtype=torch.float16)
+            batch_compute_s += perf_counter() - batch_start
+
+            write_start = perf_counter()
+            for future in pending_writes:
+                future.result()
+            image_write_s += perf_counter() - write_start
+
+            if torch.cuda.is_available() and ((i + 1) % 10 == 0 or i == n_batches - 1):
+                torch.cuda.empty_cache()
+                gc.collect()
 
     normalized_image_fnames = [_normalize_image_path_for_cache(str(fname), data_dir) for fname in image_fnames]
     meta_start = perf_counter()
