@@ -15,8 +15,8 @@ Success criteria:
 
 Secondary constraints:
 - prioritize wins in extraction scheduling and feature loading before spending effort on the core trainer
-- extraction must run on GPUs `1,2` and show overlapping activity on both GPUs
-- training must run on GPU `1` only
+- extraction must run on GPUs `6,7` and show overlapping activity on both GPUs
+- training must run on GPU `6` only
 - no cheating with pre-existing feature caches: the benchmark deletes `features/clip` before extraction and again after the run
 - official `measure` runs should stay within roughly 2 hours on the provided hardware; `smoke` runs should stay comfortably under 20 minutes
 
@@ -142,7 +142,7 @@ commit	end_to_end_wall_s	extract_wall_s	train_wall_s	extract_worker_init_s	extra
 ```
 
 Field notes:
-- `extract_parallel_ok` is `1` for valid overlap on GPUs `1,2`, else `0`
+- `extract_parallel_ok` is `1` for valid overlap on GPUs `6,7`, else `0`
 - `peak_extract_gpu_mem_mb` is the higher of the monitored extraction GPUs
 - `peak_train_gpu_mem_mb` is the peak memory on the single training GPU
 - timing columns come from the benchmark summary and final timing scalars

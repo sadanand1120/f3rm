@@ -5,7 +5,7 @@
 - 2026-03-18: Reduce per-image feature write cost or change the cache layout. The official `measure` baseline spent `extract.per_image_write_s=90.624241`, which is too large to ignore relative to `extract.batch_compute_s=341.42798`.
 - 2026-03-18: Reduce training feature-window fetch cost instead of micro-optimizing stacking. On the official `measure` baseline, `train_feature_window_fetch_avg_s=0.6935027241706848` across 10 refreshes, while `train_feature_window_stack_avg_s=0.0015003500739112496` and `Train/feature_lookup_build/total_s=0.002903980202972889` were both tiny.
 - 2026-03-18: Batch or overlap H2D feature transfers more aggressively during window refreshes. `train_feature_cache_load_avg_s=0.0037606656551361084` and the large `feature_window_fetch` spikes still point at the cache refill path as the main training-side latency source.
-- 2026-03-18: Revisit extraction worker count vs. GPU residency. With `CUDA_VISIBLE_DEVICES=1,2`, the current resolver still creates multiple full CLIP workers per GPU, and the official `measure` baseline peaked at `25334 MB` on extraction GPUs before any code changes.
+- 2026-03-18: Revisit extraction worker count vs. GPU residency. With `CUDA_VISIBLE_DEVICES=6,7`, the current resolver still creates multiple full CLIP workers per GPU, and the official `measure` baseline peaked at `25334 MB` on extraction GPUs before any code changes.
 - 2026-03-18: Keep looking for startup-only lazy imports or setup work around extraction and training startup. This is now lower priority than worker init, feature writes, and window fetches, but it is still plausible cleanup work if the primary bottlenecks flatten out.
 
 # Out Of Scope Issues For Human
