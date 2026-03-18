@@ -210,25 +210,18 @@ class FeatureDataManager(VanillaDataManager):
         lookup[image_ids] = torch.arange(len(image_ids), dtype=torch.long, device=image_ids.device)
         return lookup
 
-    def _prefetch_train_feature_dict(
-        self, source_future: concurrent.futures.Future
-    ) -> Tuple[int, torch.Tensor, torch.Tensor, Dict[int, torch.Tensor]]:
+    def _prefetch_train_feature_dict(self, source_future: concurrent.futures.Future) -> int:
         image_batch = source_future.result()
-        image_ids, loader_ids = self._resolve_loader_ids(image_batch, is_eval=False)
-        feature_dict = self.feature_loader.load_batch_images(loader_ids)
-        return self._window_token(image_batch), image_ids, loader_ids, feature_dict
+        _, loader_ids = self._resolve_loader_ids(image_batch, is_eval=False)
+        self.feature_loader.warm_batch_images(loader_ids)
+        return self._window_token(image_batch)
 
-    def _consume_train_feature_prefetch(
-        self, image_batch: Dict
-    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[int, torch.Tensor]] | None:
+    def _consume_train_feature_prefetch(self, image_batch: Dict) -> bool:
         future = self._train_feature_prefetch_future
         if future is None:
-            return None
-        prefetched = future.result()
+            return False
         self._train_feature_prefetch_future = None
-        if prefetched[0] != self._window_token(image_batch):
-            return None
-        return prefetched[1], prefetched[2], prefetched[3]
+        return future.result() == self._window_token(image_batch)
 
     def _arm_train_feature_prefetch(self) -> None:
         source_future = getattr(self.train_image_dataloader, "_prefetch_future", None)
@@ -257,16 +250,11 @@ class FeatureDataManager(VanillaDataManager):
             self._put_timing(f"Timing/{prefix}/feature_cache_miss", 0.0, step)
         else:
             image_ids, loader_ids = self._resolve_loader_ids(image_batch, is_eval=is_eval)
-            prefetched = None if is_eval else self._consume_train_feature_prefetch(image_batch)
-            if prefetched is None:
-                fetch_start = perf_counter()
-                feature_dict = self.feature_loader.load_batch_images(loader_ids)
-                self._put_timing(f"Timing/{prefix}/feature_window_fetch", perf_counter() - fetch_start, step)
-            else:
-                image_ids, loader_ids, feature_dict = prefetched
-                if self.feature_loader._stream is not None:
-                    torch.cuda.current_stream().wait_stream(self.feature_loader._stream)
-                self._put_timing(f"Timing/{prefix}/feature_window_fetch", 0.0, step)
+            fetch_start = perf_counter()
+            if not is_eval:
+                self._consume_train_feature_prefetch(image_batch)
+            feature_dict = self.feature_loader.load_batch_images(loader_ids)
+            self._put_timing(f"Timing/{prefix}/feature_window_fetch", perf_counter() - fetch_start, step)
 
             stack_start = perf_counter()
             feature_window = self._stack_feature_window(feature_dict, loader_ids)
