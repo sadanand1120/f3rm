@@ -16,7 +16,7 @@ import torch
 from nerfstudio.utils.rich_utils import CONSOLE
 
 from f3rm.features.clip_extract import CLIPArgs, CLIPExtractor, examine_saved
-from f3rm.features.utils import BatchFeatureLoader, get_cache_paths, run_async_in_any_context
+from f3rm.features.utils import BatchFeatureLoader, get_cache_paths
 
 
 def _current_feature_args_id(feature_type: str) -> dict[str, Any]:
@@ -46,7 +46,7 @@ def create_feature_visualization(data_dir: Path, feature_type: str):
     CONSOLE.print(f"[green]Video saved: {feat_dir}/features_viz.mp4")
 
 
-async def _save_per_image_clip(
+def _save_per_image_clip(
     image_fnames: List[str],
     data_dir: Path,
     device: torch.device,
@@ -66,7 +66,7 @@ async def _save_per_image_clip(
     for i in tqdm(range(n_batches), desc="CLIP: extracting", position=0):
         s, e = i * batch_size, min((i + 1) * batch_size, n_imgs)
         batch_paths = image_fnames[s:e]
-        data = await extractor.extract_batch_async(batch_paths)
+        data = extractor.extract_batch(batch_paths)
 
         for j in range(len(batch_paths)):
             img_idx = s + j
@@ -206,16 +206,12 @@ def extract_features_for_dataset(
         )
 
     CONSOLE.print(f"[{feature_type}] Extracting features...")
-
-    async def _run():
-        await _save_per_image_clip(
-            image_fnames=image_fnames,
-            data_dir=data_dir,
-            device=device,
-            batch_size=batch_size,
-        )
-
-    run_async_in_any_context(_run)
+    _save_per_image_clip(
+        image_fnames=image_fnames,
+        data_dir=data_dir,
+        device=device,
+        batch_size=batch_size,
+    )
 
     return BatchFeatureLoader(
         data_dir,
