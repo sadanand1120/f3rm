@@ -1,22 +1,17 @@
 import concurrent.futures
 import gc
 from dataclasses import dataclass, field
-from time import perf_counter
 from typing import Dict, Literal, Tuple, Type
 
 import torch
 from nerfstudio.cameras.rays import RayBundle
-from nerfstudio.data.datamanagers.base_datamanager import (
-    VanillaDataManager,
-    VanillaDataManagerConfig,
-)
+from nerfstudio.data.datamanagers.base_datamanager import VanillaDataManager, VanillaDataManagerConfig
 from nerfstudio.data.datasets.base_dataset import InputDataset
 from nerfstudio.data.utils.dataloaders import CacheDataloader
 from nerfstudio.utils.rich_utils import CONSOLE
 
 from f3rm.features.extract_features_standalone import extract_features_for_dataset
 from f3rm.ray_generator import FeatureRayGenerator
-from f3rm.timing import put_timing
 
 
 @dataclass
@@ -89,10 +84,6 @@ class PrefetchCacheDataloader(CacheDataloader):
 class FeatureDataManager(VanillaDataManager):
     config: FeatureDataManagerConfig
 
-    @staticmethod
-    def _put_timing(name: str, duration: float, step: int) -> None:
-        put_timing(name=name, duration=duration, step=step, avg_over_steps=True)
-
     def create_train_dataset(self) -> InputDataset:
         return UInt8InputDataset(
             dataparser_outputs=self.train_dataparser_outputs,
@@ -122,7 +113,6 @@ class FeatureDataManager(VanillaDataManager):
         self.train_ray_generator = FeatureRayGenerator(self.train_dataset.cameras.to(self.device))
         self.eval_ray_generator = FeatureRayGenerator(self.eval_dataset.cameras.to(self.device))
 
-        # Dataset and device setup
         if isinstance(self.device, str):
             self.device = torch.device(self.device)
         self.eval_offset = len(self.train_dataset)
@@ -130,13 +120,12 @@ class FeatureDataManager(VanillaDataManager):
         loader_kwargs = {
             "image_fnames": image_fnames,
             "data_dir": self.config.dataparser.data,
-            "batch_size": 128,  # TODO: why hardcoded 128?
+            "batch_size": 128,
             "enable_cache": self.config.enable_cache,
             "pin_cpu_tensors": self.config.pin_cpu_feature_cache,
             "force": False,
         }
 
-        # Feature loaders
         self.feature_loader = extract_features_for_dataset(
             feature_type=self.config.feature_type,
             device=self.device,
@@ -146,11 +135,9 @@ class FeatureDataManager(VanillaDataManager):
         )
         CONSOLE.print(f"Created batch loader for {self.config.feature_type} features")
 
-        # Metadata required by downstream model construction
         self.train_dataset.metadata["feature_type"] = self.config.feature_type
         self.train_dataset.metadata["feature_dim"] = self.feature_loader.C
 
-        # Validate camera dimensions and compute scaling into feature grids
         feat_h, feat_w = self.feature_loader.H, self.feature_loader.W
         im_h = set(self.train_dataset.cameras.image_height.squeeze().tolist())
         im_w = set(self.train_dataset.cameras.image_width.squeeze().tolist())
@@ -207,44 +194,24 @@ class FeatureDataManager(VanillaDataManager):
         lookup[image_ids] = torch.arange(len(image_ids), dtype=torch.long, device=image_ids.device)
         return lookup
 
-    def _populate_batch_features(self, image_batch: Dict, batch: Dict, step: int, is_eval: bool) -> None:
-        prefix = "Eval" if is_eval else "Train"
-        populate_start = perf_counter()
+    def _populate_batch_features(self, image_batch: Dict, batch: Dict, is_eval: bool) -> None:
         camera_idx, y_feat, x_feat = self._index_triplet(batch, self.feat_scale_h, self.feat_scale_w)
 
-        load_start = perf_counter()
         cache = self._eval_window_cache if is_eval else self._train_window_cache
         token = self._window_token(image_batch)
         if cache.get("token") == token:
             feature_window, lookup = cache["feature"], cache["lookup"]  # type: ignore[assignment]
-            self._put_timing(f"Timing/{prefix}/feature_cache_hit", 1.0, step)
-            self._put_timing(f"Timing/{prefix}/feature_cache_miss", 0.0, step)
         else:
             image_ids, loader_ids = self._resolve_loader_ids(image_batch, is_eval=is_eval)
-            fetch_start = perf_counter()
             feature_dict = self.feature_loader.load_batch_images(loader_ids)
-            self._put_timing(f"Timing/{prefix}/feature_window_fetch", perf_counter() - fetch_start, step)
-
-            stack_start = perf_counter()
             feature_window = self._stack_feature_window(feature_dict, loader_ids)
-            self._put_timing(f"Timing/{prefix}/feature_window_stack", perf_counter() - stack_start, step)
-
-            lookup_start = perf_counter()
             lookup = self._build_feature_lookup(image_ids, is_eval=is_eval)
-            self._put_timing(f"Timing/{prefix}/feature_lookup_build", perf_counter() - lookup_start, step)
-
             cache.clear()
             cache["token"] = token
             cache["feature"] = feature_window
             cache["lookup"] = lookup
-            self._put_timing(f"Timing/{prefix}/feature_cache_hit", 0.0, step)
-            self._put_timing(f"Timing/{prefix}/feature_cache_miss", 1.0, step)
-        self._put_timing(f"Timing/{prefix}/feature_cache_load", perf_counter() - load_start, step)
 
-        gather_start = perf_counter()
         batch["feature"] = self._gather_from_window(feature_window, lookup, camera_idx, y_feat, x_feat)
-        self._put_timing(f"Timing/{prefix}/feature_gather", perf_counter() - gather_start, step)
-        self._put_timing(f"Timing/{prefix}/feature_populate", perf_counter() - populate_start, step)
 
     def _prepare_sampled_image(self, batch: Dict) -> None:
         image = batch["image"]
@@ -257,7 +224,7 @@ class FeatureDataManager(VanillaDataManager):
             batch["image"] = image.to(self.device, non_blocking=True)
 
     def next_train(self, step: int) -> Tuple[RayBundle, Dict]:
-        batch_start = perf_counter()
+        del step
         self.train_count += 1
         image_batch = next(self.iter_train_image_dataloader)
         assert self.train_pixel_sampler is not None
@@ -265,12 +232,11 @@ class FeatureDataManager(VanillaDataManager):
         batch = self.train_pixel_sampler.sample(image_batch)
         ray_bundle = self.train_ray_generator(batch["indices"])
         self._prepare_sampled_image(batch)
-        self._populate_batch_features(image_batch, batch, step=step, is_eval=False)
-        self._put_timing("Timing/Train/batch_load", perf_counter() - batch_start, step)
+        self._populate_batch_features(image_batch, batch, is_eval=False)
         return ray_bundle, batch
 
     def next_eval(self, step: int) -> Tuple[RayBundle, Dict]:
-        batch_start = perf_counter()
+        del step
         self.eval_count += 1
         image_batch = next(self.iter_eval_image_dataloader)
         assert self.eval_pixel_sampler is not None
@@ -278,6 +244,5 @@ class FeatureDataManager(VanillaDataManager):
         batch = self.eval_pixel_sampler.sample(image_batch)
         ray_bundle = self.eval_ray_generator(batch["indices"])
         self._prepare_sampled_image(batch)
-        self._populate_batch_features(image_batch, batch, step=step, is_eval=True)
-        self._put_timing("Timing/Eval/batch_load", perf_counter() - batch_start, step)
+        self._populate_batch_features(image_batch, batch, is_eval=True)
         return ray_bundle, batch

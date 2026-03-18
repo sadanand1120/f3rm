@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import errno
 import fcntl
 import json
@@ -15,7 +14,6 @@ import shutil
 import struct
 import subprocess
 import sys
-import threading
 import termios
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,7 +27,6 @@ CONDA_SH = "/opt/miniconda3/etc/profile.d/conda.sh"
 CONDA_ENV = "f3rm"
 SUMMARY_START = "=== F3RM_BENCHMARK_SUMMARY_BEGIN ==="
 SUMMARY_END = "=== F3RM_BENCHMARK_SUMMARY_END ==="
-GPU_ACTIVE_UTIL_THRESHOLD = 10
 DEFAULT_STREAM_COLUMNS = 120
 DEFAULT_STREAM_ROWS = 40
 OSC_ESCAPE_RE = re.compile(r"\x1b\].*?(?:\x07|\x1b\\)")
@@ -45,7 +42,6 @@ class BenchmarkProfile:
     dataset: Path
     extract_gpu_ids: tuple[int, ...]
     train_gpu_ids: tuple[int, ...]
-    skip_visualization: bool = True
 
 
 PROFILES = {
@@ -66,65 +62,6 @@ PROFILES = {
 
 class BenchmarkError(RuntimeError):
     pass
-
-
-class GpuPoller:
-    def __init__(self, gpu_ids: tuple[int, ...], sample_interval_s: float = 0.5) -> None:
-        self.gpu_ids = gpu_ids
-        self.sample_interval_s = sample_interval_s
-        self._samples: list[dict[str, Any]] = []
-        self._lock = threading.Lock()
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-
-    def _sample_once(self, t_s: float) -> None:
-        cmd = [
-            "nvidia-smi",
-            "-i",
-            ",".join(str(gpu_id) for gpu_id in self.gpu_ids),
-            "--query-gpu=index,utilization.gpu,utilization.memory,memory.used",
-            "--format=csv,noheader,nounits",
-        ]
-        output = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
-        tick_samples = []
-        for raw_line in output.strip().splitlines():
-            parts = [part.strip() for part in raw_line.split(",")]
-            if len(parts) != 4:
-                continue
-            tick_samples.append(
-                {
-                    "time_s": round(t_s, 3),
-                    "gpu": int(parts[0]),
-                    "utilization_gpu": int(parts[1]),
-                    "utilization_memory": int(parts[2]),
-                    "memory_used_mb": int(parts[3]),
-                }
-            )
-        with self._lock:
-            self._samples.extend(tick_samples)
-
-    def _run(self) -> None:
-        start = perf_counter()
-        while not self._stop.is_set():
-            try:
-                self._sample_once(perf_counter() - start)
-            except Exception:
-                pass
-            if self._stop.wait(self.sample_interval_s):
-                break
-
-    def start(self) -> None:
-        if self._thread is not None:
-            return
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def stop(self) -> list[dict[str, Any]]:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=5.0)
-        with self._lock:
-            return list(self._samples)
 
 
 def parse_args() -> argparse.Namespace:
@@ -155,6 +92,7 @@ def run_in_container(args: argparse.Namespace) -> int:
             f"conda activate {shlex.quote(CONDA_ENV)}",
             f"cd {shlex.quote(str(REPO_ROOT))}",
             "export F3RM_BENCHMARK_INSIDE=1",
+            "export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1",
             shlex.join(child_args),
         ]
     )
@@ -189,6 +127,16 @@ def remove_dir(path: Path) -> None:
         shutil.rmtree(path)
 
 
+def count_f3rm_loc(root: Path) -> int:
+    total = 0
+    for path in sorted(root.rglob("*.py")):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#"):
+                total += 1
+    return total
+
+
 def select_visual_check_indices(num_images: int, num_checks: int = 4) -> list[int]:
     if num_images < num_checks:
         raise BenchmarkError(f"Need at least {num_checks} images for visual checks, found {num_images}")
@@ -209,64 +157,78 @@ def select_visual_check_indices(num_images: int, num_checks: int = 4) -> list[in
     return indices
 
 
-def create_extract_visual_checks(feature_cache_dir: Path, output_dir: Path) -> dict[str, Any]:
+def _to_display_rgb(image) -> "torch.Tensor":
+    import torch
+
+    if not torch.is_tensor(image):
+        image = torch.as_tensor(image)
+    image = image.detach().cpu()
+    if image.dtype == torch.uint8:
+        image = image.float().div_(255.0)
+    else:
+        image = image.float()
+    return image.clamp_(0.0, 1.0)
+
+
+def create_visual_checks(run_dir: Path, output_dir: Path) -> dict[str, Any]:
+    import gc
     import matplotlib
 
     matplotlib.use("Agg")
 
     import matplotlib.pyplot as plt
-    import numpy as np
     import torch
-    from PIL import Image
+    from nerfstudio.utils.eval_utils import eval_setup
 
     from f3rm.features.utils import apply_pca_colormap
 
-    meta_path = feature_cache_dir / "meta.pt"
-    if not meta_path.exists():
-        raise BenchmarkError(f"Feature metadata not found: {meta_path}")
-    meta = torch.load(meta_path, map_location="cpu")
-    image_fnames = [Path(path) for path in meta.get("image_fnames", [])]
-    if not image_fnames:
-        raise BenchmarkError(f"No image_fnames recorded in {meta_path}")
+    config_path = run_dir / "config.yml"
+    if not config_path.exists():
+        raise BenchmarkError(f"Nerfstudio config not found: {config_path}")
+
+    _, pipeline, _, _ = eval_setup(config_path, test_mode="val")
+    train_dataset = getattr(pipeline.datamanager, "train_dataset", None)
+    train_ray_generator = getattr(pipeline.datamanager, "train_ray_generator", None)
+    if train_dataset is None or train_ray_generator is None:
+        raise BenchmarkError("Loaded pipeline does not expose train_dataset/train_ray_generator for visual checks")
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    indices = select_visual_check_indices(len(image_fnames))
+    indices = select_visual_check_indices(len(train_dataset))
     paths: list[str] = []
 
-    for idx in indices:
-        image_path = image_fnames[idx]
-        feature_path = feature_cache_dir / f"image_{idx:06d}.npy"
-        if not image_path.exists():
-            raise BenchmarkError(f"Original image for visual check not found: {image_path}")
-        if not feature_path.exists():
-            raise BenchmarkError(f"Feature file for visual check not found: {feature_path}")
+    with torch.no_grad():
+        for idx in indices:
+            batch = train_dataset.get_data(idx)
+            original_rgb = _to_display_rgb(batch["image"])
+            camera_ray_bundle = train_ray_generator.cameras.generate_rays(camera_indices=idx, keep_shape=True)
+            outputs = pipeline.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle, render_features=True)
+            render_rgb = _to_display_rgb(outputs["rgb"])
+            if "feature" not in outputs:
+                raise BenchmarkError("Model outputs did not include rendered features for visual checks")
+            render_feature = apply_pca_colormap(outputs["feature"], niter=5, q_min=0.01, q_max=0.99).cpu()
 
-        with Image.open(image_path) as image:
-            original = image.convert("RGB")
-            original_np = np.array(original)
+            fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+            axes[0].imshow(original_rgb.numpy())
+            axes[0].set_title(f"Original RGB\nidx={idx}")
+            axes[1].imshow(render_rgb.numpy())
+            axes[1].set_title("Render RGB")
+            axes[2].imshow(render_feature.numpy())
+            axes[2].set_title("Render Feature")
+            for axis in axes:
+                axis.axis("off")
+            fig.tight_layout()
 
-        feature = torch.from_numpy(np.load(feature_path)).float()
-        pca_image = apply_pca_colormap(feature, niter=5, q_min=0.01, q_max=0.99).cpu().numpy()
+            out_path = output_dir / f"visual_check_{idx:06d}.png"
+            fig.savefig(out_path, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+            paths.append(str(out_path))
 
-        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-        axes[0].imshow(original_np)
-        axes[0].set_title(f"Original\nidx={idx} {image_path.name}")
-        axes[1].imshow(pca_image)
-        axes[1].set_title(f"Feature PCA\nimage_{idx:06d}.npy")
-        for axis in axes:
-            axis.axis("off")
-        fig.tight_layout()
+    del pipeline
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-        out_path = output_dir / f"visual_check_{idx:06d}.png"
-        fig.savefig(out_path, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        paths.append(str(out_path))
-
-    return {
-        "count": len(paths),
-        "indices": indices,
-        "paths": paths,
-    }
+    return {"count": len(paths), "indices": indices, "paths": paths}
 
 
 def tail_lines(path: Path, n: int = 40) -> list[str]:
@@ -286,71 +248,6 @@ def read_clean_log_lines(path: Path) -> list[str]:
     text = path.read_text(errors="replace").replace("\r", "\n")
     text = strip_terminal_escapes(text)
     return text.splitlines()
-
-
-def parse_marker_scalars(log_path: Path, prefix: str) -> dict[str, float]:
-    results: dict[str, float] = {}
-    for line in read_clean_log_lines(log_path):
-        if not line.startswith(prefix):
-            continue
-        payload = line[len(prefix):].strip()
-        if "=" not in payload:
-            continue
-        key, value = payload.split("=", 1)
-        try:
-            results[key] = float(value)
-        except ValueError:
-            continue
-    return results
-
-
-def parse_marker_values(log_path: Path, prefix: str) -> dict[str, str]:
-    results: dict[str, str] = {}
-    for line in read_clean_log_lines(log_path):
-        if not line.startswith(prefix):
-            continue
-        payload = line[len(prefix):].strip()
-        if "=" not in payload:
-            continue
-        key, value = payload.split("=", 1)
-        results[key] = value
-    return results
-
-
-def summarize_gpu_samples(samples: list[dict[str, Any]], gpu_ids: tuple[int, ...]) -> dict[str, Any]:
-    per_gpu: dict[str, Any] = {}
-    by_tick: dict[float, dict[int, dict[str, Any]]] = {}
-    for sample in samples:
-        gpu = sample["gpu"]
-        key = str(gpu)
-        summary = per_gpu.setdefault(
-            key,
-            {"samples": 0, "max_utilization_gpu": 0, "max_memory_mb": 0, "active_samples": 0},
-        )
-        summary["samples"] += 1
-        summary["max_utilization_gpu"] = max(summary["max_utilization_gpu"], sample["utilization_gpu"])
-        summary["max_memory_mb"] = max(summary["max_memory_mb"], sample["memory_used_mb"])
-        if sample["utilization_gpu"] > GPU_ACTIVE_UTIL_THRESHOLD:
-            summary["active_samples"] += 1
-        by_tick.setdefault(sample["time_s"], {})[gpu] = sample
-
-    overlap_samples = 0
-    for tick in by_tick.values():
-        if all(tick.get(gpu, {}).get("utilization_gpu", 0) > GPU_ACTIVE_UTIL_THRESHOLD for gpu in gpu_ids):
-            overlap_samples += 1
-
-    return {
-        "gpu_ids": list(gpu_ids),
-        "sample_count": len(samples),
-        "overlap_active_samples": overlap_samples,
-        "parallel_ok": overlap_samples > 0 and all(per_gpu.get(str(gpu), {}).get("active_samples", 0) > 0 for gpu in gpu_ids),
-        "per_gpu": per_gpu,
-    }
-
-
-def peak_memory_mb(summary: dict[str, Any]) -> int:
-    per_gpu = summary.get("per_gpu", {})
-    return max((int(stats.get("max_memory_mb", 0)) for stats in per_gpu.values()), default=0)
 
 
 def open_stream_pty() -> tuple[int, int]:
@@ -387,43 +284,32 @@ def stream_process_output(stream_fd: int, log_file) -> None:
         sys.stdout.buffer.flush()
 
 
-def run_logged_subprocess(
-    command: list[str],
-    env: dict[str, str],
-    log_path: Path,
-    gpu_ids: tuple[int, ...],
-) -> tuple[float, list[dict[str, Any]]]:
-    poller = GpuPoller(gpu_ids)
+def run_logged_subprocess(command: list[str], env: dict[str, str], log_path: Path) -> float:
     start = perf_counter()
     stream_env = env | {"PYTHONUNBUFFERED": "1"}
     with log_path.open("wb") as log_file:
         print(f"[benchmark] running: {shlex.join(command)}", flush=True)
         print(f"[benchmark] logging to: {log_path}", flush=True)
-        poller.start()
+        master_fd, slave_fd = open_stream_pty()
         try:
-            master_fd, slave_fd = open_stream_pty()
-            try:
-                process = subprocess.Popen(
-                    command,
-                    cwd=REPO_ROOT,
-                    env=stream_env,
-                    stdin=subprocess.DEVNULL,
-                    stdout=slave_fd,
-                    stderr=slave_fd,
-                )
-            finally:
-                os.close(slave_fd)
-            try:
-                # Use a PTY so tqdm/Rich update live instead of batching behind a pipe.
-                stream_process_output(master_fd, log_file)
-            finally:
-                os.close(master_fd)
-                returncode = process.wait()
-            if returncode != 0:
-                raise subprocess.CalledProcessError(returncode, command)
+            process = subprocess.Popen(
+                command,
+                cwd=REPO_ROOT,
+                env=stream_env,
+                stdin=subprocess.DEVNULL,
+                stdout=slave_fd,
+                stderr=slave_fd,
+            )
         finally:
-            samples = poller.stop()
-    return perf_counter() - start, samples
+            os.close(slave_fd)
+        try:
+            stream_process_output(master_fd, log_file)
+        finally:
+            os.close(master_fd)
+            returncode = process.wait()
+        if returncode != 0:
+            raise subprocess.CalledProcessError(returncode, command)
+    return perf_counter() - start
 
 
 def locate_single_run_dir(ns_output_dir: Path, experiment_name: str) -> Path:
@@ -451,8 +337,27 @@ def load_event_scalars(run_dir: Path) -> dict[str, float]:
     return scalars
 
 
+def extract_final_metrics(event_scalars: dict[str, float]) -> dict[str, float]:
+    return {
+        tag.removeprefix("Final Metrics/"): value
+        for tag, value in event_scalars.items()
+        if tag.startswith("Final Metrics/")
+    }
+
+
+def canonical_metric_summary(final_metrics: dict[str, float]) -> dict[str, float | None]:
+    return {
+        "final_eval_all_psnr": final_metrics.get("Eval All Images/psnr"),
+        "final_eval_all_ssim": final_metrics.get("Eval All Images/ssim"),
+        "final_eval_all_lpips": final_metrics.get("Eval All Images/lpips"),
+        "final_train_feature_error": final_metrics.get("Train Batch/feature_error"),
+    }
+
+
 def run_benchmark(args: argparse.Namespace) -> int:
     profile = PROFILES[args.profile]
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu_id) for gpu_id in profile.train_gpu_ids)
+
     ensure_dataset(profile.dataset)
     dataset_stats = scan_dataset(profile.dataset)
 
@@ -463,9 +368,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
     summary_path = run_dir / "summary.json"
     extract_log = run_dir / "extract.log"
     train_log = run_dir / "train.log"
-    extract_gpu_csv = run_dir / "extract_gpu.csv"
-    train_gpu_csv = run_dir / "train_gpu.csv"
-    extract_visual_dir = run_dir / "extract_visual_check"
+    visual_dir = run_dir / "visual_check"
     feature_cache_dir = profile.dataset / "features" / "clip"
 
     experiment_name = f"{profile.name}_{run_id}"
@@ -494,9 +397,6 @@ def run_benchmark(args: argparse.Namespace) -> int:
         "--feature-type",
         "CLIP",
     ]
-    if profile.skip_visualization:
-        extract_command.append("--skip-visualization")
-
     train_command = [
         "ns-train",
         "f3rm",
@@ -527,99 +427,35 @@ def run_benchmark(args: argparse.Namespace) -> int:
         "train_command": train_command,
         "extract_log": str(extract_log),
         "train_log": str(train_log),
+        "f3rm_loc": count_f3rm_loc(REPO_ROOT / "f3rm"),
     }
 
     try:
         remove_dir(feature_cache_dir)
 
-        extract_wall_s, extract_gpu_samples = run_logged_subprocess(
-            command=extract_command,
-            env=extract_env,
-            log_path=extract_log,
-            gpu_ids=profile.extract_gpu_ids,
-        )
-        extract_visual_check = create_extract_visual_checks(feature_cache_dir=feature_cache_dir, output_dir=extract_visual_dir)
-        with extract_gpu_csv.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(
-                handle,
-                fieldnames=["time_s", "gpu", "utilization_gpu", "utilization_memory", "memory_used_mb"],
-            )
-            writer.writeheader()
-            writer.writerows(extract_gpu_samples)
-
-        train_wall_s, train_gpu_samples = run_logged_subprocess(
-            command=train_command,
-            env=train_env,
-            log_path=train_log,
-            gpu_ids=profile.train_gpu_ids,
-        )
-        with train_gpu_csv.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(
-                handle,
-                fieldnames=["time_s", "gpu", "utilization_gpu", "utilization_memory", "memory_used_mb"],
-            )
-            writer.writeheader()
-            writer.writerows(train_gpu_samples)
+        extract_wall_s = run_logged_subprocess(command=extract_command, env=extract_env, log_path=extract_log)
+        train_wall_s = run_logged_subprocess(command=train_command, env=train_env, log_path=train_log)
 
         ns_run_dir = locate_single_run_dir(ns_output_dir, experiment_name)
+        visual_check = create_visual_checks(run_dir=ns_run_dir, output_dir=visual_dir)
         event_scalars = load_event_scalars(ns_run_dir)
+        final_metrics = extract_final_metrics(event_scalars)
 
-        extract_timings = parse_marker_scalars(extract_log, "[F3RM_TIMING]")
-        extract_info = parse_marker_values(extract_log, "[F3RM_INFO]")
-        extract_gpu = summarize_gpu_samples(extract_gpu_samples, profile.extract_gpu_ids)
-        train_gpu = summarize_gpu_samples(train_gpu_samples, profile.train_gpu_ids)
-        final_metrics = {
-            tag.removeprefix("Final Metrics/"): value
-            for tag, value in event_scalars.items()
-            if tag.startswith("Final Metrics/")
-        }
-        final_timings = {
-            tag.removeprefix("Final Timing/"): value
-            for tag, value in event_scalars.items()
-            if tag.startswith("Final Timing/")
-        }
         summary.update(
             {
                 "extract_wall_s": extract_wall_s,
                 "train_wall_s": train_wall_s,
                 "end_to_end_wall_s": extract_wall_s + train_wall_s,
-                "extract_timings": extract_timings,
-                "extract_info": extract_info,
-                "extract_visual_check": extract_visual_check,
-                "extract_gpu": extract_gpu,
-                "train_gpu": train_gpu,
+                "visual_check": visual_check,
                 "train_run_dir": str(ns_run_dir),
                 "final_metrics": final_metrics,
-                "final_timings": final_timings,
-                "writer_scalars": {
-                    tag: value
-                    for tag, value in event_scalars.items()
-                    if tag in {"Train Iter (time)", "Train Total (time)", "ETA (time)", "Train Rays / Sec", "Test Rays / Sec"}
-                },
-                "extract_worker_init_s": extract_timings.get("extract.worker_init_s"),
-                "extract_worker_warmup_s": extract_timings.get("extract.worker_warmup_s"),
-                "extract_batch_compute_s": extract_timings.get("extract.batch_compute_s"),
-                "extract_per_image_write_s": extract_timings.get("extract.per_image_write_s"),
-                "extract_parallel_ok": int(extract_gpu["parallel_ok"]),
-                "peak_extract_gpu_mem_mb": peak_memory_mb(extract_gpu),
-                "peak_train_gpu_mem_mb": peak_memory_mb(train_gpu),
-                "train_feature_cache_load_avg_s": final_timings.get("Train/feature_cache_load/avg_s"),
-                "train_feature_window_fetch_avg_s": final_timings.get("Train/feature_window_fetch/avg_s"),
-                "train_feature_window_stack_avg_s": final_timings.get("Train/feature_window_stack/avg_s"),
-                "train_batch_load_avg_s": final_timings.get("Train/batch_load/avg_s"),
-                "train_model_forward_avg_s": final_timings.get("Train/model_forward/avg_s"),
-                "final_eval_all_psnr": final_metrics.get("Eval All Images/psnr"),
-                "final_eval_all_ssim": final_metrics.get("Eval All Images/ssim"),
-                "final_eval_all_lpips": final_metrics.get("Eval All Images/lpips"),
-                "final_train_feature_error": final_metrics.get("Train Batch/feature_error"),
             }
         )
-        if not extract_gpu["parallel_ok"]:
+        summary.update(canonical_metric_summary(final_metrics))
+
+        if visual_check["count"] != 4:
             summary["status"] = "failure"
-            summary["parallel_validation_error"] = "Extraction did not show overlapping activity on all requested GPUs."
-        if extract_visual_check["count"] != 4:
-            summary["status"] = "failure"
-            summary["visual_check_validation_error"] = "Expected exactly 4 extraction visual-check plots."
+            summary["visual_check_validation_error"] = "Expected exactly 4 saved visual checks."
         if not final_metrics:
             summary["status"] = "failure"
             summary["metrics_validation_error"] = "No Final Metrics/* scalars were found in the TensorBoard event files."
@@ -629,6 +465,16 @@ def run_benchmark(args: argparse.Namespace) -> int:
             {
                 "status": "failure",
                 "returncode": exc.returncode,
+                "failed_log": str(failed_log),
+                "failed_log_tail": tail_lines(failed_log),
+            }
+        )
+    except Exception as exc:
+        failed_log = train_log if train_log.exists() else extract_log
+        summary.update(
+            {
+                "status": "failure",
+                "error": f"{type(exc).__name__}: {exc}",
                 "failed_log": str(failed_log),
                 "failed_log_tail": tail_lines(failed_log),
             }

@@ -1,13 +1,9 @@
 import asyncio
 import gc
-import glob
 import os
 from pathlib import Path
-from time import perf_counter
 from typing import Callable, List, Optional, Sequence, Union
 
-import cv2
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -16,16 +12,11 @@ from PIL import Image
 from torchvision.io import ImageReadMode, read_image
 from tqdm import tqdm
 
-from f3rm.features.utils import AsyncMultiWrapper, apply_pca_colormap, resolve_devices_and_workers, run_async_in_any_context
+from f3rm.features.utils import AsyncMultiWrapper, resolve_devices_and_workers, run_async_in_any_context
 
 
 CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
 CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
-
-
-def _emit_timing(name: str, duration: float, enabled: bool) -> None:
-    if enabled:
-        print(f"[F3RM_TIMING] {name}={duration:.6f}")
 
 
 def _env_int(name: str, default: int) -> int:
@@ -33,7 +24,7 @@ def _env_int(name: str, default: int) -> int:
 
 
 class CLIPArgs:
-    model_name: str = "ViT-L-14-336-quickgelu"   # open_clip.list_pretrained() lists all available models
+    model_name: str = "ViT-L-14-336-quickgelu"
     model_pretrained: str = "openai"
     load_size: int = 2048
     skip_center_crop: bool = True
@@ -106,7 +97,7 @@ def _preprocess_rgb(
             crop_width = min(resized_width, int(resolved_size))
             top = max((resized_height - crop_height) // 2, 0)
             left = max((resized_width - crop_width) // 2, 0)
-            tensor = tensor[:, top:top + crop_height, left:left + crop_width]
+            tensor = tensor[:, top : top + crop_height, left : left + crop_width]
 
     mean = tensor.new_tensor(CLIP_MEAN).view(3, 1, 1)
     std = tensor.new_tensor(CLIP_STD).view(3, 1, 1)
@@ -220,8 +211,8 @@ class _CLIPWorker(nn.Module):
         *layers, last_resblock = visual.transformer.resblocks
         if layers:
             x = torch.nn.Sequential(*layers)(x)
-        v_in_proj_weight = last_resblock.attn.in_proj_weight[-last_resblock.attn.embed_dim:]
-        v_in_proj_bias = last_resblock.attn.in_proj_bias[-last_resblock.attn.embed_dim:]
+        v_in_proj_weight = last_resblock.attn.in_proj_weight[-last_resblock.attn.embed_dim :]
+        v_in_proj_bias = last_resblock.attn.in_proj_bias[-last_resblock.attn.embed_dim :]
         v_in = F.linear(last_resblock.ln_1(x), v_in_proj_weight, v_in_proj_bias)
         x = F.linear(v_in, last_resblock.attn.out_proj.weight, last_resblock.attn.out_proj.bias)
         x = x[:, 1:, :]
@@ -332,10 +323,6 @@ class _CLIPWorker(nn.Module):
             result = result.to(dtype=output_dtype)
         return result.cpu()
 
-    async def extract_agg_async(self, **kwargs) -> torch.Tensor:
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, lambda: self.extract_agg(**kwargs))
-
 
 class CLIPExtractor:
     def __init__(self, device: torch.device, verbose: bool = False) -> None:
@@ -343,8 +330,6 @@ class CLIPExtractor:
         devices_param, num_workers = resolve_devices_and_workers(device, workers_per_gpu)
         if verbose:
             print("Initializing CLIP workers")
-            print(f"[F3RM_INFO] extract.num_workers={num_workers}")
-        init_start = perf_counter()
         self.client = AsyncMultiWrapper(
             _CLIPWorker,
             num_objects=num_workers,
@@ -353,10 +338,8 @@ class CLIPExtractor:
             pretrained=CLIPArgs.model_pretrained,
         )
         self.num_workers = num_workers
-        _emit_timing("extract.worker_init_s", perf_counter() - init_start, verbose)
         if verbose:
             print("Warming up CLIP workers...")
-        warmup_start = perf_counter()
         tiny = Image.new("RGB", (8, 8), color=0)
         for _ in range(self.num_workers):
             _ = self.client.extract_agg(
@@ -368,7 +351,6 @@ class CLIPExtractor:
                 interpolation_mode="bilinear",
                 padding_mode="constant",
             )
-        _emit_timing("extract.worker_warmup_s", perf_counter() - warmup_start, verbose)
 
     @staticmethod
     def _extract_one(worker: _CLIPWorker, image_path: str, output_dtype: Optional[torch.dtype]) -> torch.Tensor:
@@ -382,39 +364,6 @@ class CLIPExtractor:
             padding_mode="constant",
             output_dtype=output_dtype,
         )
-
-    async def _extract_batch_async(
-        self,
-        image_paths: List[str],
-        output_dtype: Optional[torch.dtype] = None,
-    ) -> torch.Tensor:
-        if not image_paths:
-            return torch.empty(0)
-
-        loop = asyncio.get_running_loop()
-        workers = self.client.workers
-        queue = iter(enumerate(image_paths))
-        results: list[torch.Tensor | None] = [None] * len(image_paths)
-
-        with tqdm(total=len(image_paths), desc="CLIP tasks", leave=False) as pbar:
-            async def _worker_loop_with_progress(worker: _CLIPWorker) -> None:
-                while True:
-                    try:
-                        image_idx, image_path = next(queue)
-                    except StopIteration:
-                        return
-
-                    result = await loop.run_in_executor(
-                        None,
-                        lambda path=image_path, clip_worker=worker: self._extract_one(clip_worker, path, output_dtype),
-                    )
-                    results[image_idx] = result.cpu()
-                    pbar.update(1)
-
-            await asyncio.gather(*(_worker_loop_with_progress(worker) for worker in workers))
-
-        gc.collect()
-        return torch.stack([result for result in results if result is not None], dim=0)
 
     async def _stream_batch_async(
         self,
@@ -430,13 +379,12 @@ class CLIPExtractor:
         queue = iter(enumerate(image_paths))
 
         with tqdm(total=len(image_paths), desc="CLIP tasks", leave=False) as pbar:
-            async def _worker_loop_with_progress(worker: _CLIPWorker) -> None:
+            async def _worker_loop(worker: _CLIPWorker) -> None:
                 while True:
                     try:
                         image_idx, image_path = next(queue)
                     except StopIteration:
                         return
-
                     result = await loop.run_in_executor(
                         None,
                         lambda path=image_path, clip_worker=worker: self._extract_one(clip_worker, path, output_dtype),
@@ -444,12 +392,9 @@ class CLIPExtractor:
                     on_result(image_idx, result)
                     pbar.update(1)
 
-            await asyncio.gather(*(_worker_loop_with_progress(worker) for worker in workers))
+            await asyncio.gather(*(_worker_loop(worker) for worker in workers))
 
         gc.collect()
-
-    def extract_batch(self, image_paths: List[str], output_dtype: Optional[torch.dtype] = None) -> torch.Tensor:
-        return run_async_in_any_context(lambda: self._extract_batch_async(image_paths, output_dtype=output_dtype))
 
     def stream_batch(
         self,
@@ -458,47 +403,3 @@ class CLIPExtractor:
         output_dtype: Optional[torch.dtype] = None,
     ) -> None:
         run_async_in_any_context(lambda: self._stream_batch_async(image_paths, on_result, output_dtype=output_dtype))
-
-
-def examine_saved(clip_feat_dir: str):
-    """Create .mp4 video of saved CLIP features with PCA visualization."""
-    meta_path = os.path.join(clip_feat_dir, "meta.pt")
-    assert os.path.exists(meta_path), f"CLIP meta not found at {meta_path}"
-
-    meta = torch.load(meta_path)
-    image_fnames = meta["image_fnames"]
-    n_images = len(image_fnames)
-
-    first_feat = np.load(os.path.join(clip_feat_dir, "image_000000.npy"))
-    H, W = first_feat.shape[:2]
-
-    video_path = os.path.join(clip_feat_dir, "features_viz.mp4")
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(video_path, fourcc, 2.0, (W, H))
-
-    for i in tqdm(range(n_images), desc="Creating CLIP features video"):
-        feat_path = os.path.join(clip_feat_dir, f"image_{i:06d}.npy")
-        feat = torch.from_numpy(np.load(feat_path)).float()
-        pca_img = apply_pca_colormap(feat, niter=5, q_min=0.01, q_max=0.99)
-        frame = (pca_img.cpu().numpy() * 255).astype(np.uint8)
-        out.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-
-    out.release()
-    assert os.path.exists(video_path), f"Video not created at {video_path}"
-
-
-if __name__ == "__main__":
-    image_dir = "datasets/f3rm/panda/scene_001/images"
-    image_paths = sorted(glob.glob(f"{image_dir}/*.jpg") + glob.glob(f"{image_dir}/*.png"))[:4]
-    print(f"Found {len(image_paths)} images in {image_dir}")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    feats = CLIPExtractor(device=device, verbose=True).extract_batch(image_paths)
-    print(f"CLIP features shape: {tuple(feats.shape)}")
-
-    pca_img = apply_pca_colormap(feats[0], niter=5, q_min=0.01, q_max=0.99)
-    plt.figure(figsize=(6, 6))
-    plt.imshow(pca_img.cpu().numpy())
-    plt.title("CLIP PCA Visualization")
-    plt.axis("off")
-    plt.tight_layout()
-    plt.show()

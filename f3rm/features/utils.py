@@ -3,11 +3,10 @@ import concurrent.futures
 from collections import OrderedDict
 from itertools import cycle
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
 import numpy as np
 import torch
-from tqdm.auto import tqdm
 
 
 def parse_comma_separated_labels(raw_text: str) -> List[str]:
@@ -125,43 +124,6 @@ class AsyncMultiWrapper:
             return getattr(worker, name)(*args, **kwargs)
 
         return _dispatch
-
-    @staticmethod
-    async def async_run_tasks(
-        awaitables: List[Awaitable[Any]],
-        desc: Optional[str] = None,
-        position: Optional[int] = None,
-        disable: Optional[bool] = None,
-        leave: Optional[bool] = None,
-    ) -> List[Any]:
-        if not awaitables:
-            return []
-
-        async def _with_index(index: int, awaitable: Awaitable[Any]) -> Tuple[int, Any]:
-            return index, await awaitable
-
-        tasks = [asyncio.create_task(_with_index(i, awaitable)) for i, awaitable in enumerate(awaitables)]
-        results: List[Any] = [None] * len(tasks)
-        bar_kwargs: Dict[str, Any] = {"desc": desc or "Tasks", "total": len(tasks)}
-        if position is not None:
-            bar_kwargs["position"] = position
-        if disable is not None:
-            bar_kwargs["disable"] = disable
-        if leave is not None:
-            bar_kwargs["leave"] = leave
-
-        try:
-            with tqdm(**bar_kwargs) as pbar:
-                for task in asyncio.as_completed(tasks):
-                    index, result = await task
-                    results[index] = result
-                    pbar.update(1)
-        except Exception:
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            raise
-        return results
 
 
 def apply_pca_colormap(

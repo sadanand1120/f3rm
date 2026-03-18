@@ -29,7 +29,6 @@ def _install_nonviewer_import_stubs() -> None:
     if vis_mode not in {"wandb", "tensorboard", "comet"}:
         return
 
-    # Nerfstudio imports viewer modules eagerly in Trainer even for non-viewer runs.
     if "nerfstudio.viewer.viewer" not in sys.modules:
         import nerfstudio.viewer as viewer_pkg
 
@@ -60,10 +59,9 @@ def _install_nonviewer_import_stubs() -> None:
 _install_nonviewer_import_stubs()
 
 from nerfstudio.engine.trainer import Trainer, TrainerConfig
-from nerfstudio.utils.misc import step_check
 from nerfstudio.utils import profiler, writer
+from nerfstudio.utils.misc import step_check
 from nerfstudio.utils.rich_utils import CONSOLE
-from f3rm.timing import flush_final_timings
 
 
 FINAL_METRIC_METADATA_KEYS = {"image_idx", "num_rays"}
@@ -82,7 +80,6 @@ class F3RMTrainer(Trainer):
     config: F3RMTrainerConfig
 
     def __init__(self, config: F3RMTrainerConfig, local_rank: int = 0, world_size: int = 1) -> None:
-        """Initialize F3RM trainer."""
         if torch.cuda.is_available():
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
@@ -152,18 +149,14 @@ class F3RMTrainer(Trainer):
         return did_sanitize
 
     def _sanitize_camera_opt_params_if_needed(self) -> None:
-        """Prevent a non-finite camera optimizer state from poisoning subsequent steps."""
         camera_optimizer = getattr(self.pipeline.model, "camera_optimizer", None)
         pose_adjustment = getattr(camera_optimizer, "pose_adjustment", None)
-        if pose_adjustment is None:
-            return
-        if torch.isfinite(pose_adjustment).all():
+        if pose_adjustment is None or torch.isfinite(pose_adjustment).all():
             return
         with torch.no_grad():
             torch.nan_to_num_(pose_adjustment, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _sanitize_all_optimizer_groups(self) -> None:
-        """Sanitize params and optimizer states across all groups after a non-finite forward."""
         for group in self.optimizers.parameters.keys():
             params = list(self.optimizers.parameters[group])
             self._sanitize_parameter_tensors(params)
@@ -172,7 +165,6 @@ class F3RMTrainer(Trainer):
 
     @profiler.time_function
     def train_iteration(self, step: int):
-        """Run one training iteration with camera-opt safety guards."""
         self._sanitize_camera_opt_params_if_needed()
 
         needs_zero = [
@@ -235,7 +227,6 @@ class F3RMTrainer(Trainer):
     @check_eval_enabled
     @profiler.time_function
     def eval_iteration(self, step: int) -> None:
-        """Run eval iteration while keeping the latest unweighted eval metrics for final reporting."""
         if step_check(step, self.config.steps_per_eval_batch):
             _, eval_loss_dict, eval_metrics_dict = self.pipeline.get_eval_loss_dict(step=step)
             self._latest_eval_batch_metrics = self._detach_scalar_metrics(eval_metrics_dict)
@@ -255,9 +246,8 @@ class F3RMTrainer(Trainer):
                 avg_over_steps=True,
             )
             writer.put_dict(name="Eval Images Metrics", scalar_dict=metrics_dict, step=step)
-            group = "Eval Images"
             for image_name, image in images_dict.items():
-                writer.put_image(name=group + "/" + image_name, image=image, step=step)
+                writer.put_image(name="Eval Images/" + image_name, image=image, step=step)
 
         if step_check(step, self.config.steps_per_eval_all_images):
             metrics_dict = self.pipeline.get_average_eval_image_metrics(step=step)
@@ -276,11 +266,7 @@ class F3RMTrainer(Trainer):
     def _queue_final_metrics(self, metric_groups: list[tuple[str, Dict[str, float]]]) -> None:
         for group_name, metrics in metric_groups:
             for metric_name, metric_value in sorted(metrics.items()):
-                writer.put_scalar(
-                    name=f"Final Metrics/{group_name}/{metric_name}",
-                    scalar=metric_value,
-                    step=self.step,
-                )
+                writer.put_scalar(name=f"Final Metrics/{group_name}/{metric_name}", scalar=metric_value, step=self.step)
 
     def _print_final_metrics(self, metric_groups: list[tuple[str, Dict[str, float]]]) -> None:
         if not metric_groups:
@@ -300,6 +286,5 @@ class F3RMTrainer(Trainer):
     def _after_train(self) -> None:
         metric_groups = self._get_final_metric_groups()
         self._queue_final_metrics(metric_groups)
-        flush_final_timings(step=self.step)
         super()._after_train()
         self._print_final_metrics(metric_groups)
