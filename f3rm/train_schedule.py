@@ -20,6 +20,13 @@ def env_float(name: str, default: float) -> float:
     return float(os.getenv(name, default))
 
 
+def env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def env_int_tuple(name: str, default: tuple[int, int]) -> tuple[int, int]:
     value = os.getenv(name)
     return default if value is None else tuple(int(part.strip()) for part in value.split(",", maxsplit=1))

@@ -110,6 +110,10 @@ class AsyncMultiWrapper:
         self._workers = [worker_cls(device=device, **worker_kwargs) for device in resolved_devices]
         self._rr_index = 0
 
+    @property
+    def workers(self) -> List[Any]:
+        return self._workers
+
     def _next_worker(self) -> Any:
         worker = self._workers[self._rr_index]
         self._rr_index = (self._rr_index + 1) % len(self._workers)

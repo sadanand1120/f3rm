@@ -8,6 +8,7 @@ batch loading during training.
 
 import gc
 import math
+import os
 from pathlib import Path
 from time import perf_counter
 from typing import Any, List
@@ -22,6 +23,10 @@ from f3rm.features.utils import BatchFeatureLoader, get_cache_paths
 
 def _emit_timing(name: str, duration: float) -> None:
     CONSOLE.print(f"[F3RM_TIMING] {name}={duration:.6f}")
+
+
+def _env_int(name: str, default: int) -> int:
+    return int(os.getenv(name, default))
 
 
 def _current_feature_args_id(feature_type: str) -> dict[str, Any]:
@@ -57,6 +62,7 @@ def _save_per_image_clip(
     device: torch.device,
     batch_size: int,
 ):
+    import concurrent.futures
     from tqdm.auto import tqdm
 
     root, meta = get_cache_paths(data_dir, "CLIP")
@@ -69,6 +75,10 @@ def _save_per_image_clip(
     n_batches = math.ceil(n_imgs / batch_size)
     batch_compute_s = 0.0
     image_write_s = 0.0
+    write_threads = max(1, _env_int("F3RM_CLIP_WRITE_THREADS", 1))
+
+    def _save_one_image(img_idx: int, img_tensor: torch.Tensor) -> None:
+        np.save(root / f"image_{img_idx:06d}.npy", img_tensor.numpy(), allow_pickle=False)
 
     for i in tqdm(range(n_batches), desc="CLIP: extracting", position=0):
         s, e = i * batch_size, min((i + 1) * batch_size, n_imgs)
@@ -78,10 +88,15 @@ def _save_per_image_clip(
         batch_compute_s += perf_counter() - batch_start
 
         write_start = perf_counter()
-        for j in range(len(batch_paths)):
-            img_idx = s + j
-            img_data = data[j].cpu().half()
-            np.save(root / f"image_{img_idx:06d}.npy", img_data.numpy(), allow_pickle=False)
+        image_payloads = [(s + j, data[j].cpu().half()) for j in range(len(batch_paths))]
+        if write_threads == 1:
+            for img_idx, img_data in image_payloads:
+                _save_one_image(img_idx, img_data)
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=write_threads) as executor:
+                futures = [executor.submit(_save_one_image, img_idx, img_data) for img_idx, img_data in image_payloads]
+                for future in futures:
+                    future.result()
         image_write_s += perf_counter() - write_start
 
         del data
@@ -263,6 +278,7 @@ def extract_features_standalone(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device(device)
+    batch_size = _env_int("F3RM_CLIP_BATCH_SIZE", batch_size)
 
     CONSOLE.print(f"Using device: {device}")
     dataparser_start = perf_counter()

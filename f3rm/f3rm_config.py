@@ -8,7 +8,7 @@ from f3rm.feature_datamanager import FeatureDataManagerConfig
 from f3rm.model import FeatureFieldModelConfig
 from f3rm.trainer import F3RMTrainerConfig
 from f3rm.pipeline import FeaturePipelineConfig
-from f3rm.train_schedule import derive_train_schedule, env_float, env_int, env_int_tuple
+from f3rm.train_schedule import derive_train_schedule, env_bool, env_float, env_int, env_int_tuple
 from nerfstudio.plugins.types import MethodSpecification
 
 # Transfer these knobs to another dataset and keep the same schedule density.
@@ -20,6 +20,8 @@ TRAIN_NUM_IMAGES_TO_SAMPLE_FROM = env_int("F3RM_TRAIN_NUM_IMAGES_TO_SAMPLE_FROM"
 PIXEL_VISITATION = env_float("F3RM_PIXEL_VISITATION", 0.4)  # Increase => total work: up directly; end-to-end time: up directly; quality: usually up because pixels are revisited more.
 WINDOW_COVERAGE = env_float("F3RM_WINDOW_COVERAGE", 2.0)  # Increase => total work: about flat; end-to-end time: usually up from more window refreshes; quality: usually up because training touches more images.
 GPU_FEATURE_CACHE_IMAGES = env_int("F3RM_GPU_FEATURE_CACHE_IMAGES", 8)  # Increase => total work: unchanged; end-to-end time: can go down or up depending on cache-hit gains vs VRAM pressure; quality: unchanged.
+CPU_FEATURE_CACHE_IMAGES = env_int("F3RM_CPU_FEATURE_CACHE_IMAGES", 32)  # Increase => total work: unchanged; end-to-end time: can go down by reducing rereads or up by increasing RAM pressure; quality: unchanged.
+PIN_CPU_FEATURE_CACHE = env_bool("F3RM_PIN_CPU_FEATURE_CACHE", False)  # Increase => total work: unchanged; end-to-end time: may go down if host-to-device transfer dominates; quality: unchanged.
 
 TRAIN_SCHEDULE = derive_train_schedule(
     num_images_total=NUM_IMAGES_TOTAL,
@@ -54,8 +56,8 @@ f3rm_method = MethodSpecification(
             datamanager=FeatureDataManagerConfig(
                 feature_type="CLIP",
                 images_on_gpu=True,
-                pin_cpu_feature_cache=False,
-                cpu_feature_cache_images=32,
+                pin_cpu_feature_cache=PIN_CPU_FEATURE_CACHE,
+                cpu_feature_cache_images=CPU_FEATURE_CACHE_IMAGES,
                 gpu_feature_cache_images=GPU_FEATURE_CACHE_IMAGES,
                 dataparser=NerfstudioDataParserConfig(train_split_fraction=TRAIN_SPLIT_FRACTION),
                 train_num_rays_per_batch=TRAIN_NUM_RAYS_PER_BATCH,
