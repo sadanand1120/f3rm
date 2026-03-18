@@ -3,13 +3,20 @@ from __future__ import annotations
 
 import argparse
 import csv
+import errno
+import fcntl
 import json
 import os
+import pty
+import re
+import select
 import shlex
 import shutil
+import struct
 import subprocess
 import sys
 import threading
+import termios
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter, strftime
@@ -23,6 +30,11 @@ CONDA_ENV = "f3rm"
 SUMMARY_START = "=== F3RM_BENCHMARK_SUMMARY_BEGIN ==="
 SUMMARY_END = "=== F3RM_BENCHMARK_SUMMARY_END ==="
 GPU_ACTIVE_UTIL_THRESHOLD = 10
+DEFAULT_STREAM_COLUMNS = 120
+DEFAULT_STREAM_ROWS = 40
+OSC_ESCAPE_RE = re.compile(r"\x1b\].*?(?:\x07|\x1b\\)")
+CSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+SINGLE_ESCAPE_RE = re.compile(r"\x1b[@-Z\\-_]")
 
 
 @dataclass(frozen=True)
@@ -258,12 +270,25 @@ def create_extract_visual_checks(feature_cache_dir: Path, output_dir: Path) -> d
 def tail_lines(path: Path, n: int = 40) -> list[str]:
     if not path.exists():
         return []
-    return path.read_text(errors="replace").splitlines()[-n:]
+    return read_clean_log_lines(path)[-n:]
+
+
+def strip_terminal_escapes(text: str) -> str:
+    text = OSC_ESCAPE_RE.sub("", text)
+    text = CSI_ESCAPE_RE.sub("", text)
+    text = SINGLE_ESCAPE_RE.sub("", text)
+    return text
+
+
+def read_clean_log_lines(path: Path) -> list[str]:
+    text = path.read_text(errors="replace").replace("\r", "\n")
+    text = strip_terminal_escapes(text)
+    return text.splitlines()
 
 
 def parse_marker_scalars(log_path: Path, prefix: str) -> dict[str, float]:
     results: dict[str, float] = {}
-    for line in log_path.read_text(errors="replace").splitlines():
+    for line in read_clean_log_lines(log_path):
         if not line.startswith(prefix):
             continue
         payload = line[len(prefix):].strip()
@@ -279,7 +304,7 @@ def parse_marker_scalars(log_path: Path, prefix: str) -> dict[str, float]:
 
 def parse_marker_values(log_path: Path, prefix: str) -> dict[str, str]:
     results: dict[str, str] = {}
-    for line in log_path.read_text(errors="replace").splitlines():
+    for line in read_clean_log_lines(log_path):
         if not line.startswith(prefix):
             continue
         payload = line[len(prefix):].strip()
@@ -326,10 +351,32 @@ def peak_memory_mb(summary: dict[str, Any]) -> int:
     return max((int(stats.get("max_memory_mb", 0)) for stats in per_gpu.values()), default=0)
 
 
-def stream_process_output(process: subprocess.Popen[bytes], log_file) -> None:
-    assert process.stdout is not None
+def open_stream_pty() -> tuple[int, int]:
+    master_fd, slave_fd = pty.openpty()
+    try:
+        size = os.get_terminal_size(sys.stdout.fileno())
+        rows, columns = size.lines, size.columns
+    except OSError:
+        rows, columns = DEFAULT_STREAM_ROWS, DEFAULT_STREAM_COLUMNS
+    try:
+        winsize = struct.pack("HHHH", rows, columns, 0, 0)
+        fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
+    except OSError:
+        pass
+    return master_fd, slave_fd
+
+
+def stream_process_output(stream_fd: int, log_file) -> None:
     while True:
-        chunk = process.stdout.read(4096)
+        ready, _, _ = select.select([stream_fd], [], [], 0.5)
+        if not ready:
+            continue
+        try:
+            chunk = os.read(stream_fd, 4096)
+        except OSError as exc:
+            if exc.errno == errno.EIO:
+                break
+            raise
         if not chunk:
             break
         log_file.write(chunk)
@@ -346,21 +393,29 @@ def run_logged_subprocess(
 ) -> tuple[float, list[dict[str, Any]]]:
     poller = GpuPoller(gpu_ids)
     start = perf_counter()
+    stream_env = env | {"PYTHONUNBUFFERED": "1"}
     with log_path.open("wb") as log_file:
         print(f"[benchmark] running: {shlex.join(command)}", flush=True)
         print(f"[benchmark] logging to: {log_path}", flush=True)
         poller.start()
         try:
-            process = subprocess.Popen(
-                command,
-                cwd=REPO_ROOT,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-            )
+            master_fd, slave_fd = open_stream_pty()
             try:
-                stream_process_output(process, log_file)
+                process = subprocess.Popen(
+                    command,
+                    cwd=REPO_ROOT,
+                    env=stream_env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=slave_fd,
+                    stderr=slave_fd,
+                )
             finally:
+                os.close(slave_fd)
+            try:
+                # Use a PTY so tqdm/Rich update live instead of batching behind a pipe.
+                stream_process_output(master_fd, log_file)
+            finally:
+                os.close(master_fd)
                 returncode = process.wait()
             if returncode != 0:
                 raise subprocess.CalledProcessError(returncode, command)
