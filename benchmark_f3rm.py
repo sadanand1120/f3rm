@@ -35,6 +35,8 @@ DEFAULT_STREAM_ROWS = 40
 OSC_ESCAPE_RE = re.compile(r"\x1b\].*?(?:\x07|\x1b\\)")
 CSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 SINGLE_ESCAPE_RE = re.compile(r"\x1b[@-Z\\-_]")
+BENCHMARK_EXTRACT_GPU_IDS = (6, 7)
+BENCHMARK_TRAIN_GPU_IDS = (6,)
 
 
 @dataclass(frozen=True)
@@ -50,14 +52,14 @@ PROFILES = {
     "smoke": BenchmarkProfile(
         name="smoke",
         dataset=REPO_ROOT / "datasets/f3rm/test/poster_smoke",
-        extract_gpu_ids=(1, 2),
-        train_gpu_ids=(1,),
+        extract_gpu_ids=BENCHMARK_EXTRACT_GPU_IDS,
+        train_gpu_ids=BENCHMARK_TRAIN_GPU_IDS,
     ),
     "measure": BenchmarkProfile(
         name="measure",
         dataset=REPO_ROOT / "datasets/f3rm/test/poster2",
-        extract_gpu_ids=(1, 2),
-        train_gpu_ids=(1,),
+        extract_gpu_ids=BENCHMARK_EXTRACT_GPU_IDS,
+        train_gpu_ids=BENCHMARK_TRAIN_GPU_IDS,
     ),
 }
 
