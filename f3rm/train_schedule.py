@@ -5,8 +5,6 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class DerivedTrainSchedule:
-    train_image_count: int
-    train_total_pixels: int
     max_num_iterations: int
     steps_per_eval_all_images: int
     train_num_times_to_repeat_images: int
@@ -48,8 +46,6 @@ def derive_train_schedule(
     target_windows = max(1, round(window_coverage * train_image_count / train_num_images_to_sample_from))
     train_num_times_to_repeat_images = max(1, math.ceil(max_num_iterations / target_windows))
     return DerivedTrainSchedule(
-        train_image_count=train_image_count,
-        train_total_pixels=train_total_pixels,
         max_num_iterations=max_num_iterations,
         steps_per_eval_all_images=max(0, max_num_iterations - 1),
         train_num_times_to_repeat_images=train_num_times_to_repeat_images,

@@ -22,8 +22,7 @@ from nerfstudio.viewer.server.viewer_elements import (
 from torch.nn import Parameter
 
 from f3rm.feature_field import FeatureField
-from f3rm.features.utils import compute_similarity_scores, parse_comma_separated_labels
-from f3rm.pca_colormap import apply_pca_colormap_return_proj
+from f3rm.features.utils import apply_pca_colormap, compute_similarity_scores
 from f3rm.renderer import FeatureRenderer
 
 
@@ -77,15 +76,17 @@ class ViewerUtils:
         import open_clip
         from f3rm.features.clip_extract import CLIPArgs
 
-        texts = parse_comma_separated_labels(raw_text)
-        # Clear the GUI state if there are no texts
+        texts = [text.strip() for text in raw_text.split(",") if text.strip()]
         if not texts:
-            self.clear_positives() if is_positive else self.clear_negatives()
+            if is_positive:
+                self.positives.clear()
+                self.pos_embed = None
+            else:
+                self.negatives.clear()
+                self.neg_embed = None
             return
-        # Embed text queries
         tokenize = open_clip.get_tokenizer(CLIPArgs.model_name)
         tokens = tokenize(texts).to(self.device)
-        # Keep viewer embeddings in fp32 to avoid dtype mismatch during similarity matmul.
         embed = self.clip.encode_text(tokens).float()
         embed = embed / embed.norm(dim=-1, keepdim=True).clamp_min(1e-8)
         if is_positive:
@@ -97,22 +98,6 @@ class ViewerUtils:
         else:
             self.negatives = texts
             self.neg_embed = embed
-
-    @property
-    def has_positives(self) -> bool:
-        return bool(self.positives) and self.pos_embed is not None
-
-    def clear_positives(self):
-        self.positives.clear()
-        self.pos_embed = None
-
-    @property
-    def has_negatives(self) -> bool:
-        return bool(self.negatives) and self.neg_embed is not None
-
-    def clear_negatives(self):
-        self.negatives.clear()
-        self.neg_embed = None
 
     def update_softmax_temp(self, temp: float):
         self.softmax_temp = max(float(temp), 1e-6)
@@ -339,16 +324,14 @@ class FeatureFieldModel(NerfactoModel):
         if not render_features:
             return outputs
 
-        # Nothing else to do if not CLIP features or no positives
-        if self.kwargs["metadata"]["feature_type"] != "CLIP" or not viewer_utils.has_positives:
+        if self.kwargs["metadata"]["feature_type"] != "CLIP" or not viewer_utils.positives or viewer_utils.pos_embed is None:
             return outputs
 
-        # Normalize CLIP features rendered by feature field
         clip_features = outputs["feature"].to(viewer_utils.device)
         outputs["similarity"] = compute_similarity_scores(
             clip_features=clip_features,
             pos_embed=viewer_utils.pos_embed,
-            neg_embed=viewer_utils.neg_embed if viewer_utils.has_negatives else None,
+            neg_embed=viewer_utils.neg_embed if viewer_utils.negatives and viewer_utils.neg_embed is not None else None,
             softmax_temp=viewer_utils.softmax_temp,
         )
         return outputs
@@ -374,8 +357,11 @@ class FeatureFieldModel(NerfactoModel):
 
         # feature PCA
         if "feature" in outputs:
-            images_dict["feature_pca"], viewer_utils.pca_proj, *_ = apply_pca_colormap_return_proj(
-                outputs["feature"], viewer_utils.pca_proj
+            images_dict["feature_pca"], viewer_utils.pca_proj, *_ = apply_pca_colormap(
+                outputs["feature"],
+                proj_V=viewer_utils.pca_proj,
+                return_proj=True,
             )
+            images_dict["feature_pca"] = images_dict["feature_pca"].to(torch.float16)
 
         return metrics_dict, images_dict

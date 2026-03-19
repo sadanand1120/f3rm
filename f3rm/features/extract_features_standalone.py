@@ -16,12 +16,17 @@ import numpy as np
 import torch
 from nerfstudio.utils.rich_utils import CONSOLE
 
-from f3rm.features.clip_extract import CLIPArgs, CLIPExtractor
+from f3rm.features.clip_extract import CLIPArgs, CLIPExtractor, examine_saved
 from f3rm.features.utils import BatchFeatureLoader, get_cache_paths
 
 
 def _env_int(name: str, default: int) -> int:
     return int(os.getenv(name, default))
+
+
+def _feature_env_name(feature_type: str, suffix: str) -> str:
+    feature_token = feature_type.replace("-", "_").upper()
+    return f"F3RM_{feature_token}_{suffix}"
 
 
 def _current_feature_args_id(feature_type: str) -> dict[str, Any]:
@@ -47,7 +52,7 @@ def _save_per_image_clip(
     extractor = CLIPExtractor(device=device, verbose=True)
     n_imgs = len(image_fnames)
     n_batches = math.ceil(n_imgs / batch_size)
-    write_threads = max(1, _env_int("F3RM_CLIP_WRITE_THREADS", 1))
+    write_threads = max(1, _env_int(_feature_env_name("CLIP", "WRITE_THREADS"), 1))
 
     def _save_one_image(img_idx: int, img_tensor: torch.Tensor) -> None:
         np.save(root / f"image_{img_idx:06d}.npy", img_tensor.numpy(), allow_pickle=False)
@@ -96,11 +101,22 @@ def _extract_and_save_features(
 
 
 def _cache_file_count_matches(root: Path, feature_type: str, num_images: int) -> bool:
-    if feature_type != "CLIP":
-        raise ValueError(f"Unsupported feature type: {feature_type}")
-    if num_images == 0:
-        return True
-    return len(list(root.glob("image_*.npy"))) == num_images
+    if feature_type == "CLIP":
+        return num_images == 0 or len(list(root.glob("image_*.npy"))) == num_images
+    raise ValueError(f"Unsupported feature type: {feature_type}")
+
+
+def create_feature_visualization(data_dir: Path, feature_type: str) -> None:
+    if feature_type == "CLIP":
+        feat_dir = data_dir / "features" / feature_type.lower()
+        if not feat_dir.exists():
+            CONSOLE.print(f"[yellow]Feature directory not found: {feat_dir}")
+            return
+        CONSOLE.print(f"[blue]Creating visualization video for {feature_type}...")
+        examine_saved(str(feat_dir))
+        CONSOLE.print(f"[green]Video saved: {feat_dir / 'features_viz.mp4'}")
+        return
+    raise ValueError(f"Unsupported feature type: {feature_type}")
 
 
 def _normalize_image_path_for_cache(path_like: str, data_dir: Path) -> str:
@@ -202,7 +218,6 @@ def extract_features_for_dataset(
     return BatchFeatureLoader(
         data_dir,
         feature_type,
-        image_fnames,
         device,
         max_cpu_images=max_cpu_images,
         max_gpu_images=max_gpu_images,
@@ -216,9 +231,10 @@ def extract_features_standalone(
     batch_size: int = 64,
     device: str = "auto",
     force: bool = False,
+    skip_visualization: bool = False,
 ) -> BatchFeatureLoader:
     resolved_device = torch.device("cuda" if device == "auto" and torch.cuda.is_available() else "cpu") if device == "auto" else torch.device(device)
-    batch_size = _env_int("F3RM_CLIP_BATCH_SIZE", batch_size)
+    batch_size = _env_int(_feature_env_name(feature_type, "BATCH_SIZE"), batch_size)
 
     CONSOLE.print(f"Using device: {resolved_device}")
     image_fnames = get_image_filenames_from_dataparser(data_dir)
@@ -235,6 +251,8 @@ def extract_features_standalone(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     gc.collect()
+    if not skip_visualization:
+        create_feature_visualization(data_dir, feature_type)
     CONSOLE.print("Feature extraction completed!")
     return batch_loader
 
@@ -251,6 +269,11 @@ def main():
     parser.add_argument("--batch-size", type=int, default=32, help="Number of images to process in each extraction batch.")
     parser.add_argument("--device", type=str, default="auto", help="Device to use (auto, cuda, cpu, cuda:0, etc.)")
     parser.add_argument("--force", action="store_true", help="Force re-extraction even if cache exists")
+    parser.add_argument(
+        "--skip-visualization",
+        action="store_true",
+        help="Skip PCA video generation.",
+    )
     args = parser.parse_args()
 
     if not args.data.exists():
@@ -266,6 +289,7 @@ def main():
         batch_size=args.batch_size,
         device=args.device,
         force=args.force,
+        skip_visualization=args.skip_visualization,
     )
 
 

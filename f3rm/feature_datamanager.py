@@ -115,7 +115,6 @@ class FeatureDataManager(VanillaDataManager):
 
         if isinstance(self.device, str):
             self.device = torch.device(self.device)
-        self.eval_offset = len(self.train_dataset)
         image_fnames = self.train_dataset.image_filenames + self.eval_dataset.image_filenames
         loader_kwargs = {
             "image_fnames": image_fnames,
@@ -125,7 +124,6 @@ class FeatureDataManager(VanillaDataManager):
             "pin_cpu_tensors": self.config.pin_cpu_feature_cache,
             "force": False,
         }
-
         self.feature_loader = extract_features_for_dataset(
             feature_type=self.config.feature_type,
             device=self.device,
@@ -157,61 +155,39 @@ class FeatureDataManager(VanillaDataManager):
         torch.cuda.empty_cache()
         gc.collect()
 
-    @staticmethod
-    def _window_token(image_batch: Dict) -> int:
-        image = image_batch["image"]
-        return image.data_ptr() if torch.is_tensor(image) else id(image)
-
-    @staticmethod
-    def _gather_from_window(
-        window: torch.Tensor, lookup: torch.Tensor, camera_idx: torch.Tensor, y_idx: torch.Tensor, x_idx: torch.Tensor
-    ) -> torch.Tensor:
-        window_idx = lookup[camera_idx]
-        if window.ndim == 4:
-            return window[window_idx, y_idx, x_idx, :]
-        return window[window_idx, y_idx, x_idx]
-
-    def _index_triplet(self, batch, scale_h, scale_w):
+    def _populate_batch_features(self, image_batch: Dict, batch: Dict, is_eval: bool) -> None:
         ray_indices = batch["indices"]
         camera_idx = ray_indices[:, 0]
-        y_idx = (ray_indices[:, 1] * scale_h).long()
-        x_idx = (ray_indices[:, 2] * scale_w).long()
-        return camera_idx, y_idx, x_idx
-
-    def _resolve_loader_ids(self, image_batch: Dict, is_eval: bool) -> Tuple[torch.Tensor, torch.Tensor]:
-        image_ids = image_batch["image_idx"]
-        loader_ids = image_ids + self.eval_offset if is_eval else image_ids
-        return image_ids, loader_ids
-
-    @staticmethod
-    def _stack_feature_window(feature_dict: Dict[int, torch.Tensor], loader_ids: torch.Tensor) -> torch.Tensor:
-        ordered_loader_ids = loader_ids.tolist()
-        return torch.stack([feature_dict[int(idx)] for idx in ordered_loader_ids], dim=0)
-
-    def _build_feature_lookup(self, image_ids: torch.Tensor, is_eval: bool) -> torch.Tensor:
-        lookup_size = len(self.eval_dataset) if is_eval else len(self.train_dataset)
-        lookup = torch.full((lookup_size,), -1, dtype=torch.long, device=image_ids.device)
-        lookup[image_ids] = torch.arange(len(image_ids), dtype=torch.long, device=image_ids.device)
-        return lookup
-
-    def _populate_batch_features(self, image_batch: Dict, batch: Dict, is_eval: bool) -> None:
-        camera_idx, y_feat, x_feat = self._index_triplet(batch, self.feat_scale_h, self.feat_scale_w)
+        y_feat = (ray_indices[:, 1] * self.feat_scale_h).long()
+        x_feat = (ray_indices[:, 2] * self.feat_scale_w).long()
 
         cache = self._eval_window_cache if is_eval else self._train_window_cache
-        token = self._window_token(image_batch)
+        image = image_batch["image"]
+        token = image.data_ptr() if torch.is_tensor(image) else id(image)
         if cache.get("token") == token:
             feature_window, lookup = cache["feature"], cache["lookup"]  # type: ignore[assignment]
         else:
-            image_ids, loader_ids = self._resolve_loader_ids(image_batch, is_eval=is_eval)
+            image_ids = image_batch["image_idx"]
+            loader_ids = image_ids + len(self.train_dataset) if is_eval else image_ids
             feature_dict = self.feature_loader.load_batch_images(loader_ids)
-            feature_window = self._stack_feature_window(feature_dict, loader_ids)
-            lookup = self._build_feature_lookup(image_ids, is_eval=is_eval)
+            feature_window = torch.stack([feature_dict[int(idx)] for idx in loader_ids.tolist()], dim=0)
+            lookup = torch.full(
+                (len(self.eval_dataset) if is_eval else len(self.train_dataset),),
+                -1,
+                dtype=torch.long,
+                device=image_ids.device,
+            )
+            lookup[image_ids] = torch.arange(len(image_ids), dtype=torch.long, device=image_ids.device)
             cache.clear()
             cache["token"] = token
             cache["feature"] = feature_window
             cache["lookup"] = lookup
 
-        batch["feature"] = self._gather_from_window(feature_window, lookup, camera_idx, y_feat, x_feat)
+        window_idx = lookup[camera_idx]
+        if feature_window.ndim == 4:
+            batch["feature"] = feature_window[window_idx, y_feat, x_feat, :]
+        else:
+            batch["feature"] = feature_window[window_idx, y_feat, x_feat]
 
     def _prepare_sampled_image(self, batch: Dict) -> None:
         image = batch["image"]
@@ -223,26 +199,25 @@ class FeatureDataManager(VanillaDataManager):
         if image.device != self.device:
             batch["image"] = image.to(self.device, non_blocking=True)
 
+    def _next_batch(self, image_iter, pixel_sampler, ray_generator, count_attr: str, is_eval: bool):
+        setattr(self, count_attr, getattr(self, count_attr) + 1)
+        image_batch = next(image_iter)
+        assert pixel_sampler is not None
+        assert isinstance(image_batch, dict)
+        batch = pixel_sampler.sample(image_batch)
+        ray_bundle = ray_generator(batch["indices"])
+        self._prepare_sampled_image(batch)
+        self._populate_batch_features(image_batch, batch, is_eval=is_eval)
+        return ray_bundle, batch
+
     def next_train(self, step: int) -> Tuple[RayBundle, Dict]:
         del step
-        self.train_count += 1
-        image_batch = next(self.iter_train_image_dataloader)
-        assert self.train_pixel_sampler is not None
-        assert isinstance(image_batch, dict)
-        batch = self.train_pixel_sampler.sample(image_batch)
-        ray_bundle = self.train_ray_generator(batch["indices"])
-        self._prepare_sampled_image(batch)
-        self._populate_batch_features(image_batch, batch, is_eval=False)
-        return ray_bundle, batch
+        return self._next_batch(
+            self.iter_train_image_dataloader, self.train_pixel_sampler, self.train_ray_generator, "train_count", False
+        )
 
     def next_eval(self, step: int) -> Tuple[RayBundle, Dict]:
         del step
-        self.eval_count += 1
-        image_batch = next(self.iter_eval_image_dataloader)
-        assert self.eval_pixel_sampler is not None
-        assert isinstance(image_batch, dict)
-        batch = self.eval_pixel_sampler.sample(image_batch)
-        ray_bundle = self.eval_ray_generator(batch["indices"])
-        self._prepare_sampled_image(batch)
-        self._populate_batch_features(image_batch, batch, is_eval=True)
-        return ray_bundle, batch
+        return self._next_batch(
+            self.iter_eval_image_dataloader, self.eval_pixel_sampler, self.eval_ray_generator, "eval_count", True
+        )

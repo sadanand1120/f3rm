@@ -396,6 +396,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
         str(profile.dataset),
         "--feature-type",
         "CLIP",
+        "--skip-visualization",
     ]
     train_command = [
         "ns-train",

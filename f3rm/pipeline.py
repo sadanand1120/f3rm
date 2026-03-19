@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import time
-from typing import Dict, List, Literal, Optional, Type
+from typing import Dict, List, Optional, Type
 
 import torch
 from PIL import Image
@@ -18,25 +18,6 @@ class FeaturePipelineConfig(VanillaPipelineConfig):
 
 
 class FeaturePipeline(VanillaPipeline):
-    def __init__(
-        self,
-        config: FeaturePipelineConfig,
-        device: str,
-        test_mode: Literal["test", "val", "inference"] = "val",
-        world_size: int = 1,
-        local_rank: int = 0,
-        grad_scaler=None,
-    ):
-        super().__init__(
-            config=config,
-            device=device,
-            test_mode=test_mode,
-            world_size=world_size,
-            local_rank=local_rank,
-            grad_scaler=grad_scaler,
-        )
-        self._local_rank = local_rank
-
     @profiler.time_function
     def get_train_loss_dict(self, step: int):
         ray_bundle, batch = self.datamanager.next_train(step)
@@ -47,24 +28,6 @@ class FeaturePipeline(VanillaPipeline):
         if self.config.steps_per_train_image_viz and step_check(step, self.config.steps_per_train_image_viz):
             self._log_train_images_for_step(batch, step)
         return model_outputs, loss_dict, metrics_dict
-
-    def _render_outputs(self, camera_ray_bundle, render_features: bool = True) -> Dict[str, torch.Tensor]:
-        return self.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle, render_features=render_features)
-
-    @staticmethod
-    def _image_idx_from_batch(batch: Dict) -> int:
-        image_idx = batch["image_idx"]
-        if torch.is_tensor(image_idx):
-            return int(image_idx.item())
-        return int(image_idx)
-
-    def _get_deterministic_eval_camera_and_batch(self, step: int):
-        """Pick eval image deterministically to keep eval logs reproducible."""
-        if hasattr(self.datamanager, "fixed_indices_eval_dataloader") and self.datamanager.eval_dataset is not None:
-            num_eval = len(self.datamanager.eval_dataset)
-            image_idx = step % max(num_eval, 1)
-            return self.datamanager.fixed_indices_eval_dataloader.get_camera(image_idx)
-        return self.datamanager.next_eval_image(step)
 
     def _log_train_images_for_step(self, batch: Dict, step: int) -> None:
         if "indices" not in batch:
@@ -78,7 +41,7 @@ class FeaturePipeline(VanillaPipeline):
         ci = int(unique_cams[0])
         cams = self.datamanager.train_ray_generator.cameras
         camera_ray_bundle = cams.generate_rays(camera_indices=ci, keep_shape=True)
-        outputs = self._render_outputs(camera_ray_bundle, render_features=True)
+        outputs = self.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle, render_features=True)
         full_batch = self.datamanager.train_dataset.get_data(ci)
         _, images_dict = self.model.get_image_metrics_and_images(outputs, full_batch)
 
@@ -88,13 +51,16 @@ class FeaturePipeline(VanillaPipeline):
     @profiler.time_function
     def get_eval_image_metrics_and_images(self, step: int):
         self.eval()
-        camera, batch = self._get_deterministic_eval_camera_and_batch(step)
+        if hasattr(self.datamanager, "fixed_indices_eval_dataloader") and self.datamanager.eval_dataset is not None:
+            camera, batch = self.datamanager.fixed_indices_eval_dataloader.get_camera(step % max(len(self.datamanager.eval_dataset), 1))
+        else:
+            camera, batch = self.datamanager.next_eval_image(step)
         camera_ray_bundle = camera.generate_rays(camera_indices=0, keep_shape=True)
-        outputs = self._render_outputs(camera_ray_bundle, render_features=False)
+        outputs = self.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle, render_features=False)
         metrics_dict, images_dict = self.model.get_image_metrics_and_images(outputs, batch)
-        image_idx = self._image_idx_from_batch(batch)
+        image_idx = batch["image_idx"]
         assert "image_idx" not in metrics_dict
-        metrics_dict["image_idx"] = image_idx
+        metrics_dict["image_idx"] = int(image_idx.item()) if torch.is_tensor(image_idx) else int(image_idx)
         assert "num_rays" not in metrics_dict
         metrics_dict["num_rays"] = (camera.height * camera.width * camera.size).item()
         self.train()
@@ -121,7 +87,8 @@ class FeaturePipeline(VanillaPipeline):
             metrics_dict, images_dict = self.model.get_image_metrics_and_images(outputs, batch)
 
             if output_path is not None:
-                image_idx = self._image_idx_from_batch(batch)
+                image_idx = batch["image_idx"]
+                image_idx = int(image_idx.item()) if torch.is_tensor(image_idx) else int(image_idx)
                 for key, val in images_dict.items():
                     Image.fromarray((val * 255).byte().cpu().numpy()).save(output_path / f"{image_idx:06d}-{key}.jpg")
             metrics_dict["num_rays_per_sec"] = (num_rays / (time() - inner_start)).item()

@@ -330,19 +330,18 @@ class CLIPExtractor:
         devices_param, num_workers = resolve_devices_and_workers(device, workers_per_gpu)
         if verbose:
             print("Initializing CLIP workers")
-        self.client = AsyncMultiWrapper(
+        self.client_workers = AsyncMultiWrapper(
             _CLIPWorker,
             num_objects=num_workers,
             devices=devices_param,
             model_name=CLIPArgs.model_name,
             pretrained=CLIPArgs.model_pretrained,
-        )
-        self.num_workers = num_workers
+        ).workers
         if verbose:
             print("Warming up CLIP workers...")
         tiny = Image.new("RGB", (8, 8), color=0)
-        for _ in range(self.num_workers):
-            _ = self.client.extract_agg(
+        for worker in self.client_workers:
+            _ = worker.extract_agg(
                 image=tiny,
                 agg_scales=[1.0],
                 agg_weights=None,
@@ -351,19 +350,6 @@ class CLIPExtractor:
                 interpolation_mode="bilinear",
                 padding_mode="constant",
             )
-
-    @staticmethod
-    def _extract_one(worker: _CLIPWorker, image_path: str, output_dtype: Optional[torch.dtype]) -> torch.Tensor:
-        return worker.extract_agg(
-            image=image_path,
-            agg_scales=CLIPArgs.agg_scales,
-            agg_weights=CLIPArgs.agg_weights,
-            load_size=CLIPArgs.load_size,
-            center_crop=not CLIPArgs.skip_center_crop,
-            interpolation_mode="bilinear",
-            padding_mode="constant",
-            output_dtype=output_dtype,
-        )
 
     async def _stream_batch_async(
         self,
@@ -375,7 +361,6 @@ class CLIPExtractor:
             return
 
         loop = asyncio.get_running_loop()
-        workers = self.client.workers
         queue = iter(enumerate(image_paths))
 
         with tqdm(total=len(image_paths), desc="CLIP tasks", leave=False) as pbar:
@@ -387,12 +372,21 @@ class CLIPExtractor:
                         return
                     result = await loop.run_in_executor(
                         None,
-                        lambda path=image_path, clip_worker=worker: self._extract_one(clip_worker, path, output_dtype),
+                        lambda path=image_path, clip_worker=worker: clip_worker.extract_agg(
+                            image=path,
+                            agg_scales=CLIPArgs.agg_scales,
+                            agg_weights=CLIPArgs.agg_weights,
+                            load_size=CLIPArgs.load_size,
+                            center_crop=not CLIPArgs.skip_center_crop,
+                            interpolation_mode="bilinear",
+                            padding_mode="constant",
+                            output_dtype=output_dtype,
+                        ),
                     )
                     on_result(image_idx, result)
                     pbar.update(1)
 
-            await asyncio.gather(*(_worker_loop(worker) for worker in workers))
+            await asyncio.gather(*(_worker_loop(worker) for worker in self.client_workers))
 
         gc.collect()
 
@@ -403,3 +397,37 @@ class CLIPExtractor:
         output_dtype: Optional[torch.dtype] = None,
     ) -> None:
         run_async_in_any_context(lambda: self._stream_batch_async(image_paths, on_result, output_dtype=output_dtype))
+
+
+def examine_saved(clip_feat_dir: str) -> None:
+    """Create an MP4 video of saved CLIP features using PCA visualization."""
+    import cv2
+
+    from f3rm.features.utils import apply_pca_colormap
+
+    meta_path = os.path.join(clip_feat_dir, "meta.pt")
+    if not os.path.exists(meta_path):
+        raise FileNotFoundError(f"CLIP meta not found at {meta_path}")
+
+    meta = torch.load(meta_path, map_location="cpu")
+    image_fnames = meta["image_fnames"]
+    n_images = len(image_fnames)
+
+    first_feat = np.load(os.path.join(clip_feat_dir, "image_000000.npy"))
+    height, width = first_feat.shape[:2]
+    video_path = os.path.join(clip_feat_dir, "features_viz.mp4")
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(video_path, fourcc, 2.0, (width, height))
+
+    try:
+        for image_idx in tqdm(range(n_images), desc="Creating CLIP features video"):
+            feat_path = os.path.join(clip_feat_dir, f"image_{image_idx:06d}.npy")
+            feat = torch.from_numpy(np.load(feat_path)).float()
+            pca_img = apply_pca_colormap(feat, niter=5, q_min=0.01, q_max=0.99)
+            frame = (pca_img.cpu().numpy() * 255).astype(np.uint8)
+            writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+    finally:
+        writer.release()
+
+    if not os.path.exists(video_path):
+        raise FileNotFoundError(f"Video not created at {video_path}")

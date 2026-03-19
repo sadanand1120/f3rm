@@ -9,11 +9,6 @@ import numpy as np
 import torch
 
 
-def parse_comma_separated_labels(raw_text: str) -> List[str]:
-    """Parse comma-separated labels and drop empty tokens."""
-    return [x.strip() for x in raw_text.split(",") if x.strip()]
-
-
 def l2_normalize_embeddings(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """L2-normalize embedding tensors on the last dimension."""
     return x / x.norm(dim=-1, keepdim=True).clamp_min(eps)
@@ -60,23 +55,8 @@ def resolve_devices_and_workers(device: torch.device, batch_size_per_gpu: int) -
     return torch.device("cpu"), 1
 
 
-def run_async_in_any_context(coro_fn: Callable[[], Any]) -> Any:
-    """Run an async coroutine function regardless of existing event loop."""
-    try:
-        asyncio.get_running_loop()
-
-        def _thread_run():
-            return asyncio.run(coro_fn())
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            fut = ex.submit(_thread_run)
-            return fut.result()
-    except RuntimeError:
-        return asyncio.run(coro_fn())
-
-
 class AsyncMultiWrapper:
-    """Round-robin dispatcher over multiple worker instances."""
+    """Container for multiple worker instances."""
 
     def __init__(
         self,
@@ -87,7 +67,6 @@ class AsyncMultiWrapper:
     ) -> None:
         if num_objects < 1:
             raise ValueError("num_objects must be >= 1")
-
         if devices is None:
             if torch.cuda.is_available():
                 device_iter = cycle(range(torch.cuda.device_count()))
@@ -105,25 +84,22 @@ class AsyncMultiWrapper:
                 resolved_devices = [next(device_iter) for _ in range(num_objects)]
             else:
                 resolved_devices = resolved_devices[:num_objects]
+        self.workers = [worker_cls(device=device, **worker_kwargs) for device in resolved_devices]
 
-        self._workers = [worker_cls(device=device, **worker_kwargs) for device in resolved_devices]
-        self._rr_index = 0
 
-    @property
-    def workers(self) -> List[Any]:
-        return self._workers
+def run_async_in_any_context(coro_fn: Callable[[], Any]) -> Any:
+    """Run an async coroutine function regardless of existing event loop."""
+    try:
+        asyncio.get_running_loop()
 
-    def _next_worker(self) -> Any:
-        worker = self._workers[self._rr_index]
-        self._rr_index = (self._rr_index + 1) % len(self._workers)
-        return worker
+        def _thread_run():
+            return asyncio.run(coro_fn())
 
-    def __getattr__(self, name: str) -> Callable[..., Any]:
-        def _dispatch(*args: Any, **kwargs: Any) -> Any:
-            worker = self._next_worker()
-            return getattr(worker, name)(*args, **kwargs)
-
-        return _dispatch
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(_thread_run)
+            return fut.result()
+    except RuntimeError:
+        return asyncio.run(coro_fn())
 
 
 def apply_pca_colormap(
@@ -161,7 +137,6 @@ class BatchFeatureLoader:
         self,
         data_dir: Path,
         feature_type: str,
-        image_fnames: List[str],
         device: torch.device,
         max_cpu_images: int = 128,
         max_gpu_images: int = 16,
@@ -170,9 +145,6 @@ class BatchFeatureLoader:
         if feature_type != "CLIP":
             raise ValueError(f"Unsupported feature type: {feature_type}")
 
-        self.data_dir = data_dir
-        self.feature_type = feature_type
-        self.image_fnames = image_fnames
         self.device = device
         self.root, _ = get_cache_paths(data_dir, feature_type)
         self.max_cpu_images = int(max_cpu_images)
@@ -184,7 +156,6 @@ class BatchFeatureLoader:
 
         sample_features = self._load_single_image_cpu(0)
         self.H, self.W, self.C = sample_features.shape
-        self.dtype = sample_features.dtype
 
     def _load_single_image_cpu(self, img_idx: int) -> torch.Tensor:
         data = np.load(self.root / f"image_{img_idx:06d}.npy", mmap_mode="r")
