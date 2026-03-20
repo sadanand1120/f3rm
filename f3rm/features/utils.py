@@ -43,14 +43,14 @@ def compute_similarity_scores(
     return sims
 
 
-def resolve_devices_and_workers(device: torch.device, batch_size_per_gpu: int) -> Tuple[Optional[torch.device], int]:
+def resolve_devices_and_workers(device: torch.device, workers_per_gpu: int) -> Tuple[Optional[torch.device], int]:
     """Return (devices_param, num_workers) for AsyncMultiWrapper using per-GPU worker count."""
     if device.type == "cuda":
         if device.index is None:
             n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-            num_workers = max(1, (n_gpus or 1) * max(1, batch_size_per_gpu))
+            num_workers = max(1, (n_gpus or 1) * max(1, workers_per_gpu))
             return None, num_workers
-        num_workers = max(1, batch_size_per_gpu)
+        num_workers = max(1, workers_per_gpu)
         return torch.device(f"cuda:{device.index}"), num_workers
     return torch.device("cpu"), 1
 
@@ -131,7 +131,7 @@ def apply_pca_colormap(
 
 
 class BatchFeatureLoader:
-    """Batch feature loader for per-image CLIP features."""
+    """Batch feature loader for per-image feature tensors."""
 
     def __init__(
         self,
@@ -142,9 +142,6 @@ class BatchFeatureLoader:
         max_gpu_images: int = 16,
         pin_cpu_tensors: bool = True,
     ):
-        if feature_type != "CLIP":
-            raise ValueError(f"Unsupported feature type: {feature_type}")
-
         self.device = device
         self.root, _ = get_cache_paths(data_dir, feature_type)
         self.max_cpu_images = int(max_cpu_images)
@@ -155,7 +152,13 @@ class BatchFeatureLoader:
         self._stream = torch.cuda.Stream() if torch.cuda.is_available() else None
 
         sample_features = self._load_single_image_cpu(0)
-        self.H, self.W, self.C = sample_features.shape
+        if sample_features.ndim == 2:
+            self.H, self.W = sample_features.shape
+            self.C = 1
+        elif sample_features.ndim == 3:
+            self.H, self.W, self.C = sample_features.shape
+        else:
+            raise ValueError(f"Unsupported cached feature shape: {tuple(sample_features.shape)}")
 
     def _load_single_image_cpu(self, img_idx: int) -> torch.Tensor:
         data = np.load(self.root / f"image_{img_idx:06d}.npy", mmap_mode="r")

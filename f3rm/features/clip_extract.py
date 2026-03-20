@@ -1,5 +1,4 @@
 import asyncio
-import gc
 import os
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Union
@@ -19,16 +18,12 @@ CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
 CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
 
 
-def _env_int(name: str, default: int) -> int:
-    return int(os.getenv(name, default))
-
-
 class CLIPArgs:
     model_name: str = "ViT-L-14-336-quickgelu"
     model_pretrained: str = "openai"
     load_size: int = 2048
     skip_center_crop: bool = True
-    batch_size_per_gpu: int = 4
+    workers_per_gpu: int = 4
     agg_scales: List[float] = [0.25, 0.5, 1.0, 1.5]
     agg_weights: Optional[List[float]] = [1.5, 3, 6, 3]
 
@@ -326,8 +321,7 @@ class _CLIPWorker(nn.Module):
 
 class CLIPExtractor:
     def __init__(self, device: torch.device, verbose: bool = False) -> None:
-        workers_per_gpu = _env_int("F3RM_CLIP_WORKERS_PER_GPU", CLIPArgs.batch_size_per_gpu)
-        devices_param, num_workers = resolve_devices_and_workers(device, workers_per_gpu)
+        devices_param, num_workers = resolve_devices_and_workers(device, CLIPArgs.workers_per_gpu)
         if verbose:
             print("Initializing CLIP workers")
         self.client_workers = AsyncMultiWrapper(
@@ -387,8 +381,6 @@ class CLIPExtractor:
                     pbar.update(1)
 
             await asyncio.gather(*(_worker_loop(worker) for worker in self.client_workers))
-
-        gc.collect()
 
     def stream_batch(
         self,

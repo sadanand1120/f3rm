@@ -7,58 +7,79 @@ can be added without changing training-time loading code.
 """
 
 import gc
+from dataclasses import dataclass
 import math
-import os
 from pathlib import Path
-from typing import Any, List
+from typing import Any, Callable, List, Optional
 
 import numpy as np
 import torch
 from nerfstudio.utils.rich_utils import CONSOLE
 
-from f3rm.features.clip_extract import CLIPArgs, CLIPExtractor, examine_saved
+from f3rm.features.clip_extract import CLIPArgs, CLIPExtractor, examine_saved as examine_saved_clip
+from f3rm.features.sam_extract import SAMArgs, SAMExtractor, examine_saved as examine_saved_sam
 from f3rm.features.utils import BatchFeatureLoader, get_cache_paths
 
 
-def _env_int(name: str, default: int) -> int:
-    return int(os.getenv(name, default))
+@dataclass(frozen=True)
+class FeatureSpec:
+    args_cls: Any
+    extractor_cls: Any
+    examine_saved: Callable[[str], None]
+    output_dtype: Optional[torch.dtype] = None
 
 
-def _feature_env_name(feature_type: str, suffix: str) -> str:
-    feature_token = feature_type.replace("-", "_").upper()
-    return f"F3RM_{feature_token}_{suffix}"
+FEATURE_SPECS = {
+    "CLIP": FeatureSpec(
+        args_cls=CLIPArgs,
+        extractor_cls=CLIPExtractor,
+        examine_saved=examine_saved_clip,
+        output_dtype=torch.float16,
+    ),
+    "SAM": FeatureSpec(
+        args_cls=SAMArgs,
+        extractor_cls=SAMExtractor,
+        examine_saved=examine_saved_sam,
+    ),
+}
 
 
-def _current_feature_args_id(feature_type: str) -> dict[str, Any]:
-    if feature_type == "CLIP":
-        return CLIPArgs.id_dict()
-    raise ValueError(f"Unsupported feature type: {feature_type}")
+def _resolve_feature_spec(feature_type: str) -> tuple[str, FeatureSpec]:
+    normalized_feature_type = feature_type.upper()
+    spec = FEATURE_SPECS.get(normalized_feature_type)
+    if spec is None:
+        raise ValueError(f"Unsupported feature type: {feature_type}")
+    return normalized_feature_type, spec
 
 
-def _save_per_image_clip(
+def _save_per_image_features(
     image_fnames: List[str],
     data_dir: Path,
+    feature_type: str,
     device: torch.device,
     batch_size: int,
+    write_threads: int = 1,
 ) -> None:
     import concurrent.futures
     from tqdm.auto import tqdm
 
-    root, meta = get_cache_paths(data_dir, "CLIP")
+    feature_type, spec = _resolve_feature_spec(feature_type)
+    root, meta = get_cache_paths(data_dir, feature_type)
     root.mkdir(parents=True, exist_ok=True)
     if batch_size <= 0:
         raise ValueError(f"batch_size must be > 0, got {batch_size}")
+    if write_threads <= 0:
+        raise ValueError(f"write_threads must be > 0, got {write_threads}")
 
-    extractor = CLIPExtractor(device=device, verbose=True)
     n_imgs = len(image_fnames)
     n_batches = math.ceil(n_imgs / batch_size)
-    write_threads = max(1, _env_int(_feature_env_name("CLIP", "WRITE_THREADS"), 1))
+    extractor = spec.extractor_cls(device=device, verbose=True)
 
     def _save_one_image(img_idx: int, img_tensor: torch.Tensor) -> None:
         np.save(root / f"image_{img_idx:06d}.npy", img_tensor.numpy(), allow_pickle=False)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=write_threads) as executor:
-        for batch_idx in tqdm(range(n_batches), desc="CLIP: extracting", position=0):
+        for batch_idx in tqdm(range(n_batches), desc=f"{feature_type}: extracting", position=0):
             start = batch_idx * batch_size
             end = min((batch_idx + 1) * batch_size, n_imgs)
             batch_paths = image_fnames[start:end]
@@ -67,7 +88,7 @@ def _save_per_image_clip(
             def _submit_write(local_idx: int, img_tensor: torch.Tensor) -> None:
                 pending_writes.append(executor.submit(_save_one_image, start + local_idx, img_tensor))
 
-            extractor.stream_batch(batch_paths, on_result=_submit_write, output_dtype=torch.float16)
+            extractor.stream_batch(batch_paths, on_result=_submit_write, output_dtype=spec.output_dtype)
             for future in pending_writes:
                 future.result()
 
@@ -78,45 +99,28 @@ def _save_per_image_clip(
     normalized_image_fnames = [_normalize_image_path_for_cache(str(fname), data_dir) for fname in image_fnames]
     torch.save(
         {
-            "args": CLIPArgs.id_dict(),
+            "args": spec.args_cls.id_dict(),
             "image_fnames": image_fnames,
             "normalized_image_fnames": normalized_image_fnames,
         },
         meta,
     )
-    CONSOLE.print(f"Saved CLIP per-image features -> {root}")
+    CONSOLE.print(f"Saved {feature_type} per-image features -> {root}")
 
 
-def _extract_and_save_features(
-    image_fnames: List[str],
-    data_dir: Path,
-    feature_type: str,
-    device: torch.device,
-    batch_size: int,
-) -> None:
-    if feature_type == "CLIP":
-        _save_per_image_clip(image_fnames=image_fnames, data_dir=data_dir, device=device, batch_size=batch_size)
-        return
-    raise ValueError(f"Unsupported feature type: {feature_type}")
-
-
-def _cache_file_count_matches(root: Path, feature_type: str, num_images: int) -> bool:
-    if feature_type == "CLIP":
-        return num_images == 0 or len(list(root.glob("image_*.npy"))) == num_images
-    raise ValueError(f"Unsupported feature type: {feature_type}")
+def _cache_file_count_matches(root: Path, num_images: int) -> bool:
+    return num_images == 0 or len(list(root.glob("image_*.npy"))) == num_images
 
 
 def create_feature_visualization(data_dir: Path, feature_type: str) -> None:
-    if feature_type == "CLIP":
-        feat_dir = data_dir / "features" / feature_type.lower()
-        if not feat_dir.exists():
-            CONSOLE.print(f"[yellow]Feature directory not found: {feat_dir}")
-            return
-        CONSOLE.print(f"[blue]Creating visualization video for {feature_type}...")
-        examine_saved(str(feat_dir))
-        CONSOLE.print(f"[green]Video saved: {feat_dir / 'features_viz.mp4'}")
+    feature_type, spec = _resolve_feature_spec(feature_type)
+    feat_dir = data_dir / "features" / feature_type.lower()
+    if not feat_dir.exists():
+        CONSOLE.print(f"[yellow]Feature directory not found: {feat_dir}")
         return
-    raise ValueError(f"Unsupported feature type: {feature_type}")
+    CONSOLE.print(f"[blue]Creating visualization video for {feature_type}...")
+    spec.examine_saved(str(feat_dir))
+    CONSOLE.print(f"[green]Video saved: {feat_dir / 'features_viz.mp4'}")
 
 
 def _normalize_image_path_for_cache(path_like: str, data_dir: Path) -> str:
@@ -133,6 +137,7 @@ def _normalize_image_path_for_cache(path_like: str, data_dir: Path) -> str:
 
 
 def feature_cache_matches(image_fnames: List[str], current_args: dict[str, Any], data_dir: Path, feature_type: str) -> bool:
+    feature_type, _ = _resolve_feature_spec(feature_type)
     root, meta = get_cache_paths(data_dir, feature_type)
     if not meta.exists():
         CONSOLE.print(f"[DEBUG] {feature_type}: CACHE MISS - Metadata file does not exist")
@@ -161,7 +166,7 @@ def feature_cache_matches(image_fnames: List[str], current_args: dict[str, Any],
     if not args_match or not fnames_match:
         CONSOLE.print(f"[DEBUG] {feature_type}: CACHE MISS - {'Args' if not args_match else 'Filenames'} don't match")
         return False
-    if not _cache_file_count_matches(root, feature_type, len(image_fnames)):
+    if not _cache_file_count_matches(root, len(image_fnames)):
         CONSOLE.print(f"[DEBUG] {feature_type}: CACHE MISS - Per-image file count mismatch")
         return False
 
@@ -190,6 +195,7 @@ def extract_features_for_dataset(
     feature_type: str,
     device: torch.device,
     batch_size: int = 64,
+    write_threads: int = 1,
     enable_cache: bool = True,
     pin_cpu_tensors: bool = True,
     force: bool = False,
@@ -199,18 +205,20 @@ def extract_features_for_dataset(
     if batch_size <= 0:
         raise ValueError(f"batch_size must be > 0, got {batch_size}")
 
+    feature_type, spec = _resolve_feature_spec(feature_type)
     CONSOLE.print(f"[DEBUG] {feature_type}: enable_cache={enable_cache}, checking for cached features...")
-    current_args = _current_feature_args_id(feature_type)
+    current_args = spec.args_cls.id_dict()
     cache_hit = feature_cache_matches(image_fnames, current_args, data_dir, feature_type) if enable_cache and not force else False
 
     if not cache_hit:
         CONSOLE.print(f"[{feature_type}] Extracting features...")
-        _extract_and_save_features(
+        _save_per_image_features(
             image_fnames=image_fnames,
             data_dir=data_dir,
             feature_type=feature_type,
             device=device,
             batch_size=batch_size,
+            write_threads=write_threads,
         )
     else:
         CONSOLE.print(f"[{feature_type}] Using cached features")
@@ -229,12 +237,13 @@ def extract_features_standalone(
     data_dir: Path,
     feature_type: str = "CLIP",
     batch_size: int = 64,
+    write_threads: int = 1,
     device: str = "auto",
     force: bool = False,
     skip_visualization: bool = False,
 ) -> BatchFeatureLoader:
+    feature_type, _ = _resolve_feature_spec(feature_type)
     resolved_device = torch.device("cuda" if device == "auto" and torch.cuda.is_available() else "cpu") if device == "auto" else torch.device(device)
-    batch_size = _env_int(_feature_env_name(feature_type, "BATCH_SIZE"), batch_size)
 
     CONSOLE.print(f"Using device: {resolved_device}")
     image_fnames = get_image_filenames_from_dataparser(data_dir)
@@ -244,6 +253,7 @@ def extract_features_standalone(
         feature_type=feature_type,
         device=resolved_device,
         batch_size=batch_size,
+        write_threads=write_threads,
         enable_cache=True,
         force=force,
     )
@@ -257,7 +267,7 @@ def extract_features_standalone(
     return batch_loader
 
 
-def main():
+if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
@@ -265,15 +275,12 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--data", type=Path, required=True, help="Path to the dataset directory (same as used in training)")
-    parser.add_argument("--feature-type", type=str, default="CLIP", help="Feature type to extract.")
+    parser.add_argument("--feature-type", type=str, default="CLIP", choices=sorted(FEATURE_SPECS), help="Feature type to extract.")
     parser.add_argument("--batch-size", type=int, default=32, help="Number of images to process in each extraction batch.")
+    parser.add_argument("--write-threads", type=int, default=1, help="Number of CPU threads used to write extracted feature files.")
     parser.add_argument("--device", type=str, default="auto", help="Device to use (auto, cuda, cpu, cuda:0, etc.)")
     parser.add_argument("--force", action="store_true", help="Force re-extraction even if cache exists")
-    parser.add_argument(
-        "--skip-visualization",
-        action="store_true",
-        help="Skip PCA video generation.",
-    )
+    parser.add_argument("--skip-visualization", action="store_true", help="Skip feature visualization video generation.")
     args = parser.parse_args()
 
     if not args.data.exists():
@@ -287,11 +294,8 @@ def main():
         data_dir=args.data,
         feature_type=args.feature_type,
         batch_size=args.batch_size,
+        write_threads=args.write_threads,
         device=args.device,
         force=args.force,
         skip_visualization=args.skip_visualization,
     )
-
-
-if __name__ == "__main__":
-    main()
