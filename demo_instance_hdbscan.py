@@ -11,7 +11,9 @@ import viser
 from cuml.cluster import HDBSCAN
 from cuml.preprocessing import StandardScaler
 from nerfstudio.utils.eval_utils import eval_setup
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.neighbors import KDTree
+from umap import UMAP
 
 
 def as_numpy(x):
@@ -38,31 +40,273 @@ def preprocess_features(x: cp.ndarray, mode: str) -> cp.ndarray:
     raise ValueError(f"Unknown preprocess mode: {mode}")
 
 
-def colorize(labels: np.ndarray, seed: int) -> np.ndarray:
-    image = np.zeros((*labels.shape, 3), dtype=np.float32)
-    image[labels == -1] = 0.65
+def cluster_palette(labels: np.ndarray, seed: int) -> dict[int, np.ndarray]:
+    palette = {-1: np.full(3, 0.65, dtype=np.float32)}
     cluster_ids = np.array(sorted(label for label in np.unique(labels) if label >= 0), dtype=np.int64)
     if len(cluster_ids) == 0:
-        return image
+        return palette
     colors = plt.cm.hsv(np.linspace(0.0, 1.0, len(cluster_ids), endpoint=False))[:, :3].astype(np.float32)
     rng = np.random.default_rng(seed)
     colors = colors[rng.permutation(len(colors))]
     for color, label in zip(colors, cluster_ids):
-        image[labels == label] = color
+        palette[int(label)] = color
+    return palette
+
+
+def colorize(labels: np.ndarray, palette: dict[int, np.ndarray]) -> np.ndarray:
+    image = np.zeros((*labels.shape, 3), dtype=np.float32)
+    image[labels == -1] = palette[-1]
+    for label, color in palette.items():
+        if label >= 0:
+            image[labels == label] = color
     return image
 
 
-def point_colors(labels: np.ndarray, seed: int) -> np.ndarray:
-    colors = np.full((len(labels), 3), 0.65, dtype=np.float32)
-    cluster_ids = np.array(sorted(label for label in np.unique(labels) if label >= 0), dtype=np.int64)
-    if len(cluster_ids) == 0:
-        return colors
-    palette = plt.cm.hsv(np.linspace(0.0, 1.0, len(cluster_ids), endpoint=False))[:, :3].astype(np.float32)
-    rng = np.random.default_rng(seed)
-    palette = palette[rng.permutation(len(palette))]
-    for color, label in zip(palette, cluster_ids):
-        colors[labels == label] = color
+def point_colors(labels: np.ndarray, palette: dict[int, np.ndarray]) -> np.ndarray:
+    colors = np.repeat(palette[-1][None, :], len(labels), axis=0)
+    for label, color in palette.items():
+        if label >= 0:
+            colors[labels == label] = color
     return colors
+
+
+def label_pixel_counts(labels: np.ndarray) -> dict[int, int]:
+    unique, counts = np.unique(labels, return_counts=True)
+    return {int(label): int(count) for label, count in zip(unique, counts)}
+
+
+def sample_embedding_indices(
+    labels: np.ndarray,
+    pixel_counts: dict[int, int],
+    max_points: int,
+    seed: int,
+) -> np.ndarray:
+    candidate_labels = np.array(
+        [label for label in sorted(np.unique(labels)) if pixel_counts.get(int(label), 0) > 0],
+        dtype=np.int64,
+    )
+    if len(candidate_labels) == 0:
+        return np.zeros(0, dtype=np.int64)
+
+    available_total = int(sum(np.sum(labels == label) for label in candidate_labels))
+    if max_points <= 0 or available_total <= max_points:
+        return np.sort(np.concatenate([np.flatnonzero(labels == label) for label in candidate_labels], axis=0)).astype(np.int64)
+
+    weights = np.array([pixel_counts[int(label)] for label in candidate_labels], dtype=np.float64)
+    weights /= np.clip(weights.sum(), 1.0, None)
+    raw_targets = weights * max_points
+    quotas = np.floor(raw_targets).astype(np.int64)
+
+    positive = weights > 0.0
+    quotas[positive] = np.maximum(quotas[positive], 1)
+    available = np.array([np.sum(labels == label) for label in candidate_labels], dtype=np.int64)
+    quotas = np.minimum(quotas, available)
+
+    total = int(quotas.sum())
+    remainders = raw_targets - np.floor(raw_targets)
+    order = np.argsort(-remainders)
+    while total < max_points:
+        changed = False
+        for idx in order:
+            if quotas[idx] < available[idx]:
+                quotas[idx] += 1
+                total += 1
+                changed = True
+                if total >= max_points:
+                    break
+        if not changed:
+            break
+
+    while total > max_points:
+        removable = np.flatnonzero(quotas > 1)
+        if len(removable) == 0:
+            removable = np.flatnonzero(quotas > 0)
+            if len(removable) == 0:
+                break
+        idx = removable[np.argmin(remainders[removable])]
+        quotas[idx] -= 1
+        total -= 1
+
+    rng = np.random.default_rng(seed)
+    keep = []
+    for label, quota in zip(candidate_labels, quotas):
+        if quota <= 0:
+            continue
+        idx = np.flatnonzero(labels == label)
+        if len(idx) > quota:
+            idx = rng.choice(idx, size=int(quota), replace=False)
+        keep.append(np.sort(idx))
+
+    if not keep:
+        return np.zeros(0, dtype=np.int64)
+    return np.sort(np.concatenate(keep, axis=0)).astype(np.int64)
+
+
+def compute_supervised_umap(
+    cluster_features: cp.ndarray,
+    labels: np.ndarray,
+    pixel_counts: dict[int, int],
+    seed: int,
+    max_points: int,
+):
+    if len(labels) == 0:
+        return np.zeros((0, 2), dtype=np.float32), np.zeros(0, dtype=np.int32)
+
+    sample_idx = sample_embedding_indices(labels, pixel_counts, max_points, seed)
+    if len(sample_idx) == 0:
+        return np.zeros((0, 2), dtype=np.float32), np.zeros(0, dtype=np.int32)
+    embed_labels = labels[sample_idx].astype(np.int32, copy=False)
+    if len(np.unique(embed_labels)) < 2:
+        return np.zeros((0, 2), dtype=np.float32), embed_labels
+
+    embed_feats = cp.asnumpy(cluster_features[cp.asarray(sample_idx)]).astype(np.float32, copy=False)
+    unique_labels = np.array(sorted(np.unique(embed_labels)), dtype=np.int32)
+    supervised_targets = np.searchsorted(unique_labels, embed_labels).astype(np.int32, copy=False)
+
+    reducer = UMAP(
+        n_components=2,
+        n_neighbors=30,
+        min_dist=0.0,
+        metric="euclidean",
+        target_metric="categorical",
+        target_weight=0.95,
+        random_state=seed,
+        transform_seed=seed,
+        low_memory=True,
+    )
+    embedding = reducer.fit_transform(embed_feats, y=supervised_targets).astype(np.float32, copy=False)
+    return embedding, embed_labels
+
+
+def compute_lda_projection(
+    cluster_features: cp.ndarray,
+    labels: np.ndarray,
+    pixel_counts: dict[int, int],
+    seed: int,
+    max_points: int,
+):
+    fit_mask = labels >= 0
+    if not np.any(fit_mask):
+        return np.zeros((0, 2), dtype=np.float32), np.zeros(0, dtype=np.int32)
+
+    fit_idx = np.flatnonzero(fit_mask)
+    fit_labels = labels[fit_idx]
+    nonneg_pixel_counts = {label: count for label, count in pixel_counts.items() if label >= 0}
+    sample_local = sample_embedding_indices(fit_labels, nonneg_pixel_counts, max_points, seed)
+    if len(sample_local) == 0:
+        return np.zeros((0, 2), dtype=np.float32), np.zeros(0, dtype=np.int32)
+    sample_idx = fit_idx[sample_local]
+    embed_labels = labels[sample_idx].astype(np.int32, copy=False)
+    unique_labels = np.array(sorted(np.unique(embed_labels)), dtype=np.int32)
+    if len(unique_labels) < 2:
+        return np.zeros((0, 2), dtype=np.float32), embed_labels
+
+    embed_feats = cp.asnumpy(cluster_features[cp.asarray(sample_idx)]).astype(np.float32, copy=False)
+    n_components = min(2, len(unique_labels) - 1)
+    reducer = LinearDiscriminantAnalysis(n_components=n_components)
+    embedding = reducer.fit_transform(embed_feats, embed_labels).astype(np.float32, copy=False)
+    if embedding.ndim == 1:
+        embedding = embedding[:, None]
+    if embedding.shape[1] == 1:
+        embedding = np.concatenate([embedding, np.zeros((len(embedding), 1), dtype=np.float32)], axis=1)
+    return embedding, embed_labels
+
+
+def directed_nn_distances(a: cp.ndarray, b: cp.ndarray) -> np.ndarray:
+    if len(a) == 0 or len(b) == 0:
+        return np.zeros(0, dtype=np.float32)
+    a_sq = cp.sum(a * a, axis=1, keepdims=True)
+    b_sq = cp.sum(b * b, axis=1)
+    d2 = cp.maximum(a_sq + b_sq[None, :] - 2.0 * (a @ b.T), 0.0)
+    return cp.asnumpy(cp.sqrt(cp.min(d2, axis=1))).astype(np.float32, copy=False)
+
+
+def closest_cluster_pairs_to_epsilon(
+    cluster_features: cp.ndarray,
+    labels: np.ndarray,
+    epsilon: float,
+    seed: int,
+    top_k: int = 5,
+    sample_size: int = 2048,
+):
+    cluster_ids = np.array(sorted(label for label in np.unique(labels) if label >= 0), dtype=np.int32)
+    if len(cluster_ids) < 2:
+        return []
+
+    rng = np.random.default_rng(seed)
+    sampled = {}
+    for label in cluster_ids:
+        idx = np.flatnonzero(labels == label)
+        if len(idx) > sample_size:
+            idx = rng.choice(idx, size=sample_size, replace=False)
+        sampled[int(label)] = cluster_features[cp.asarray(np.sort(idx).astype(np.int64))]
+
+    stats = []
+    for i, label_a in enumerate(cluster_ids):
+        feats_a = sampled[int(label_a)]
+        for label_b in cluster_ids[i + 1 :]:
+            feats_b = sampled[int(label_b)]
+            dists = np.concatenate(
+                [
+                    directed_nn_distances(feats_a, feats_b),
+                    directed_nn_distances(feats_b, feats_a),
+                ],
+                axis=0,
+            )
+            if len(dists) == 0:
+                continue
+            p1, p5, p10 = np.percentile(dists, [1, 5, 10])
+            stats.append(
+                {
+                    "pair": (int(label_a), int(label_b)),
+                    "min": float(dists.min()),
+                    "p1": float(p1),
+                    "p5": float(p5),
+                    "p10": float(p10),
+                    "delta_p5_to_eps": float(p5 - epsilon),
+                }
+            )
+
+    stats.sort(key=lambda x: abs(x["delta_p5_to_eps"]))
+    return stats[:top_k]
+
+
+def plot_feature_embedding(ax, embedding: np.ndarray, labels: np.ndarray, palette: dict[int, np.ndarray], title: str):
+    ax.set_xticks([])
+    ax.set_yticks([])
+    if len(embedding) == 0:
+        ax.set_title(title)
+        ax.text(0.5, 0.5, "Need >=2 labels", ha="center", va="center", transform=ax.transAxes)
+        return
+
+    colors = point_colors(labels, palette)
+    ax.scatter(
+        embedding[:, 0],
+        embedding[:, 1],
+        s=4,
+        c=colors,
+        alpha=0.8,
+        linewidths=0,
+        rasterized=True,
+    )
+    ax.set_title(f"{title} ({len(labels)} pts)")
+
+    for label in sorted(int(x) for x in np.unique(labels) if x >= 0):
+        pts = embedding[labels == label]
+        if len(pts) == 0:
+            continue
+        center = np.median(pts, axis=0)
+        ax.text(
+            center[0],
+            center[1],
+            str(label),
+            color="white",
+            ha="center",
+            va="center",
+            fontsize=12,
+            weight="bold",
+            bbox=dict(boxstyle="round,pad=0.2", facecolor="black", alpha=0.6, edgecolor="none"),
+        )
 
 
 def annotate_clusters(ax, labels: np.ndarray):
@@ -176,8 +420,8 @@ def export_instance_cloud(pipeline, ray_generator, num_points: int, num_rays_per
     return points, feats
 
 
-def show_cluster_cloud(points: np.ndarray, labels: np.ndarray, seed: int):
-    colors = (255.0 * point_colors(labels, seed)).astype(np.uint8)
+def show_cluster_cloud(points: np.ndarray, labels: np.ndarray, palette: dict[int, np.ndarray]):
+    colors = (255.0 * point_colors(labels, palette)).astype(np.uint8)
     diag = np.linalg.norm(points.max(axis=0) - points.min(axis=0))
     server = viser.ViserServer()
     share_url = server.request_share_url()
@@ -209,11 +453,12 @@ def main():
     p.add_argument("--remove-outliers", action=BooleanOptionalAction, default=True)
     p.add_argument("--std-ratio", type=float, default=10.0)
     p.add_argument("--voxel-frac", type=float, default=2e-4)
-    p.add_argument("--min-size", type=int, default=2048)
+    p.add_argument("--min-size", type=int, default=1024)  # use 2048 with bm1_new type config
     p.add_argument("--min-samples", type=int, default=256)
-    p.add_argument("--cluster-selection-epsilon", type=float, default=0.02)
+    p.add_argument("--cluster-selection-epsilon", type=float, default=0.4)  # use 0.105 with bm1_new type config
     p.add_argument("--min-prob", type=float, default=0.0)
     p.add_argument("--preprocess", choices=("raw", "std", "l2"), default="raw")
+    p.add_argument("--umap-max-points", type=int, default=50_000)
     p.add_argument("--eval-num-rays-per-chunk", type=int, default=1 << 16)
     p.add_argument("--show-viser-only", action=BooleanOptionalAction, default=False)
     p.add_argument("--seed", type=int, default=42)
@@ -273,8 +518,17 @@ def main():
         probs_valid = cp.asnumpy(clusterer.probabilities_)
         labels_valid[probs_valid < args.min_prob] = -1
 
+    cluster_ids, cluster_counts = np.unique(labels_valid[labels_valid >= 0], return_counts=True)
+    close_pairs = closest_cluster_pairs_to_epsilon(
+        cluster_features,
+        labels_valid,
+        args.cluster_selection_epsilon,
+        args.seed,
+    )
+    palette = cluster_palette(labels_valid, args.seed)
+
     if args.show_viser_only:
-        show_cluster_cloud(source_points, labels_valid, args.seed)
+        show_cluster_cloud(source_points, labels_valid, palette)
         return
 
     log(f"rendering target image {args.image_idx}")
@@ -289,9 +543,26 @@ def main():
     flat_labels = np.full(len(valid), -2, dtype=np.int32)
     flat_labels[valid] = labels_valid[nn].astype(np.int32)
     label_image = flat_labels.reshape(target["shape"])
-    cluster_vis = colorize(label_image, args.seed)
+    cluster_vis = colorize(label_image, palette)
+    visible_pixel_counts = label_pixel_counts(flat_labels[valid].astype(np.int32, copy=False))
+    umap_embedding, umap_labels = compute_supervised_umap(
+        cluster_features,
+        labels_valid,
+        visible_pixel_counts,
+        args.seed,
+        args.umap_max_points,
+    )
+    lda_embedding, lda_labels = compute_lda_projection(
+        cluster_features,
+        labels_valid,
+        visible_pixel_counts,
+        args.seed,
+        args.umap_max_points,
+    )
 
-    fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(14, 7))
+    fig, axes = plt.subplots(2, 2, figsize=(16, 14))
+    ax0, ax1 = axes[0]
+    ax2, ax3 = axes[1]
     ax0.imshow(np.clip(target["image"], 0.0, 1.0))
     ax0.set_title(f"{args.split} image {args.image_idx}")
     ax0.axis("off")
@@ -300,12 +571,24 @@ def main():
     ax1.set_title(f"HDBSCAN on exported 3D instance cloud ({n_clusters} clusters)")
     ax1.axis("off")
     annotate_clusters(ax1, label_image)
+    plot_feature_embedding(ax2, umap_embedding, umap_labels, palette, "Supervised UMAP of clustered features")
+    plot_feature_embedding(ax3, lda_embedding, lda_labels, palette, "LDA of clustered features (labels >= 0)")
     fig.tight_layout()
 
     print(f"image:          {dataset.image_filenames[args.image_idx]}")
     print(f"valid_pixels:   {int(valid.sum())}")
     print(f"clusters:       {n_clusters}")
     print(f"noise_fraction: {np.mean(labels_valid == -1):.3f}")
+    print("cluster_points:")
+    for label, count in zip(cluster_ids, cluster_counts):
+        print(f"  {int(label)}: {int(count)}")
+    print("closest_cluster_pairs_to_eps:")
+    for stat in close_pairs:
+        a, b = stat["pair"]
+        print(
+            f"  ({a}, {b}): min={stat['min']:.4f} p1={stat['p1']:.4f} "
+            f"p5={stat['p5']:.4f} p10={stat['p10']:.4f} delta_p5_to_eps={stat['delta_p5_to_eps']:+.4f}"
+        )
     print(f"elapsed_sec:    {perf_counter() - t0:.1f}")
 
     if args.out:
