@@ -1,11 +1,12 @@
 from dataclasses import dataclass, field
 from collections import defaultdict
 from functools import cached_property
-from typing import Dict, List, Optional, Type
+from typing import Dict, List, Optional, Type, Union
 
 import torch
 import torch.nn.functional as F
 from nerfstudio.cameras.rays import RayBundle, RaySamples
+from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.field_components.field_heads import FieldHeadNames
 from nerfstudio.model_components.losses import (
     orientation_loss,
@@ -23,7 +24,7 @@ from torch.nn import Parameter
 
 from f3rm.feature_field import FeatureField
 from f3rm.features.utils import apply_pca_colormap, compute_similarity_scores
-from f3rm.renderer import FeatureRenderer
+from f3rm.renderer import FeatureRenderer, FeatureSecondMomentRenderer
 
 
 @dataclass
@@ -41,11 +42,28 @@ class FeatureFieldModelConfig(NerfactoModelConfig):
     feat_features_per_level: int = 8
     feat_hidden_dim: int = 64
     feat_num_layers: int = 2
+    inst_feature_dim: int = 8
+    inst2d_lambda: float = 0.1
+    inst_var_lambda: float = 0.5
+    inst_gamma: float = 1.0
+    inst_pos_weight: float = 1.0
+    inst_neg_weight: float = 1.0
+    inst_min_mask_pixels: int = 8
+    inst_use_pe: bool = True
+    inst_pe_n_freq: int = 6
+    inst_num_levels: int = 12
+    inst_log2_hashmap_size: int = 19
+    inst_start_res: int = 16
+    inst_max_res: int = 128
+    inst_features_per_level: int = 8
+    inst_hidden_dim: int = 64
+    inst_num_layers: int = 2
 
 
 @dataclass
 class ViewerUtils:
     pca_proj: Optional[torch.Tensor] = None
+    instance_pca_proj: Optional[torch.Tensor] = None
     positives: List[str] = field(default_factory=list)
     pos_embed: Optional[torch.Tensor] = None
     negatives: List[str] = field(default_factory=list)
@@ -104,16 +122,39 @@ class ViewerUtils:
 
     def reset_pca_proj(self):
         self.pca_proj = None
+        self.instance_pca_proj = None
         CONSOLE.print("Reset PCA projection")
 
 
 viewer_utils = ViewerUtils(device=torch.device("cpu"))
+
+FEATURE_OUTPUT_KEY = "feature"
+INSTANCE_FEATURE_OUTPUT_KEY = "instance-feature"
+INSTANCE_SECOND_MOMENT_OUTPUT_KEY = "instance_feature_second_moment"
+INSTANCE_VARIANCE_OUTPUT_KEY = "instance_feature_variance"
 
 
 class FeatureFieldModel(NerfactoModel):
     config: FeatureFieldModelConfig
 
     feature_field: FeatureField
+    instance_field: FeatureField
+
+    def _build_aux_field(self, prefix: str, feature_dim: int) -> FeatureField:
+        return FeatureField(
+            feature_dim=feature_dim,
+            spatial_distortion=self.field.spatial_distortion,
+            use_pe=getattr(self.config, f"{prefix}_use_pe"),
+            pe_n_freq=getattr(self.config, f"{prefix}_pe_n_freq"),
+            num_levels=getattr(self.config, f"{prefix}_num_levels"),
+            log2_hashmap_size=getattr(self.config, f"{prefix}_log2_hashmap_size"),
+            start_res=getattr(self.config, f"{prefix}_start_res"),
+            max_res=getattr(self.config, f"{prefix}_max_res"),
+            features_per_level=getattr(self.config, f"{prefix}_features_per_level"),
+            hidden_dim=getattr(self.config, f"{prefix}_hidden_dim"),
+            num_layers=getattr(self.config, f"{prefix}_num_layers"),
+            implementation=self.config.implementation,
+        )
 
     def populate_modules(self):
         super().populate_modules()
@@ -122,22 +163,11 @@ class FeatureFieldModel(NerfactoModel):
         if feature_dim <= 0:
             raise ValueError("Feature dimensionality must be positive.")
 
-        self.feature_field = FeatureField(
-            feature_dim=feature_dim,
-            spatial_distortion=self.field.spatial_distortion,
-            use_pe=self.config.feat_use_pe,
-            pe_n_freq=self.config.feat_pe_n_freq,
-            num_levels=self.config.feat_num_levels,
-            log2_hashmap_size=self.config.feat_log2_hashmap_size,
-            start_res=self.config.feat_start_res,
-            max_res=self.config.feat_max_res,
-            features_per_level=self.config.feat_features_per_level,
-            hidden_dim=self.config.feat_hidden_dim,
-            num_layers=self.config.feat_num_layers,
-            implementation=self.config.implementation,
-        )
+        self.feature_field = self._build_aux_field("feat", feature_dim)
+        self.instance_field = self._build_aux_field("inst", self.config.inst_feature_dim)
 
         self.renderer_feature = FeatureRenderer()
+        self.renderer_feature_second_moment = FeatureSecondMomentRenderer()
         self.setup_gui()
 
     def setup_gui(self):
@@ -168,6 +198,7 @@ class FeatureFieldModel(NerfactoModel):
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
         param_groups = super().get_param_groups()
         param_groups["feature_field"] = list(self.feature_field.parameters())
+        param_groups["instance_field"] = list(self.instance_field.parameters())
         return param_groups
 
     @staticmethod
@@ -181,7 +212,12 @@ class FeatureFieldModel(NerfactoModel):
         return torch.linspace(0, num_rays - 1, steps=keep, device=weights.device).round().long().unique(sorted=True)
 
     def _get_outputs_internal(
-        self, ray_bundle: RayBundle, render_features: bool, subsample_supervision_rays: bool = True
+        self,
+        ray_bundle: RayBundle,
+        render_features: bool,
+        render_instance_features: bool = False,
+        render_instance_aux: bool = False,
+        subsample_supervision_rays: bool = True,
     ):
         """Core rendering that can optionally skip feature-field computation."""
         # Match Nerfacto behavior: apply learned camera pose deltas during training.
@@ -220,6 +256,10 @@ class FeatureFieldModel(NerfactoModel):
             feat_vals = self.feature_field.get_feature(feat_ray_samples)
             features = self.renderer_feature(features=feat_vals, weights=feat_weights)
 
+        if render_instance_features:
+            instance_vals = self.instance_field.get_feature(ray_samples)
+            instance_features = self.renderer_feature(features=instance_vals, weights=custom_weights)
+
         outputs_feature_indices = feat_indices if render_features and feat_indices is not None else None
 
         outputs = {
@@ -229,7 +269,16 @@ class FeatureFieldModel(NerfactoModel):
             "expected_depth": expected_depth,
         }
         if render_features:
-            outputs["feature"] = features
+            outputs[FEATURE_OUTPUT_KEY] = features
+        if render_instance_features:
+            outputs[INSTANCE_FEATURE_OUTPUT_KEY] = instance_features
+            if render_instance_aux:
+                instance_second_moment = self.renderer_feature_second_moment(features=instance_vals, weights=custom_weights)
+                outputs[INSTANCE_SECOND_MOMENT_OUTPUT_KEY] = instance_second_moment
+                outputs[INSTANCE_VARIANCE_OUTPUT_KEY] = torch.clamp_min(
+                    instance_second_moment - instance_features.square(),
+                    0.0,
+                )
         if outputs_feature_indices is not None:
             outputs["feature_ray_indices"] = outputs_feature_indices
 
@@ -263,6 +312,125 @@ class FeatureFieldModel(NerfactoModel):
         """Modified from nerfacto.get_outputs to include feature field outputs."""
         return self._get_outputs_internal(ray_bundle, render_features=True)
 
+    def forward(
+        self, ray_bundle: Union[RayBundle, Cameras], instance_ray_bundle: Optional[RayBundle] = None
+    ) -> Dict[str, torch.Tensor | List]:
+        if isinstance(ray_bundle, Cameras):
+            raise TypeError("FeatureFieldModel.forward expects a RayBundle during training.")
+        if self.collider is not None:
+            ray_bundle = self.collider(ray_bundle)
+        outputs = self.get_outputs(ray_bundle)
+        if instance_ray_bundle is not None:
+            outputs.update(self.get_instance_outputs(instance_ray_bundle))
+        return outputs
+
+    def get_instance_outputs(self, ray_bundle: RayBundle) -> Dict[str, torch.Tensor]:
+        # Match the CLIP feature branch: instance supervision consumes detached rendering weights.
+        with torch.no_grad():
+            if self.training:
+                self.camera_optimizer.apply_to_raybundle(ray_bundle)
+            if self.collider is not None:
+                ray_bundle = self.collider(ray_bundle)
+            ray_samples, _, _ = self.proposal_sampler(ray_bundle, density_fns=self.density_fns)
+            density, _ = self.field.get_density(ray_samples)
+            weights = ray_samples.get_weights(density).detach()
+
+        instance_values = self.instance_field.get_feature(ray_samples)
+        instance_features = self.renderer_feature(features=instance_values, weights=weights)
+        instance_second_moment = self.renderer_feature_second_moment(features=instance_values, weights=weights)
+        return {
+            INSTANCE_FEATURE_OUTPUT_KEY: instance_features,
+            INSTANCE_SECOND_MOMENT_OUTPUT_KEY: instance_second_moment,
+            INSTANCE_VARIANCE_OUTPUT_KEY: torch.clamp_min(instance_second_moment - instance_features.square(), 0.0),
+        }
+
+    @staticmethod
+    def _instance_patch_size(batch: Dict[str, torch.Tensor | int]) -> int:
+        patch_size = batch["patch_size"]
+        if torch.is_tensor(patch_size):
+            return int(patch_size.item())
+        return int(patch_size)
+
+    @staticmethod
+    def _instance_patch_count(batch: Dict[str, torch.Tensor | int]) -> int:
+        num_patches = batch["num_instance_patches"]
+        if torch.is_tensor(num_patches):
+            return int(num_patches.item())
+        return int(num_patches)
+
+    def _reshape_instance_patches(self, values: torch.Tensor, batch: Dict[str, torch.Tensor | int]) -> torch.Tensor:
+        patch_size = self._instance_patch_size(batch)
+        num_patches = self._instance_patch_count(batch)
+        expected_rays = num_patches * patch_size * patch_size
+        if values.shape[0] != expected_rays:
+            raise ValueError(
+                f"Expected {expected_rays} rays for {num_patches} instance patches of size {patch_size}, got {values.shape[0]}."
+            )
+        if values.ndim == 1:
+            return values.view(num_patches, patch_size, patch_size)
+        return values.view(num_patches, patch_size, patch_size, -1)
+
+    def _compute_instance_patch_terms(self, feat_map: torch.Tensor, mask_map: torch.Tensor):
+        valid_labels = torch.unique(mask_map)
+        valid_labels = valid_labels[valid_labels >= 0]
+
+        prototypes = []
+        positive_terms = []
+        valid_mask_count = 0
+        valid_pixel_count = 0
+        for label in valid_labels:
+            label_mask = mask_map == label
+            pixel_count = int(label_mask.sum().item())
+            if pixel_count < self.config.inst_min_mask_pixels:
+                continue
+            label_features = feat_map[label_mask]
+            prototype = label_features.mean(dim=0)
+            prototypes.append(prototype)
+            positive_terms.append((label_features - prototype).square().sum(dim=-1).mean())
+            valid_mask_count += 1
+            valid_pixel_count += pixel_count
+
+        pos_loss = torch.stack(positive_terms).mean() if positive_terms else feat_map.new_zeros(())
+        if len(prototypes) >= 2:
+            proto_stack = torch.stack(prototypes, dim=0)
+            neg_loss = F.relu(self.config.inst_gamma - torch.pdist(proto_stack, p=2)).mean()
+        else:
+            neg_loss = feat_map.new_zeros(())
+        return pos_loss, neg_loss, valid_mask_count, valid_pixel_count
+
+    def _compute_instance_loss_terms(self, outputs, batch):
+        feat_maps = self._reshape_instance_patches(outputs[INSTANCE_FEATURE_OUTPUT_KEY].to(dtype=torch.float32), batch)
+        mask_maps = self._reshape_instance_patches(batch["instance_mask"].to(device=self.device, dtype=torch.long), batch)
+
+        patch_pos_losses = []
+        patch_neg_losses = []
+        valid_mask_count = 0
+        valid_pixel_count = 0
+        for feat_map, mask_map in zip(feat_maps, mask_maps):
+            pos_loss, neg_loss, patch_valid_mask_count, patch_valid_pixel_count = self._compute_instance_patch_terms(feat_map, mask_map)
+            if patch_valid_mask_count > 0:
+                patch_pos_losses.append(pos_loss)
+            if patch_valid_mask_count > 1:
+                patch_neg_losses.append(neg_loss)
+            valid_mask_count += patch_valid_mask_count
+            valid_pixel_count += patch_valid_pixel_count
+
+        pos_loss = torch.stack(patch_pos_losses).mean() if patch_pos_losses else feat_maps.new_zeros(())
+        neg_loss = torch.stack(patch_neg_losses).mean() if patch_neg_losses else feat_maps.new_zeros(())
+
+        var_map = self._reshape_instance_patches(outputs[INSTANCE_VARIANCE_OUTPUT_KEY].to(dtype=torch.float32), batch)
+        var_reg = var_map.square().sum(dim=-1).mean()
+        inst2d_unscaled = self.config.inst_pos_weight * pos_loss + self.config.inst_neg_weight * neg_loss
+
+        return {
+            "instance_pos_loss": pos_loss,
+            "instance_neg_loss": neg_loss,
+            "instance_2d_loss_unscaled": inst2d_unscaled,
+            "instance_var_reg": var_reg,
+            "instance_valid_mask_count": float(valid_mask_count),
+            "instance_valid_pixel_count": float(valid_pixel_count),
+        }
+
     def _feature_targets(self, outputs, batch) -> torch.Tensor:
         feature_ray_indices = outputs.get("feature_ray_indices")
         target_feats = batch["feature"].to(device=self.device, dtype=torch.float32)
@@ -274,7 +442,7 @@ class FeatureFieldModel(NerfactoModel):
         metrics_dict = super().get_metrics_dict(outputs, batch)
         # Feature metrics
         target_feats = self._feature_targets(outputs, batch)
-        pred_feats = outputs["feature"].to(dtype=torch.float32)
+        pred_feats = outputs[FEATURE_OUTPUT_KEY].to(dtype=torch.float32)
         metrics_dict["feature_error"] = F.mse_loss(pred_feats, target_feats)
         return metrics_dict
 
@@ -283,14 +451,24 @@ class FeatureFieldModel(NerfactoModel):
         # Feature loss
         feature_error = metrics_dict.get("feature_error") if metrics_dict is not None else None
         if feature_error is None:
-            pred_feats = outputs["feature"].to(dtype=torch.float32)
+            pred_feats = outputs[FEATURE_OUTPUT_KEY].to(dtype=torch.float32)
             feature_error = F.mse_loss(pred_feats, self._feature_targets(outputs, batch))
         loss_dict["feature_loss"] = self.config.feat_loss_weight * feature_error
         return loss_dict
 
+    def get_instance_metrics_dict(self, outputs, batch):
+        return self._compute_instance_loss_terms(outputs, batch)
+
+    def get_instance_loss_dict(self, outputs, batch, metrics_dict=None):
+        metrics_dict = metrics_dict or self._compute_instance_loss_terms(outputs, batch)
+        return {
+            "instance_2d_loss": self.config.inst2d_lambda * metrics_dict["instance_2d_loss_unscaled"],
+            "instance_var_loss": self.config.inst_var_lambda * metrics_dict["instance_var_reg"],
+        }
+
     @torch.no_grad()
     def get_outputs_for_camera_ray_bundle(self, camera_ray_bundle: RayBundle, render_features: bool = True) -> Dict[str, torch.Tensor]:
-        """Full-image render with optional feature computation. Features are kept on CPU."""
+        """Full-image render with optional auxiliary feature computation. Features are kept on CPU."""
         input_device = camera_ray_bundle.directions.device
         num_rays_per_chunk = self.config.eval_num_rays_per_chunk
         image_height, image_width = camera_ray_bundle.origins.shape[:2]
@@ -306,12 +484,13 @@ class FeatureFieldModel(NerfactoModel):
             outputs_chunk = self._get_outputs_internal(
                 ray_bundle,
                 render_features=render_features,
+                render_instance_features=render_features,
                 subsample_supervision_rays=False,
             )
             for output_name, output in outputs_chunk.items():
                 if not torch.is_tensor(output):
                     continue
-                if output_name.startswith("feature"):
+                if output_name in {FEATURE_OUTPUT_KEY, INSTANCE_FEATURE_OUTPUT_KEY}:
                     outputs_lists[output_name].append(output.cpu())
                 else:
                     outputs_lists[output_name].append(output.to(input_device))
@@ -327,7 +506,7 @@ class FeatureFieldModel(NerfactoModel):
         if self.kwargs["metadata"]["feature_type"] != "CLIP" or not viewer_utils.positives or viewer_utils.pos_embed is None:
             return outputs
 
-        clip_features = outputs["feature"].to(viewer_utils.device)
+        clip_features = outputs[FEATURE_OUTPUT_KEY].to(viewer_utils.device)
         outputs["similarity"] = compute_similarity_scores(
             clip_features=clip_features,
             pos_embed=viewer_utils.pos_embed,
@@ -356,12 +535,19 @@ class FeatureFieldModel(NerfactoModel):
             images_dict["pred_normals"] = outputs["pred_normals"]
 
         # feature PCA
-        if "feature" in outputs:
+        if FEATURE_OUTPUT_KEY in outputs:
             images_dict["feature_pca"], viewer_utils.pca_proj, *_ = apply_pca_colormap(
-                outputs["feature"],
+                outputs[FEATURE_OUTPUT_KEY],
                 proj_V=viewer_utils.pca_proj,
                 return_proj=True,
             )
             images_dict["feature_pca"] = images_dict["feature_pca"].to(torch.float16)
+        if INSTANCE_FEATURE_OUTPUT_KEY in outputs:
+            images_dict["instance_feature_pca"], viewer_utils.instance_pca_proj, *_ = apply_pca_colormap(
+                outputs[INSTANCE_FEATURE_OUTPUT_KEY],
+                proj_V=viewer_utils.instance_pca_proj,
+                return_proj=True,
+            )
+            images_dict["instance_feature_pca"] = images_dict["instance_feature_pca"].to(torch.float16)
 
         return metrics_dict, images_dict

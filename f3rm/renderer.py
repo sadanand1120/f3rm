@@ -13,3 +13,16 @@ class FeatureRenderer(nn.Module):
     ) -> Tensor:
         features = torch.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
         return torch.sum(weights * features, dim=-2)
+
+
+class FeatureSecondMomentRenderer(nn.Module):
+    """Weighted second moment for per-ray feature variance."""
+
+    @classmethod
+    def forward(
+        cls,
+        features: Tensor,
+        weights: Tensor,
+    ) -> Tensor:
+        features = torch.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+        return torch.sum(weights * features.square(), dim=-2)

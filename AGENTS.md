@@ -20,7 +20,25 @@
   3. `cd /robodata/smodak/repos/f3rm`
   4. run command
 - For any command that uses GPU, set `CUDA_VISIBLE_DEVICES='1'` before running the command.
-- Playwright/Node/npm/npx checks and browser automation commands are runtime-dependent and must be executed inside `fresh` with the `f3rm` environment. Do not treat host `node`/`npm`/`npx` availability as authoritative.
+- For checkpoint-loading runtime commands (`ns-viewer`, eval/demo scripts, anything that calls Nerfstudio checkpoint loading), set `TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1` in the command rather than patching code around PyTorch 2.6 `weights_only` behavior.
+- For browser automation and Playwright usage, use the host conda environment `browser`. Do not use `fresh`/`f3rm` for browser-driving commands.
+- Exact browser flow that worked for Viser inspection:
+  1. Launch the app/server inside `fresh` + `f3rm`.
+  2. From the host, run `source /home/smodak/anaconda3/etc/profile.d/conda.sh && conda activate browser`.
+  3. Prefer Python Playwright with bundled Chromium, not `playwright-cli open`, since the CLI defaulted to the Chrome channel and was brittle here.
+  4. Canonical pattern:
+     `xvfb-run -a python - <<'PY'`
+     `from playwright.sync_api import sync_playwright`
+     `with sync_playwright() as p:`
+     `    browser = p.chromium.launch(headless=False)`
+     `    page = browser.new_page(viewport={'width': 1400, 'height': 900})`
+     `    page.goto('<VISER_SHARE_URL>', wait_until='domcontentloaded', timeout=120000)`
+     `    page.wait_for_timeout(8000)`
+     `    page.mouse.move(700, 450); page.mouse.down(); page.mouse.move(950, 500, steps=20); page.mouse.up()`
+     `    page.screenshot(path='/tmp/viser.png', full_page=True)`
+     `    browser.close()`
+     `PY`
+  5. Ensure the `browser` env has `playwright` installed and `python -m playwright install chromium` has been run.
 - For repo-mounted source files, prefer host-side edits and host-side read-only inspection by default. Use container-side editing only when a runtime-dependent workflow explicitly requires it.
 - Non-execution inspection on repo-mounted files can be done on the host. This includes simple file lookups, `rg`, `grep`, `sed`, `ls`, and similar read-only code inspection under `/robodata/smodak/`.
 - Inspect installed packages from inside the container, since package code and imports depend on the container environment rather than the host-mounted repo alone.

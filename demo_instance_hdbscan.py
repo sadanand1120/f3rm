@@ -11,9 +11,9 @@ import viser
 from cuml.cluster import HDBSCAN
 from cuml.preprocessing import StandardScaler
 from nerfstudio.utils.eval_utils import eval_setup
+from sklearn.decomposition import PCA
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.neighbors import KDTree
-from umap import UMAP
 
 
 def as_numpy(x):
@@ -142,39 +142,36 @@ def sample_embedding_indices(
     return np.sort(np.concatenate(keep, axis=0)).astype(np.int64)
 
 
-def compute_supervised_umap(
+def compute_pca_projection(
     cluster_features: cp.ndarray,
     labels: np.ndarray,
     pixel_counts: dict[int, int],
     seed: int,
     max_points: int,
 ):
-    if len(labels) == 0:
+    fit_mask = labels >= 0
+    if not np.any(fit_mask):
         return np.zeros((0, 2), dtype=np.float32), np.zeros(0, dtype=np.int32)
 
-    sample_idx = sample_embedding_indices(labels, pixel_counts, max_points, seed)
-    if len(sample_idx) == 0:
+    fit_idx = np.flatnonzero(fit_mask)
+    fit_labels = labels[fit_idx]
+    nonneg_pixel_counts = {label: count for label, count in pixel_counts.items() if label >= 0}
+    sample_local = sample_embedding_indices(fit_labels, nonneg_pixel_counts, max_points, seed)
+    if len(sample_local) == 0:
         return np.zeros((0, 2), dtype=np.float32), np.zeros(0, dtype=np.int32)
+    sample_idx = fit_idx[sample_local]
     embed_labels = labels[sample_idx].astype(np.int32, copy=False)
-    if len(np.unique(embed_labels)) < 2:
-        return np.zeros((0, 2), dtype=np.float32), embed_labels
-
     embed_feats = cp.asnumpy(cluster_features[cp.asarray(sample_idx)]).astype(np.float32, copy=False)
-    unique_labels = np.array(sorted(np.unique(embed_labels)), dtype=np.int32)
-    supervised_targets = np.searchsorted(unique_labels, embed_labels).astype(np.int32, copy=False)
+    if len(embed_feats) == 1:
+        return np.zeros((1, 2), dtype=np.float32), embed_labels
 
-    reducer = UMAP(
-        n_components=2,
-        n_neighbors=30,
-        min_dist=0.0,
-        metric="euclidean",
-        target_metric="categorical",
-        target_weight=0.95,
-        random_state=seed,
-        transform_seed=seed,
-        low_memory=True,
-    )
-    embedding = reducer.fit_transform(embed_feats, y=supervised_targets).astype(np.float32, copy=False)
+    n_components = min(2, embed_feats.shape[0], embed_feats.shape[1])
+    reducer = PCA(n_components=n_components)
+    embedding = reducer.fit_transform(embed_feats).astype(np.float32, copy=False)
+    if embedding.ndim == 1:
+        embedding = embedding[:, None]
+    if embedding.shape[1] == 1:
+        embedding = np.concatenate([embedding, np.zeros((len(embedding), 1), dtype=np.float32)], axis=1)
     return embedding, embed_labels
 
 
@@ -274,9 +271,12 @@ def closest_cluster_pairs_to_epsilon(
 def plot_feature_embedding(ax, embedding: np.ndarray, labels: np.ndarray, palette: dict[int, np.ndarray], title: str):
     ax.set_xticks([])
     ax.set_yticks([])
+    nonneg = labels >= 0
+    embedding = embedding[nonneg]
+    labels = labels[nonneg]
     if len(embedding) == 0:
         ax.set_title(title)
-        ax.text(0.5, 0.5, "Need >=2 labels", ha="center", va="center", transform=ax.transAxes)
+        ax.text(0.5, 0.5, "No labels >= 0", ha="center", va="center", transform=ax.transAxes)
         return
 
     colors = point_colors(labels, palette)
@@ -545,7 +545,7 @@ def main():
     label_image = flat_labels.reshape(target["shape"])
     cluster_vis = colorize(label_image, palette)
     visible_pixel_counts = label_pixel_counts(flat_labels[valid].astype(np.int32, copy=False))
-    umap_embedding, umap_labels = compute_supervised_umap(
+    pca_embedding, pca_labels = compute_pca_projection(
         cluster_features,
         labels_valid,
         visible_pixel_counts,
@@ -571,7 +571,7 @@ def main():
     ax1.set_title(f"HDBSCAN on exported 3D instance cloud ({n_clusters} clusters)")
     ax1.axis("off")
     annotate_clusters(ax1, label_image)
-    plot_feature_embedding(ax2, umap_embedding, umap_labels, palette, "Supervised UMAP of clustered features")
+    plot_feature_embedding(ax2, pca_embedding, pca_labels, palette, "PCA of clustered features (labels >= 0)")
     plot_feature_embedding(ax3, lda_embedding, lda_labels, palette, "LDA of clustered features (labels >= 0)")
     fig.tight_layout()
 

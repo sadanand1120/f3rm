@@ -13,8 +13,8 @@ from f3rm.features.utils import AsyncMultiWrapper, resolve_devices_and_workers, 
 
 
 class SAMArgs:
-    checkpoint_path: str = "/robodata/smodak/repos/f3rm/checkpoints/sam_vit_l_0b3195.pth"
-    model_type: str = "vit_l"
+    checkpoint_path: str = "/robodata/smodak/repos/f3rm/checkpoints/sam_vit_h_4b8939.pth"
+    model_type: str = "vit_h"
     sort_mode: str = "area"
     min_mask_area_perc: float = 0.01
     points_per_side: Optional[int] = 8

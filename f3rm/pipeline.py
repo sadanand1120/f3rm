@@ -20,13 +20,22 @@ class FeaturePipelineConfig(VanillaPipelineConfig):
 class FeaturePipeline(VanillaPipeline):
     @profiler.time_function
     def get_train_loss_dict(self, step: int):
-        ray_bundle, batch = self.datamanager.next_train(step)
-        model_outputs = self._model(ray_bundle)
-        metrics_dict = self.model.get_metrics_dict(model_outputs, batch)
-        loss_dict = self.model.get_loss_dict(model_outputs, batch, metrics_dict)
+        train_batches = self.datamanager.next_train(step)
+        rgb_ray_bundle = train_batches["rgb"]["ray_bundle"]
+        rgb_batch = train_batches["rgb"]["batch"]
+        instance_ray_bundle = train_batches["instance"]["ray_bundle"]
+        instance_batch = train_batches["instance"]["batch"]
+
+        model_outputs = self._model(rgb_ray_bundle, instance_ray_bundle=instance_ray_bundle)
+        metrics_dict = self.model.get_metrics_dict(model_outputs, rgb_batch)
+        loss_dict = self.model.get_loss_dict(model_outputs, rgb_batch, metrics_dict)
+
+        instance_metrics_dict = self.model.get_instance_metrics_dict(model_outputs, instance_batch)
+        metrics_dict.update(instance_metrics_dict)
+        loss_dict.update(self.model.get_instance_loss_dict(model_outputs, instance_batch, instance_metrics_dict))
 
         if self.config.steps_per_train_image_viz and step_check(step, self.config.steps_per_train_image_viz):
-            self._log_train_images_for_step(batch, step)
+            self._log_train_images_for_step(rgb_batch, step)
         return model_outputs, loss_dict, metrics_dict
 
     def _log_train_images_for_step(self, batch: Dict, step: int) -> None:
