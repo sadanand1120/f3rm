@@ -20,8 +20,7 @@ NUM_DEVICES = env_int("F3RM_NUM_DEVICES", 2)  # Keep this aligned with machine.n
 TRAIN_NUM_RAYS_PER_BATCH = env_int("F3RM_TRAIN_NUM_RAYS_PER_BATCH", 1 << 15)  # Per-device RGB rays per train step. Increase => total work: about flat; end-to-end time: usually down until GPU saturation, then can go up; quality: often near-flat, but too high can hurt.
 TRAIN_NUM_IMAGES_TO_SAMPLE_FROM = env_int("F3RM_TRAIN_NUM_IMAGES_TO_SAMPLE_FROM", 32)  # Increase => total work: about flat; end-to-end time: usually up from wider window/cache churn; quality: usually up because each refresh sees more images.
 FEAT_TRAIN_RAY_RATIO = env_float("F3RM_FEAT_TRAIN_RAY_RATIO", 0.125)  # Fraction of the RGB batch that receives CLIP feature supervision.
-INSTANCE_PATCH_SIZE = env_int("F3RM_INSTANCE_PATCH_SIZE", 720)  # Side length for the SAM-supervised patch branch; rays/step = patch_size^2.
-NUM_INST_PATCHES = env_int("F3RM_NUM_INST_PATCHES", 2)  # Number of random SAM-supervised patches per step; total instance rays/step = num_inst_patches * patch_size^2.
+NUM_INST_IMAGES = env_int("F3RM_NUM_INST_IMAGES", 1)  # Number of random full SAM-supervised images per step; total instance rays/step = num_inst_images * train_image_width * train_image_height.
 # Average global visits of the RGB train pixel budget across the train pixel pool, accounting for all devices.
 PIXEL_VISITATION = env_float("F3RM_PIXEL_VISITATION", 4.0)
 # Number of times an image gets chosen in a sampled batch, throughout full run
@@ -40,6 +39,7 @@ TRAIN_SCHEDULE = derive_train_schedule(
     pixel_visitation=PIXEL_VISITATION,
     window_coverage=WINDOW_COVERAGE,
 )
+print(f"********************************** TRAIN_SCHEDULE: {TRAIN_SCHEDULE}")
 
 # TODO: move training/extraction to /scratch, see if speed up happens
 # TODO: Look at https://docs.nerf.studio/nerfology/methods/nerfacto.html, try bigger model for better scenes!
@@ -69,8 +69,7 @@ f3rm_method = MethodSpecification(
                 pin_cpu_feature_cache=PIN_CPU_FEATURE_CACHE,
                 cpu_feature_cache_images=CPU_FEATURE_CACHE_IMAGES,
                 gpu_feature_cache_images=GPU_FEATURE_CACHE_IMAGES,
-                instance_patch_size=INSTANCE_PATCH_SIZE,
-                num_instance_patches=NUM_INST_PATCHES,
+                num_instance_images=NUM_INST_IMAGES,
                 dataparser=NerfstudioDataParserConfig(train_split_fraction=TRAIN_SPLIT_FRACTION),
                 train_num_rays_per_batch=TRAIN_NUM_RAYS_PER_BATCH,
                 train_num_images_to_sample_from=TRAIN_NUM_IMAGES_TO_SAMPLE_FROM,
@@ -98,10 +97,9 @@ f3rm_method = MethodSpecification(
                 feat_num_layers=2,
                 inst_feature_dim=8,
                 inst2d_lambda=0.5,
-                inst_var_lambda=0.0,
                 inst_gamma=10.0,
-                inst_pos_weight=1.0,
-                inst_neg_weight=1.0,
+                inst_pos_weight=5.0,
+                inst_neg_weight=5.0,
                 inst_min_mask_pixels=256,
                 inst_use_pe=False,
                 inst_num_levels=10,
@@ -131,9 +129,9 @@ f3rm_method = MethodSpecification(
                 ),
             },
             "instance_field": {
-                "optimizer": AdamOptimizerConfig(lr=5e-2, eps=1e-15, max_norm=1.0),
+                "optimizer": AdamOptimizerConfig(lr=1e-1, eps=1e-15, max_norm=1.0),
                 "scheduler": ExponentialDecaySchedulerConfig(
-                    lr_final=5e-3, warmup_steps=600, max_steps=TRAIN_SCHEDULE.max_num_iterations
+                    lr_final=1e-2, warmup_steps=600, max_steps=TRAIN_SCHEDULE.max_num_iterations
                 ),
             },
             "camera_opt": {

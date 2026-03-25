@@ -75,6 +75,15 @@ def label_pixel_counts(labels: np.ndarray) -> dict[int, int]:
     return {int(label): int(count) for label, count in zip(unique, counts)}
 
 
+def nonnegative_unique_labels(labels: np.ndarray) -> np.ndarray:
+    return np.array(sorted(int(label) for label in np.unique(labels) if label >= 0), dtype=np.int32)
+
+
+def label_list_text(labels: np.ndarray) -> str:
+    unique_labels = nonnegative_unique_labels(labels)
+    return ", ".join(str(int(label)) for label in unique_labels) if len(unique_labels) > 0 else "none"
+
+
 def sample_embedding_indices(
     labels: np.ndarray,
     pixel_counts: dict[int, int],
@@ -279,6 +288,7 @@ def plot_feature_embedding(ax, embedding: np.ndarray, labels: np.ndarray, palett
         ax.text(0.5, 0.5, "No labels >= 0", ha="center", va="center", transform=ax.transAxes)
         return
 
+    unique_labels = nonnegative_unique_labels(labels)
     colors = point_colors(labels, palette)
     ax.scatter(
         embedding[:, 0],
@@ -289,9 +299,20 @@ def plot_feature_embedding(ax, embedding: np.ndarray, labels: np.ndarray, palett
         linewidths=0,
         rasterized=True,
     )
-    ax.set_title(f"{title} ({len(labels)} pts)")
+    n_visible_clusters = len(unique_labels)
+    ax.set_title(f"{title} ({n_visible_clusters} visible clusters, {len(labels)} pts)")
+    ax.text(
+        0.02,
+        0.02,
+        f"labels: {label_list_text(labels)}",
+        transform=ax.transAxes,
+        ha="left",
+        va="bottom",
+        fontsize=10,
+        bbox=dict(boxstyle="round,pad=0.2", facecolor="white", alpha=0.85, edgecolor="none"),
+    )
 
-    for label in sorted(int(x) for x in np.unique(labels) if x >= 0):
+    for label in unique_labels:
         pts = embedding[labels == label]
         if len(pts) == 0:
             continue
@@ -452,13 +473,13 @@ def main():
     p.add_argument("--cloud-cache", type=Path)
     p.add_argument("--remove-outliers", action=BooleanOptionalAction, default=True)
     p.add_argument("--std-ratio", type=float, default=10.0)
-    p.add_argument("--voxel-frac", type=float, default=2e-4)
-    p.add_argument("--min-size", type=int, default=1024)  # use 2048 with bm1_new type config
+    p.add_argument("--voxel-frac", type=float, default=0.0)
+    p.add_argument("--min-size", type=int, default=2048)
     p.add_argument("--min-samples", type=int, default=256)
     p.add_argument("--cluster-selection-epsilon", type=float, default=0.4)  # use 0.105 with bm1_new type config
     p.add_argument("--min-prob", type=float, default=0.0)
     p.add_argument("--preprocess", choices=("raw", "std", "l2"), default="raw")
-    p.add_argument("--umap-max-points", type=int, default=50_000)
+    p.add_argument("--pca-max-points", type=int, default=100_000)
     p.add_argument("--eval-num-rays-per-chunk", type=int, default=1 << 16)
     p.add_argument("--show-viser-only", action=BooleanOptionalAction, default=False)
     p.add_argument("--seed", type=int, default=42)
@@ -545,19 +566,21 @@ def main():
     label_image = flat_labels.reshape(target["shape"])
     cluster_vis = colorize(label_image, palette)
     visible_pixel_counts = label_pixel_counts(flat_labels[valid].astype(np.int32, copy=False))
+    visible_cluster_ids = np.array(sorted(label for label in visible_pixel_counts if label >= 0), dtype=np.int32)
+    n_visible_clusters = len(visible_cluster_ids)
     pca_embedding, pca_labels = compute_pca_projection(
         cluster_features,
         labels_valid,
         visible_pixel_counts,
         args.seed,
-        args.umap_max_points,
+        args.pca_max_points,
     )
     lda_embedding, lda_labels = compute_lda_projection(
         cluster_features,
         labels_valid,
         visible_pixel_counts,
         args.seed,
-        args.umap_max_points,
+        args.pca_max_points,
     )
 
     fig, axes = plt.subplots(2, 2, figsize=(16, 14))
@@ -566,18 +589,27 @@ def main():
     ax0.imshow(np.clip(target["image"], 0.0, 1.0))
     ax0.set_title(f"{args.split} image {args.image_idx}")
     ax0.axis("off")
-    n_clusters = len(set(labels_valid)) - int(-1 in labels_valid)
     ax1.imshow(cluster_vis)
-    ax1.set_title(f"HDBSCAN on exported 3D instance cloud ({n_clusters} clusters)")
+    ax1.set_title(f"HDBSCAN labels projected to image ({n_visible_clusters} visible clusters)")
     ax1.axis("off")
     annotate_clusters(ax1, label_image)
+    ax1.text(
+        0.02,
+        0.02,
+        f"labels: {label_list_text(visible_cluster_ids)}",
+        transform=ax1.transAxes,
+        ha="left",
+        va="bottom",
+        fontsize=10,
+        bbox=dict(boxstyle="round,pad=0.2", facecolor="white", alpha=0.85, edgecolor="none"),
+    )
     plot_feature_embedding(ax2, pca_embedding, pca_labels, palette, "PCA of clustered features (labels >= 0)")
     plot_feature_embedding(ax3, lda_embedding, lda_labels, palette, "LDA of clustered features (labels >= 0)")
     fig.tight_layout()
 
     print(f"image:          {dataset.image_filenames[args.image_idx]}")
     print(f"valid_pixels:   {int(valid.sum())}")
-    print(f"clusters:       {n_clusters}")
+    print(f"clusters:       {n_visible_clusters}")
     print(f"noise_fraction: {np.mean(labels_valid == -1):.3f}")
     print("cluster_points:")
     for label, count in zip(cluster_ids, cluster_counts):

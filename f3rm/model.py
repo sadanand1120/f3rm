@@ -24,7 +24,7 @@ from torch.nn import Parameter
 
 from f3rm.feature_field import FeatureField
 from f3rm.features.utils import apply_pca_colormap, compute_similarity_scores
-from f3rm.renderer import FeatureRenderer, FeatureSecondMomentRenderer
+from f3rm.renderer import FeatureRenderer
 
 
 @dataclass
@@ -44,7 +44,6 @@ class FeatureFieldModelConfig(NerfactoModelConfig):
     feat_num_layers: int = 2
     inst_feature_dim: int = 8
     inst2d_lambda: float = 0.1
-    inst_var_lambda: float = 0.5
     inst_gamma: float = 1.0
     inst_pos_weight: float = 1.0
     inst_neg_weight: float = 1.0
@@ -130,8 +129,6 @@ viewer_utils = ViewerUtils(device=torch.device("cpu"))
 
 FEATURE_OUTPUT_KEY = "feature"
 INSTANCE_FEATURE_OUTPUT_KEY = "instance-feature"
-INSTANCE_SECOND_MOMENT_OUTPUT_KEY = "instance_feature_second_moment"
-INSTANCE_VARIANCE_OUTPUT_KEY = "instance_feature_variance"
 
 
 class FeatureFieldModel(NerfactoModel):
@@ -167,7 +164,6 @@ class FeatureFieldModel(NerfactoModel):
         self.instance_field = self._build_aux_field("inst", self.config.inst_feature_dim)
 
         self.renderer_feature = FeatureRenderer()
-        self.renderer_feature_second_moment = FeatureSecondMomentRenderer()
         self.setup_gui()
 
     def setup_gui(self):
@@ -216,7 +212,6 @@ class FeatureFieldModel(NerfactoModel):
         ray_bundle: RayBundle,
         render_features: bool,
         render_instance_features: bool = False,
-        render_instance_aux: bool = False,
         subsample_supervision_rays: bool = True,
     ):
         """Core rendering that can optionally skip feature-field computation."""
@@ -272,13 +267,6 @@ class FeatureFieldModel(NerfactoModel):
             outputs[FEATURE_OUTPUT_KEY] = features
         if render_instance_features:
             outputs[INSTANCE_FEATURE_OUTPUT_KEY] = instance_features
-            if render_instance_aux:
-                instance_second_moment = self.renderer_feature_second_moment(features=instance_vals, weights=custom_weights)
-                outputs[INSTANCE_SECOND_MOMENT_OUTPUT_KEY] = instance_second_moment
-                outputs[INSTANCE_VARIANCE_OUTPUT_KEY] = torch.clamp_min(
-                    instance_second_moment - instance_features.square(),
-                    0.0,
-                )
         if outputs_feature_indices is not None:
             outputs["feature_ray_indices"] = outputs_feature_indices
 
@@ -337,40 +325,45 @@ class FeatureFieldModel(NerfactoModel):
 
         instance_values = self.instance_field.get_feature(ray_samples)
         instance_features = self.renderer_feature(features=instance_values, weights=weights)
-        instance_second_moment = self.renderer_feature_second_moment(features=instance_values, weights=weights)
         return {
             INSTANCE_FEATURE_OUTPUT_KEY: instance_features,
-            INSTANCE_SECOND_MOMENT_OUTPUT_KEY: instance_second_moment,
-            INSTANCE_VARIANCE_OUTPUT_KEY: torch.clamp_min(instance_second_moment - instance_features.square(), 0.0),
         }
 
     @staticmethod
-    def _instance_patch_size(batch: Dict[str, torch.Tensor | int]) -> int:
-        patch_size = batch["patch_size"]
-        if torch.is_tensor(patch_size):
-            return int(patch_size.item())
-        return int(patch_size)
+    def _instance_image_height(batch: Dict[str, torch.Tensor | int]) -> int:
+        image_height = batch["instance_image_height"]
+        if torch.is_tensor(image_height):
+            return int(image_height.item())
+        return int(image_height)
 
     @staticmethod
-    def _instance_patch_count(batch: Dict[str, torch.Tensor | int]) -> int:
-        num_patches = batch["num_instance_patches"]
-        if torch.is_tensor(num_patches):
-            return int(num_patches.item())
-        return int(num_patches)
+    def _instance_image_width(batch: Dict[str, torch.Tensor | int]) -> int:
+        image_width = batch["instance_image_width"]
+        if torch.is_tensor(image_width):
+            return int(image_width.item())
+        return int(image_width)
 
-    def _reshape_instance_patches(self, values: torch.Tensor, batch: Dict[str, torch.Tensor | int]) -> torch.Tensor:
-        patch_size = self._instance_patch_size(batch)
-        num_patches = self._instance_patch_count(batch)
-        expected_rays = num_patches * patch_size * patch_size
+    @staticmethod
+    def _instance_image_count(batch: Dict[str, torch.Tensor | int]) -> int:
+        num_images = batch["num_instance_images"]
+        if torch.is_tensor(num_images):
+            return int(num_images.item())
+        return int(num_images)
+
+    def _reshape_instance_images(self, values: torch.Tensor, batch: Dict[str, torch.Tensor | int]) -> torch.Tensor:
+        image_height = self._instance_image_height(batch)
+        image_width = self._instance_image_width(batch)
+        num_images = self._instance_image_count(batch)
+        expected_rays = num_images * image_height * image_width
         if values.shape[0] != expected_rays:
             raise ValueError(
-                f"Expected {expected_rays} rays for {num_patches} instance patches of size {patch_size}, got {values.shape[0]}."
+                f"Expected {expected_rays} rays for {num_images} full instance images of size {image_height}x{image_width}, got {values.shape[0]}."
             )
         if values.ndim == 1:
-            return values.view(num_patches, patch_size, patch_size)
-        return values.view(num_patches, patch_size, patch_size, -1)
+            return values.view(num_images, image_height, image_width)
+        return values.view(num_images, image_height, image_width, -1)
 
-    def _compute_instance_patch_terms(self, feat_map: torch.Tensor, mask_map: torch.Tensor):
+    def _compute_instance_image_terms(self, feat_map: torch.Tensor, mask_map: torch.Tensor):
         valid_labels = torch.unique(mask_map)
         valid_labels = valid_labels[valid_labels >= 0]
 
@@ -399,34 +392,30 @@ class FeatureFieldModel(NerfactoModel):
         return pos_loss, neg_loss, valid_mask_count, valid_pixel_count
 
     def _compute_instance_loss_terms(self, outputs, batch):
-        feat_maps = self._reshape_instance_patches(outputs[INSTANCE_FEATURE_OUTPUT_KEY].to(dtype=torch.float32), batch)
-        mask_maps = self._reshape_instance_patches(batch["instance_mask"].to(device=self.device, dtype=torch.long), batch)
+        feat_maps = self._reshape_instance_images(outputs[INSTANCE_FEATURE_OUTPUT_KEY].to(dtype=torch.float32), batch)
+        mask_maps = self._reshape_instance_images(batch["instance_mask"].to(device=self.device, dtype=torch.long), batch)
 
-        patch_pos_losses = []
-        patch_neg_losses = []
+        image_pos_losses = []
+        image_neg_losses = []
         valid_mask_count = 0
         valid_pixel_count = 0
         for feat_map, mask_map in zip(feat_maps, mask_maps):
-            pos_loss, neg_loss, patch_valid_mask_count, patch_valid_pixel_count = self._compute_instance_patch_terms(feat_map, mask_map)
-            if patch_valid_mask_count > 0:
-                patch_pos_losses.append(pos_loss)
-            if patch_valid_mask_count > 1:
-                patch_neg_losses.append(neg_loss)
-            valid_mask_count += patch_valid_mask_count
-            valid_pixel_count += patch_valid_pixel_count
+            pos_loss, neg_loss, image_valid_mask_count, image_valid_pixel_count = self._compute_instance_image_terms(feat_map, mask_map)
+            if image_valid_mask_count > 0:
+                image_pos_losses.append(pos_loss)
+            if image_valid_mask_count > 1:
+                image_neg_losses.append(neg_loss)
+            valid_mask_count += image_valid_mask_count
+            valid_pixel_count += image_valid_pixel_count
 
-        pos_loss = torch.stack(patch_pos_losses).mean() if patch_pos_losses else feat_maps.new_zeros(())
-        neg_loss = torch.stack(patch_neg_losses).mean() if patch_neg_losses else feat_maps.new_zeros(())
-
-        var_map = self._reshape_instance_patches(outputs[INSTANCE_VARIANCE_OUTPUT_KEY].to(dtype=torch.float32), batch)
-        var_reg = var_map.square().sum(dim=-1).mean()
+        pos_loss = torch.stack(image_pos_losses).mean() if image_pos_losses else feat_maps.new_zeros(())
+        neg_loss = torch.stack(image_neg_losses).mean() if image_neg_losses else feat_maps.new_zeros(())
         inst2d_unscaled = self.config.inst_pos_weight * pos_loss + self.config.inst_neg_weight * neg_loss
 
         return {
             "instance_pos_loss": pos_loss,
             "instance_neg_loss": neg_loss,
             "instance_2d_loss_unscaled": inst2d_unscaled,
-            "instance_var_reg": var_reg,
             "instance_valid_mask_count": float(valid_mask_count),
             "instance_valid_pixel_count": float(valid_pixel_count),
         }
@@ -463,7 +452,6 @@ class FeatureFieldModel(NerfactoModel):
         metrics_dict = metrics_dict or self._compute_instance_loss_terms(outputs, batch)
         return {
             "instance_2d_loss": self.config.inst2d_lambda * metrics_dict["instance_2d_loss_unscaled"],
-            "instance_var_loss": self.config.inst_var_lambda * metrics_dict["instance_var_reg"],
         }
 
     @torch.no_grad()

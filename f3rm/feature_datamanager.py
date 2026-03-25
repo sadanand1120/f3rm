@@ -7,7 +7,6 @@ import torch
 from nerfstudio.cameras.rays import RayBundle
 from nerfstudio.data.datamanagers.base_datamanager import VanillaDataManager, VanillaDataManagerConfig
 from nerfstudio.data.datasets.base_dataset import InputDataset
-from nerfstudio.data.pixel_samplers import PatchPixelSampler, PatchPixelSamplerConfig
 from nerfstudio.data.utils.dataloaders import CacheDataloader
 from nerfstudio.utils.rich_utils import CONSOLE
 
@@ -25,8 +24,7 @@ class FeatureDataManagerConfig(VanillaDataManagerConfig):
     pin_cpu_feature_cache: bool = True
     cpu_feature_cache_images: int = 128
     gpu_feature_cache_images: int = 16
-    instance_patch_size: int = 256
-    num_instance_patches: int = 1
+    num_instance_images: int = 1
 
 
 class UInt8InputDataset(InputDataset):
@@ -110,13 +108,6 @@ class FeatureDataManager(VanillaDataManager):
         )
         self.iter_train_image_dataloader = iter(self.train_image_dataloader)
         self.train_pixel_sampler = self._get_pixel_sampler(self.train_dataset, self.config.train_num_rays_per_batch)
-        instance_num_rays_per_batch = self.config.num_instance_patches * (self.config.instance_patch_size**2)
-        self.instance_pixel_sampler = PatchPixelSampler(
-            PatchPixelSamplerConfig(
-                patch_size=self.config.instance_patch_size,
-                num_rays_per_batch=instance_num_rays_per_batch,
-            )
-        )
         self.train_ray_generator = FeatureRayGenerator(self.train_dataset.cameras.to(self.device))
 
     def __init__(self, *args, **kwargs):
@@ -240,8 +231,41 @@ class FeatureDataManager(VanillaDataManager):
         )
         return ray_bundle, batch
 
+    def _sample_instance_indices(self, image_batch: Dict) -> torch.Tensor:
+        image = image_batch["image"]
+        num_images, image_height, image_width, _ = image.shape
+        assert self.config.num_instance_images <= num_images, "Not enough cached images for full-image instance sampling"
+        sampled = torch.randperm(num_images)[: self.config.num_instance_images]
+        yy, xx = torch.meshgrid(torch.arange(image_height), torch.arange(image_width), indexing="ij")
+        indices = torch.stack(
+            (
+                sampled[:, None, None].expand(-1, image_height, image_width),
+                yy[None].expand(self.config.num_instance_images, -1, -1),
+                xx[None].expand(self.config.num_instance_images, -1, -1),
+            ),
+            dim=-1,
+        )
+        return indices.reshape(-1, 3)
+
+    @staticmethod
+    def _collate_full_image_batch(image_batch: Dict, indices: torch.Tensor) -> Dict:
+        c, y, x = (i.flatten() for i in torch.split(indices, 1, dim=-1))
+        collated_batch = {
+            key: value[c, y, x] for key, value in image_batch.items() if key != "image_idx" and value is not None
+        }
+        image_idx = image_batch["image_idx"]
+        if torch.is_tensor(image_idx):
+            indices = indices.to(image_idx.device)
+            indices[:, 0] = image_idx[c.to(image_idx.device)]
+        else:
+            image_idx = torch.as_tensor(image_idx)
+            indices[:, 0] = image_idx[c]
+        collated_batch["indices"] = indices
+        return collated_batch
+
     def _sample_instance_batch(self, image_batch: Dict):
-        batch = self.instance_pixel_sampler.sample(image_batch)
+        indices = self._sample_instance_indices(image_batch)
+        batch = self._collate_full_image_batch(image_batch, indices)
         ray_bundle = self.train_ray_generator(batch["indices"])
         self._prepare_sampled_image(batch)
         self._populate_batch_targets(
@@ -254,8 +278,9 @@ class FeatureDataManager(VanillaDataManager):
             output_key="instance_mask",
             is_eval=False,
         )
-        batch["patch_size"] = self.config.instance_patch_size
-        batch["num_instance_patches"] = self.config.num_instance_patches
+        batch["instance_image_height"] = image_batch["image"].shape[1]
+        batch["instance_image_width"] = image_batch["image"].shape[2]
+        batch["num_instance_images"] = self.config.num_instance_images
         return ray_bundle, batch
 
     def _prepare_sampled_image(self, batch: Dict) -> None:
